@@ -334,7 +334,7 @@ def build_room_simulation():
         sub_src_idx = len(room.sources) - 1
 
     # 9. Single simulate() — all sources at once
-    room.simulate()
+    room.compute_rir()
 
     def _safe_ir(raw):
         ir = raw.astype(np.float32)
@@ -420,7 +420,7 @@ def non_convex_room_ir(near_field=False):
         mic_pos = [primary_dims[0]*0.5, primary_dims[1]*0.55, 1.7]
     primary_room.add_source(src_pos)
     primary_room.add_microphone(mic_pos)
-    primary_room.simulate()
+    primary_room.compute_rir()
     primary_ir = primary_room.rir[0][0].astype(np.float32)
 
     # Secondary space — 30–60% of primary volume, independent ceiling height
@@ -443,7 +443,7 @@ def non_convex_room_ir(near_field=False):
     junc_mic = [secondary_dims[0]*0.8, secondary_dims[1]*0.5, secondary_dims[2]*0.5]
     secondary_room.add_source(junc_src)
     secondary_room.add_microphone(junc_mic)
-    secondary_room.simulate()
+    secondary_room.compute_rir()
     secondary_ir = secondary_room.rir[0][0].astype(np.float32)
 
     # Cascade: junction attenuation of 6–14dB (opening between spaces)
@@ -489,7 +489,7 @@ def synthetic_feedback_ir(near_field=False):
     )
     room.add_source(speaker_pos)
     room.add_microphone(mic_pos)
-    room.simulate()
+    room.compute_rir()
     return room.rir[0][0].astype(np.float32)
 
 
