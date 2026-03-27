@@ -24,16 +24,12 @@ ds = load_dataset("parquet", data_files={
     "test":  str(PARQUET_DIR / "data/test-*.parquet"),
 })
 
-total = 0
-for split in ds:
-    for i, row in enumerate(ds[split]):
-        audio = row["audio"]
-        arr   = np.array(audio["array"], dtype=np.float32)
-        sr    = audio["sampling_rate"]
-        out   = OUT_DIR / f"{split}_{i:06d}.wav"
-        sf.write(str(out), arr, sr)
-        total += 1
-        if total % 100 == 0:
-            print(f"  {total} files extracted...")
-
-print(f"Done: {total} WAV files written to {OUT_DIR}")
+# Inspect first row to understand structure
+first = ds[list(ds.keys())[0]][0]
+print("Keys:", list(first.keys()))
+print("Audio type:", type(first["audio"]))
+if isinstance(first["audio"], dict):
+    print("Audio keys:", list(first["audio"].keys()))
+else:
+    print("Audio value (first 200 chars):", str(first["audio"])[:200])
+sys.exit(0)
