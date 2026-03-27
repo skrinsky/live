@@ -217,11 +217,11 @@ def build_room_simulation():
     from scipy.signal import butter, sosfilt
 
     # pyroomacoustics 0.9+ replaced CardioidFamily+DirectivityPattern with individual classes
-    def _make_dir(pattern_name, orientation, fs):
+    def _make_dir(pattern_name, orientation, fs=None):
         if pattern_name == 'OMNI':
             return Omnidirectional()
         cls = {'CARDIOID': Cardioid, 'HYPERCARDIOID': HyperCardioid, 'SUBCARDIOID': SubCardioid}
-        return cls[pattern_name](orientation=orientation, fs=fs)
+        return cls[pattern_name](orientation=orientation)
 
     # 1. Sample archetype
     archetype_name = random.choices(
