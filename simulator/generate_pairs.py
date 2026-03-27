@@ -212,14 +212,16 @@ def build_room_simulation():
     """
     import pyroomacoustics as pra   # local import — avoids macOS fork+OpenBLAS deadlock
     from pyroomacoustics.directivities import (
-        Cardioid, HyperCardioid, SubCardioid, Omnidirectional, Rotation3D
+        Cardioid, HyperCardioid, SubCardioid, Omnidirectional, DirectionVector
     )
     from scipy.signal import butter, sosfilt
 
-    # pyroomacoustics 0.9+ replaced CardioidFamily+DirectivityPattern with individual classes
-    def _make_dir(pattern_name, orientation, fs=None):
+    # pyroomacoustics 0.9+ uses DirectionVector(azimuth, colatitude) for orientation.
+    # colatitude = 90 - elevation (measured from zenith, not horizon).
+    def _make_dir(pattern_name, azimuth_deg, elevation_deg):
         if pattern_name == 'OMNI':
             return Omnidirectional()
+        orientation = DirectionVector(azimuth=azimuth_deg, colatitude=90 - elevation_deg, degrees=True)
         cls = {'CARDIOID': Cardioid, 'HYPERCARDIOID': HyperCardioid, 'SUBCARDIOID': SubCardioid}
         return cls[pattern_name](orientation=orientation)
 
@@ -270,11 +272,7 @@ def build_room_simulation():
         list(MIC_PATTERN_WEIGHTS.keys()),
         weights=list(MIC_PATTERN_WEIGHTS.values())
     )[0]
-    mic_dir = _make_dir(
-        mic_pattern_name,
-        Rotation3D([np.random.normal(0, 20), np.random.normal(0, 10), 0], 'yzx', degrees=True),
-        SR
-    )
+    mic_dir = _make_dir(mic_pattern_name, np.random.normal(0, 20), np.random.normal(0, 10))
     room.add_microphone(np.array(mic_pos), directivity=mic_dir)
 
     # 5. Mains speaker — elevated near front of room, aimed at stage
@@ -284,11 +282,7 @@ def build_room_simulation():
     )[0]
     mains_cfg   = SPEAKER_CONFIGS[mains_config_name]
     mains_elev  = np.random.uniform(*mains_cfg['elevation_range'])
-    mains_dir = _make_dir(
-        mains_cfg['pattern_name'],
-        Rotation3D([180, mains_elev, 0], 'yzx', degrees=True),
-        SR
-    )
+    mains_dir = _make_dir(mains_cfg['pattern_name'], 180, mains_elev)
     mains_src_pos = [
         dims[0] * 0.5,
         dims[1] * 0.05,
@@ -306,11 +300,7 @@ def build_room_simulation():
     monitor_src_idx = None
     if monitor_cfg['n_sources'] > 0:
         mon_elev = np.random.uniform(*monitor_cfg['elevation_range'])
-        mon_dir = _make_dir(
-            monitor_cfg['pattern_name'],
-            Rotation3D([monitor_cfg['azimuth'], mon_elev, 0], 'yzx', degrees=True),
-            SR
-        )
+        mon_dir = _make_dir(monitor_cfg['pattern_name'], monitor_cfg['azimuth'], mon_elev)
         mon_src_pos = [
             mic_pos[0] + np.random.uniform(-0.3, 0.3),
             mic_pos[1] - np.random.uniform(0.5, 1.5),
@@ -335,11 +325,7 @@ def build_room_simulation():
             and random.random() < 0.60:
         sub_config_name = random.choice(['subwoofer_ground_stack', 'subwoofer_cardioid_array'])
         sub_cfg = SPEAKER_CONFIGS[sub_config_name]
-        sub_dir = _make_dir(
-            sub_cfg['pattern_name'],
-            Rotation3D([0, 0, 0], 'yzx', degrees=True),
-            SR
-        )
+        sub_dir = _make_dir(sub_cfg['pattern_name'], 0, 0)
         sub_src_pos = [
             dims[0] * np.random.uniform(0.35, 0.65),
             dims[1] * 0.03,
