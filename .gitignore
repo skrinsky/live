@@ -1,0 +1,16 @@
+# Data — never commit audio/IR files to git
+data/
+checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.pt
+*.pth
+*.onnx
+
+# OS
+.DS_Store
