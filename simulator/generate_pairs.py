@@ -211,16 +211,17 @@ def build_room_simulation():
         meta        : dict (archetype, mic_pattern, configs, dims)
     """
     import pyroomacoustics as pra   # local import — avoids macOS fork+OpenBLAS deadlock
-    from pyroomacoustics.directivities import CardioidFamily, DirectivityPattern, Rotation3D
+    from pyroomacoustics.directivities import (
+        Cardioid, HyperCardioid, SubCardioid, Omnidirectional, Rotation3D
+    )
     from scipy.signal import butter, sosfilt
 
-    # Map string names to pra enums
-    pattern_map = {
-        'OMNI':          DirectivityPattern.OMNI,
-        'CARDIOID':      DirectivityPattern.CARDIOID,
-        'HYPERCARDIOID': DirectivityPattern.HYPERCARDIOID,
-        'SUBCARDIOID':   DirectivityPattern.SUBCARDIOID,
-    }
+    # pyroomacoustics 0.9+ replaced CardioidFamily+DirectivityPattern with individual classes
+    def _make_dir(pattern_name, orientation, fs):
+        if pattern_name == 'OMNI':
+            return Omnidirectional()
+        cls = {'CARDIOID': Cardioid, 'HYPERCARDIOID': HyperCardioid, 'SUBCARDIOID': SubCardioid}
+        return cls[pattern_name](orientation=orientation, fs=fs)
 
     # 1. Sample archetype
     archetype_name = random.choices(
@@ -269,11 +270,10 @@ def build_room_simulation():
         list(MIC_PATTERN_WEIGHTS.keys()),
         weights=list(MIC_PATTERN_WEIGHTS.values())
     )[0]
-    mic_dir = CardioidFamily(
-        orientation=Rotation3D(
-            [np.random.normal(0, 20), np.random.normal(0, 10), 0], 'yzx', degrees=True
-        ),
-        pattern_enum=pattern_map[mic_pattern_name], fs=SR
+    mic_dir = _make_dir(
+        mic_pattern_name,
+        Rotation3D([np.random.normal(0, 20), np.random.normal(0, 10), 0], 'yzx', degrees=True),
+        SR
     )
     room.add_microphone(np.array(mic_pos), directivity=mic_dir)
 
@@ -284,9 +284,10 @@ def build_room_simulation():
     )[0]
     mains_cfg   = SPEAKER_CONFIGS[mains_config_name]
     mains_elev  = np.random.uniform(*mains_cfg['elevation_range'])
-    mains_dir   = CardioidFamily(
-        orientation=Rotation3D([180, mains_elev, 0], 'yzx', degrees=True),
-        pattern_enum=pattern_map[mains_cfg['pattern_name']], fs=SR
+    mains_dir = _make_dir(
+        mains_cfg['pattern_name'],
+        Rotation3D([180, mains_elev, 0], 'yzx', degrees=True),
+        SR
     )
     mains_src_pos = [
         dims[0] * 0.5,
@@ -305,11 +306,10 @@ def build_room_simulation():
     monitor_src_idx = None
     if monitor_cfg['n_sources'] > 0:
         mon_elev = np.random.uniform(*monitor_cfg['elevation_range'])
-        mon_dir  = CardioidFamily(
-            orientation=Rotation3D(
-                [monitor_cfg['azimuth'], mon_elev, 0], 'yzx', degrees=True
-            ),
-            pattern_enum=pattern_map[monitor_cfg['pattern_name']], fs=SR
+        mon_dir = _make_dir(
+            monitor_cfg['pattern_name'],
+            Rotation3D([monitor_cfg['azimuth'], mon_elev, 0], 'yzx', degrees=True),
+            SR
         )
         mon_src_pos = [
             mic_pos[0] + np.random.uniform(-0.3, 0.3),
@@ -335,9 +335,10 @@ def build_room_simulation():
             and random.random() < 0.60:
         sub_config_name = random.choice(['subwoofer_ground_stack', 'subwoofer_cardioid_array'])
         sub_cfg = SPEAKER_CONFIGS[sub_config_name]
-        sub_dir = CardioidFamily(
-            orientation=Rotation3D([0, 0, 0], 'yzx', degrees=True),
-            pattern_enum=pattern_map[sub_cfg['pattern_name']], fs=SR
+        sub_dir = _make_dir(
+            sub_cfg['pattern_name'],
+            Rotation3D([0, 0, 0], 'yzx', degrees=True),
+            SR
         )
         sub_src_pos = [
             dims[0] * np.random.uniform(0.35, 0.65),

@@ -1,6 +1,6 @@
 from huggingface_hub import snapshot_download
 
-HF_TOKEN = "YOUR_HF_TOKEN_HERE"
+HF_TOKEN = "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"
 
 print("Downloading EARS vocals...")
 snapshot_download(
