@@ -258,7 +258,6 @@ def build_room_simulation():
         dims, fs=SR,
         materials=materials,
         max_order=arch['max_order'],
-        ray_tracing=True,    # ISM early reflections + stochastic ray tracing late tail
         air_absorption=True, # high-freq rolloff over distance (critical for distant mains)
     )
 
