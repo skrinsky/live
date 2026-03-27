@@ -244,7 +244,9 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
 
         # ── Loss: spectral MSE against HPF'd reverberant vocal ────────────────
         clean_f    = torch_stft(reverb_frame.detach(), window).unsqueeze(0)
-        total_loss = total_loss + F.mse_loss(speech_f, clean_f)
+        # Complex MSE — split into real+imag since CUDA doesn't support complex mse_loss
+        total_loss = total_loss + F.mse_loss(speech_f.real, clean_f.real) \
+                                + F.mse_loss(speech_f.imag, clean_f.imag)
 
     if not outputs:
         return None
