@@ -337,9 +337,15 @@ def train():
                          'TF schedule and epoch counter always restart from 1.')
     args, _ = ap.parse_known_args()
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
+        resume_path = Path(args.resume)
+        ckpt = torch.load(str(resume_path), map_location=device)
         model.load_state_dict(ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt)
+        # Back up the source checkpoint so run 3 can resume from it if needed.
+        backup = resume_path.parent / (resume_path.stem + '_prev.pt')
+        import shutil
+        shutil.copy2(str(resume_path), str(backup))
         print(f"Warm-started weights from {args.resume} (TF and epoch counter reset to 1)")
+        print(f"  Backup saved → {backup}")
 
     best_loss = float('inf')
 
