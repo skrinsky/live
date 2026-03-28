@@ -430,8 +430,6 @@ def train():
         print(f"Epoch {epoch:3d} | loss {avg_loss:.4f} | "
               f"valid {valid_steps}/{n_steps} | tf={tf_prob:.2f}")
 
-        torch.save({'epoch': epoch, 'model': model.state_dict()},
-                   str(ckpt_dir / f'epoch_{epoch:03d}.pt'))
         if avg_loss < best_loss:
             best_loss = avg_loss
             torch.save({'epoch': epoch, 'model': model.state_dict()},
