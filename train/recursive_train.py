@@ -92,15 +92,17 @@ def make_console_hpf(cutoff_hz=90, sr=SR):
 def sample_gain():
     """
     Returns (mains_gain, monitor_gain) independently sampled.
-    40% normal (0.2–0.6) | 35% near-threshold (0.6–0.9) | 25% active (0.9–1.5)
-    Both paths sampled independently — monitor can be hot while mains is quiet,
-    which is the most common failure mode in small venues and HOW settings.
+    Gains are capped below the Larsen threshold (loop gain < 1.0) during initial
+    training. Above-threshold scenarios produce near-infinite STFT values that
+    dominate the loss and prevent convergence. Fine-tune on above-threshold
+    data only after the model handles sub-threshold cases reliably.
+    60% normal (0.2–0.55) | 40% near-threshold (0.55–0.85)
     """
     def _one():
-        t = random.random()
-        if t < 0.40:   return random.uniform(0.2, 0.6)
-        elif t < 0.75: return random.uniform(0.6, 0.9)
-        else:          return random.uniform(0.9, 1.5)
+        if random.random() < 0.60:
+            return random.uniform(0.2, 0.55)
+        else:
+            return random.uniform(0.55, 0.85)
     return _one(), _one()
 
 
@@ -249,11 +251,16 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
         out_frame = torch.tanh(out_frame / CLIP_LEVEL) * CLIP_LEVEL
         outputs.append(out_frame)
 
-        # ── Loss: spectral MSE against HPF'd reverberant vocal ────────────────
+        # ── Loss: scale-normalised spectral MSE ───────────────────────────────
+        # Normalise by clean signal power so sequences with strong feedback
+        # (large mic values → large STFT values) don't dominate the gradient.
+        # Without normalisation, loop-gain-near-1 sequences have 100x the loss
+        # of quiet sequences and corrupt the epoch average.
         clean_f    = torch_stft(reverb_frame.detach(), window).unsqueeze(0)
-        # Complex MSE — split into real+imag since CUDA doesn't support complex mse_loss
-        total_loss = total_loss + F.mse_loss(speech_f.real, clean_f.real) \
-                                + F.mse_loss(speech_f.imag, clean_f.imag)
+        norm       = clean_f.abs().pow(2).mean().clamp(min=1e-8)
+        frame_loss = (F.mse_loss(speech_f.real, clean_f.real)
+                    + F.mse_loss(speech_f.imag, clean_f.imag)) / norm
+        total_loss = total_loss + frame_loss
 
     if not outputs:
         return None
