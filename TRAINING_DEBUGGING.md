@@ -127,24 +127,33 @@ feat = torch.cat([
 ], ...)
 ```
 
-**Fix:** Add cosine similarity (real part of normalized cross-correlation) between mic and ref per ERB band — this captures phase alignment without blowing up the feature dimension:
+**Fix:** Add the normalized cross-spectrum between mic and ref per ERB band — **both real and imaginary parts**. The real part is cosine of IPD (phase alignment magnitude); the imaginary part is sine of IPD (phase lead/lag direction). Using only real discards whether the reference leads or lags the mic — exactly the information that distinguishes feedback coherence from coincidental correlation. Standard form in IPD-based AEC/beamforming literature (arXiv 2111.04904).
+
 ```python
-# Normalized cross-correlation (real part = cosine similarity in complex domain)
-mic_norm  = mic_f / (mic_f.abs() + 1e-8)
-ref_norm  = ref_f / (ref_f.abs() + 1e-8)
-coherence = (mic_norm * ref_norm.conj()).real   # (B, F), range [-1, 1]
-# ERB-compress it
-coh_erb   = coherence @ self.mel_fb             # (B, n_bands)
+# Numerically stable normalized cross-spectrum (both real and imaginary parts)
+denom     = (mic_f.abs() * ref_f.abs()).clamp(min=1e-8)   # (B, F)
+ncs       = mic_f * ref_f.conj() / denom                  # (B, F) complex, |ncs|=1
+ncs_real  = ncs.real                                       # cosine of IPD, [-1, 1]
+ncs_imag  = ncs.imag                                       # sine of IPD,   [-1, 1]
+coh_real_erb = ncs_real @ self.mel_fb                      # (B, n_bands)
+coh_imag_erb = ncs_imag @ self.mel_fb                      # (B, n_bands)
 
 feat = torch.cat([
     self._to_erb(mic_f.abs().pow(2)),
     self._to_erb(ref_power),
     self._to_erb(innovation.abs().pow(2)),
-    coh_erb,                                    # +1 feature group
+    coh_real_erb,                                          # +1 feature group
+    coh_imag_erb,                                          # +1 feature group
 ], ...)
 ```
 
-GRU input grows from `3 × n_bands` to `4 × n_bands`. Minor param increase (~10%).
+GRU input grows from `3 × n_bands` to `5 × n_bands`. Minor param increase (~13%).
+
+**Engineering notes:**
+- `.clamp(min=1e-8)` on the denominator is required — without it, near-silence frames produce NaN/±∞ that immediately destabilize the GRU hidden state.
+- Feature scale mismatch: coherence features are bounded [-1, 1] while log-power features are unbounded. This slows early learning of coherence but does not cause divergence — no additional normalization needed.
+- NeuralKalmanAHS (arXiv 2309.16049), our direct architecture basis, does NOT include coherence features. Both IPD components are an improvement over the paper.
+- The CADB-Conformer ablation (Interspeech 2024) found inter-channel features contributed +0.84 dB SDRi — the closest published evidence of impact for this type of feature.
 
 ---
 
@@ -152,14 +161,21 @@ GRU input grows from `3 × n_bands` to `4 × n_bands`. Minor param increase (~10
 
 **Current:** `HIDDEN=128, N_LAYERS=2, N_BANDS=64`
 
-**The constraint:** This runs on a Pi 5 in real time. At 10ms blocks (HOP=480), each block budget is ~5-8ms for inference. The GRU is the bottleneck.
+**The constraint:** This runs on a Pi 5 in real time. At 10ms blocks (HOP=480), each block budget is ~5ms for inference. The GRU is the bottleneck.
 
-**Options in rough priority:**
-1. `N_BANDS=128` — finer frequency resolution for Q/R estimates. Narrow feedback peaks might fall between 64-band boundaries and get over-smoothed. Near-free in compute (ERB compression is a matrix multiply, not a recurrence).
-2. `HIDDEN=256` — doubles GRU capacity. ~3-4x parameter increase but same recurrence depth. Estimate: still real-time on Pi 5 (profile first).
-3. `N_LAYERS=3` — adds depth. Less impact than width. Not recommended without profiling.
+**Do P2 (coherence features) before P3.** ICASSP 2023 AEC Challenge found a negative correlation (PCC = -0.54) between parameter count and score — better features beat more capacity for reference-conditioned tasks. A HIDDEN=128 model with coherence features will likely outperform HIDDEN=256 without them.
 
-Before changing: profile the current model on Pi 5 to know the real-time budget headroom:
+**Compute cost of HIDDEN=256 (verified):**
+- GRU MACs per frame: ~221K (current) → ~737K (HIDDEN=256) — 3.3× increase
+- Estimated Pi 5 latency: 1.5–10ms per frame (wide range — PyTorch kernel overhead dominates at small matrix sizes)
+- The upper end busts the budget. **Must benchmark empirically before training.**
+
+**Options in priority order:**
+1. `N_BANDS=128` — finer Q/R resolution, near-free compute (matrix multiply not recurrence).
+2. `HIDDEN=256` — only attempt after: (a) P2 coherence features are working, (b) Pi 5 timing is measured empirically and shows headroom. Use `torch.quantization.quantize_dynamic` (qnnpack) for 2–4× ARM speedup if needed.
+3. `N_LAYERS=3` — adds depth not width. Less impact. Not recommended without profiling.
+
+**Before attempting HIDDEN=256**, measure current model on Pi 5:
 ```python
 import time
 model.eval()
@@ -170,7 +186,7 @@ for _ in range(1000):
     print(time.perf_counter() - t0)
 ```
 
-Target: < 3ms per block (leaves margin for STFT, I/O).
+Target: current model < 2ms, leaving headroom for HIDDEN=256 at 3.3× cost.
 
 ---
 

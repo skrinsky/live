@@ -36,8 +36,9 @@ class FDKFNet(nn.Module):
         self.register_buffer('mel_fb', fb)
 
         # GRU: estimates log(Q_k) and log(R_k) per ERB band per frame
-        # Input: log power of mic, ref, and innovation per band (3 × n_bands)
-        self.gru  = nn.GRU(n_bands * 3, hidden, num_layers=n_layers, batch_first=True)
+        # Input: log power of mic, ref, innovation (3 × n_bands) +
+        #        cosine and sine of inter-channel phase difference (2 × n_bands) = 5 × n_bands
+        self.gru  = nn.GRU(n_bands * 5, hidden, num_layers=n_layers, batch_first=True)
         # Output: log(Q) and log(R) per band (interpolated back to all bins)
         self.proj = nn.Linear(hidden, n_bands * 2)
 
@@ -63,12 +64,23 @@ class FDKFNet(nn.Module):
         ref_power  = ref_f.abs().pow(2)                       # (B, F) real
         innovation = mic_f - H_prev * ref_f                   # (B, F) complex
 
-        # GRU features (ERB-compressed log power)
+        # Inter-channel phase difference (IPD): normalized cross-spectrum, real + imag.
+        # Real part = cosine of IPD (phase alignment magnitude).
+        # Imag part = sine of IPD (phase lead/lag direction).
+        # Using only real would discard whether ref leads or lags mic — that directionality
+        # is what distinguishes feedback coherence from coincidental spectral correlation.
+        # Clamp denominator to prevent NaN on silence or P1c reference-dropout frames.
+        ipd_denom = (mic_f.abs() * ref_f.abs()).clamp(min=1e-8)   # (B, F)
+        ncs       = mic_f * ref_f.conj() / ipd_denom              # (B, F) complex, |ncs|≤1
+
+        # GRU features: log power (3 groups) + IPD real + IPD imag (2 groups) = 5 × n_bands
         feat = torch.cat([
             self._to_erb(mic_f.abs().pow(2)),
             self._to_erb(ref_power),
             self._to_erb(innovation.abs().pow(2)),
-        ], dim=-1).unsqueeze(1)                               # (B, 1, 3*n_bands)
+            ncs.real @ self.mel_fb,                            # cosine of IPD, [-1, 1]
+            ncs.imag @ self.mel_fb,                            # sine of IPD,   [-1, 1]
+        ], dim=-1).unsqueeze(1)                                # (B, 1, 5*n_bands)
 
         gru_out, gru_h = self.gru(feat, gru_h)               # (B, 1, hidden)
         cov = self.proj(gru_out[:, 0, :])                     # (B, 2*n_bands)
