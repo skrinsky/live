@@ -156,7 +156,10 @@ def main():
         else:
             enhanced = fdaf.process(mono, ref_block)
 
-        outdata[:, 0] = np.clip(enhanced[:frames], -1.0, 1.0)
+        # Undo input RMS normalization so output level matches the original mic level.
+        # The model was trained with a normalized input; inverting the scale here means
+        # the performer hears no unexpected level change when feedback is suppressed.
+        outdata[:, 0] = np.clip(enhanced[:frames] / rms_scale, -1.0, 1.0)
 
     # When --ref is set, open 2 input channels: ch0 = mic, ch1 = loopback ref.
     # The loopback ref must be ch1 on the same audio interface as the mic (same device index)

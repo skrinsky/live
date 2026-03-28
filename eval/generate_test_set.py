@@ -90,8 +90,8 @@ def generate_test_set(vocal_dir='data/clean_vocals', out_dir='data/listening_tes
         room_ir = synthetic_room_ir(sc['rt60'])
 
         reverberant_vocal = fftconvolve(vocal, room_ir)[:target_len]
-        mains_fb          = fftconvolve(vocal, mains_ir)[:target_len] * sc['mains_gain']
-        mon_fb            = fftconvolve(vocal, mon_ir)[:target_len]   * sc['mon_gain']
+        mains_fb          = fftconvolve(reverberant_vocal, mains_ir)[:target_len] * sc['mains_gain']
+        mon_fb            = fftconvolve(reverberant_vocal, mon_ir)[:target_len]   * sc['mon_gain']
 
         mic_signal = (reverberant_vocal + mains_fb + mon_fb).astype(np.float32)
         clean      = reverberant_vocal.astype(np.float32)
