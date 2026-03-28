@@ -57,7 +57,7 @@ N_FREQS        = N_FFT // 2 + 1
 MAX_IR_SAMPLES = int(1.5 * SR)  # 1.5s cap — F.conv1d cost is O(L_ir * HOP) per frame;
                                   # gymnasium rooms produce 2s+ IRs without this cap
 
-SEQ_FRAMES       = 50     # BPTT window. Start here; ramp 50 → 100 → 200 once stable
+SEQ_FRAMES       = 100    # BPTT window. Run 2: 100 (1s); next: 200 once stable
 BATCH_SIZE       = 4      # gradient accumulation
 EPOCHS           = 150    # extended to cover warmup + full decay
 LR               = 1e-4
