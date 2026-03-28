@@ -297,7 +297,10 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
         if not drop_ref:
             fb_gt_f  = torch_stft((mains_fb + monitor_fb).detach(), window).unsqueeze(0)
             fb_est_f = H * ref_f                         # what H predicts feedback is
-            echo_loss = echo_loss + F.mse_loss(fb_est_f.abs(), fb_gt_f.abs().detach())
+            echo_loss = echo_loss + F.mse_loss(
+                torch.log1p(fb_est_f.abs()),
+                torch.log1p(fb_gt_f.abs()).detach()
+            )
 
         # ── Output frame (differentiable, soft-clipped, feeds back next frame)
         out_frame = torch_istft(speech_f.squeeze(0))
