@@ -38,6 +38,10 @@ SCENARIOS = [
     {'name': '5_sibilant_vocal',    'mains_gain': 0.60, 'mon_gain': 0.55, 'rt60': 0.5},
     {'name': '6_sustained_vowel',   'mains_gain': 0.65, 'mon_gain': 0.60, 'rt60': 0.5},
     {'name': '7_multi_freq_fb',     'mains_gain': 0.75, 'mon_gain': 0.80, 'rt60': 0.8},
+    # Near- and above-threshold scenarios — where actual Larsen buildup occurs.
+    # These are the cases that matter most for a feedback suppressor.
+    {'name': '8_near_threshold',    'mains_gain': 0.95, 'mon_gain': 0.90, 'rt60': 0.6},
+    {'name': '9_above_threshold',   'mains_gain': 1.10, 'mon_gain': 1.05, 'rt60': 0.5},
 ]
 
 
