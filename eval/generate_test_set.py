@@ -21,7 +21,7 @@ import random
 import numpy as np
 import soundfile as sf
 from pathlib import Path
-from scipy.signal import fftconvolve
+from scipy.signal import fftconvolve, butter, sosfilt
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / 'simulator'))
@@ -94,8 +94,13 @@ def generate_test_set(vocal_dir='data/clean_vocals', out_dir='data/listening_tes
         mon_fb            = fftconvolve(reverberant_vocal, mon_ir)[:target_len]   * sc['mon_gain']
 
         mic_signal = (reverberant_vocal + mains_fb + mon_fb).astype(np.float32)
-        clean      = reverberant_vocal.astype(np.float32)
-        ref_signal = reverberant_vocal.astype(np.float32)
+        # HPF the clean reference to match training target convention (recursive_train.py
+        # HPFs reverb_np before using it as the loss target). Scoring enhanced (HPF'd model
+        # output) against non-HPF'd clean would penalise the model for sub-90Hz content it
+        # correctly removed. Same fix applied in generate_pairs.py lines 586-593.
+        _hpf       = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
+        clean      = sosfilt(_hpf, reverberant_vocal).astype(np.float32)
+        ref_signal = reverberant_vocal.astype(np.float32)  # non-HPF'd; HPF'd in run_inference.py
 
         # Normalise to -18 dBFS peak (same scale for all three files)
         peak  = max(np.abs(mic_signal).max(), np.abs(clean).max(), 1e-8)

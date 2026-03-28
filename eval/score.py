@@ -45,6 +45,27 @@ def _to_pesq_sr(audio: np.ndarray) -> np.ndarray:
     return librosa.resample(audio.astype(np.float32), orig_sr=SR, target_sr=PESQ_SR)
 
 
+def _score_pair(clean_48, enhanced_48, label, scores):
+    """Score one clean/enhanced pair and append results to scores dict."""
+    min_len     = min(len(clean_48), len(enhanced_48))
+    clean_48    = clean_48[:min_len]
+    enhanced_48 = enhanced_48[:min_len]
+
+    if _HAS_PESQ and _HAS_LIBROSA:
+        try:
+            clean_16    = _to_pesq_sr(clean_48)
+            enhanced_16 = _to_pesq_sr(enhanced_48)
+            scores['pesq'].append(pesq(PESQ_SR, clean_16, enhanced_16, 'wb'))
+        except Exception as e:
+            print(f"  PESQ error on {label}: {e}")
+
+    if _HAS_STOI:
+        try:
+            scores['stoi'].append(stoi(clean_48, enhanced_48, SR))
+        except Exception as e:
+            print(f"  STOI error on {label}: {e}")
+
+
 def evaluate(enhanced_dir=None, clean_dir=None):
     enhanced_dir = Path(enhanced_dir or PROJECT_ROOT / 'data' / 'eval_output')
     clean_dir    = Path(clean_dir    or PROJECT_ROOT / 'data' / 'training_pairs' / 'val')
@@ -56,40 +77,34 @@ def evaluate(enhanced_dir=None, clean_dir=None):
 
     scores = {'pesq': [], 'stoi': []}
 
+    # --- Indexed val-set format: clean_000001.wav paired with enhanced_000001.wav ---
     for clean_path in sorted(clean_dir.glob('clean_*.wav')):
-        parts = clean_path.stem.split('_', 1)
-        if len(parts) < 2:
-            # Listening test files are named 'clean.wav' — no suffix index, skip here
-            continue
-        idx           = parts[1]
+        idx           = clean_path.stem.split('_', 1)[1]
         enhanced_path = enhanced_dir / f'enhanced_{idx}.wav'
         if not enhanced_path.exists():
             print(f"  [SKIP] missing enhanced_{idx}.wav in {enhanced_dir}")
             continue
-
         clean_48,    _ = sf.read(str(clean_path),    dtype='float32')
         enhanced_48, _ = sf.read(str(enhanced_path), dtype='float32')
+        _score_pair(clean_48, enhanced_48, idx, scores)
 
-        min_len     = min(len(clean_48), len(enhanced_48))
-        clean_48    = clean_48[:min_len]
-        enhanced_48 = enhanced_48[:min_len]
-
-        if _HAS_PESQ and _HAS_LIBROSA:
-            try:
-                clean_16    = _to_pesq_sr(clean_48)
-                enhanced_16 = _to_pesq_sr(enhanced_48)
-                scores['pesq'].append(pesq(PESQ_SR, clean_16, enhanced_16, 'wb'))
-            except Exception as e:
-                print(f"  PESQ error on {idx}: {e}")
-
-        if _HAS_STOI:
-            try:
-                scores['stoi'].append(stoi(clean_48, enhanced_48, SR))
-            except Exception as e:
-                print(f"  STOI error on {idx}: {e}")
+    # --- Listening-test format: scenario_dir/clean.wav + scenario_dir/enhanced.wav ---
+    # Works when pointed at a single scenario dir or the parent listening_test/ dir.
+    for clean_path in sorted(clean_dir.rglob('clean.wav')):
+        enhanced_path = clean_path.parent / 'enhanced.wav'
+        if not enhanced_path.exists():
+            print(f"  [SKIP] no enhanced.wav in {clean_path.parent.name}/")
+            continue
+        clean_48,    _ = sf.read(str(clean_path),    dtype='float32')
+        enhanced_48, _ = sf.read(str(enhanced_path), dtype='float32')
+        _score_pair(clean_48, enhanced_48, clean_path.parent.name, scores)
 
     if not scores['pesq'] and not scores['stoi']:
-        print("No scored files found. Check that enhanced_*.wav files exist in --enhanced-dir.")
+        print("No scored files found.")
+        print("  Val set:       python eval/score.py --enhanced-dir data/eval_output "
+              "--clean-dir data/training_pairs/val")
+        print("  Listening test: python eval/score.py --enhanced-dir data/listening_test "
+              "--clean-dir data/listening_test")
         return scores
 
     if scores['pesq']:
