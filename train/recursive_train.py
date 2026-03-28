@@ -469,7 +469,8 @@ def train():
         scheduler.step()
         writer.add_scalar('loss/train',           avg_loss, epoch)
         writer.add_scalar('teacher_forcing_prob', tf_prob,  epoch)
-        print(f"Epoch {epoch:3d} | loss {avg_loss:.4f} | "
+        best_str = f"{best_loss:.4f}" if best_loss < float('inf') else "none"
+        print(f"Epoch {epoch:3d} | loss {avg_loss:.4f} | best {best_str} | "
               f"valid {valid_steps}/{n_steps} | tf={tf_prob:.2f}")
 
         if avg_loss < best_loss:
