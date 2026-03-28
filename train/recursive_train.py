@@ -237,6 +237,7 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
     H, P, gru_h = model.init_state(1, device)
 
     outputs     = []   # (HOP,) tensors per frame — in compute graph, used for feedback
+    echo_loss   = torch.zeros((), device=device)   # P1b: accumulated per-frame
 
     for t in range(SEQ_FRAMES):
         start, end = t * HOP, t * HOP + HOP
@@ -271,6 +272,15 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
             ref_frame    = reverb_frame.detach()  # teacher signal — stable warm start
             vad_override = 1.0                    # clean ref → always update H
 
+        # ── P1c: reference channel dropout ───────────────────────────────────
+        # 10% of frames: zero ref and freeze H/P. Forces the model to learn that
+        # reference-present frames yield better outcomes than reference-absent frames,
+        # preventing reference-ignoring shortcuts. (DCCRN-E pattern)
+        drop_ref = random.random() < 0.10
+        if drop_ref:
+            ref_frame    = torch.zeros_like(ref_frame)
+            vad_override = 0.0   # freeze H/P — no meaningful update without reference
+
         # ── Differentiable STFT ───────────────────────────────────────────────
         mic_f = torch_stft(mic_frame, window).unsqueeze(0)   # (1, N_FREQS)
         ref_f = torch_stft(ref_frame, window).unsqueeze(0)
@@ -279,6 +289,15 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
         speech_f, H, P, gru_h = model.forward_frame(
             mic_f, ref_f, H, P, gru_h, vad_override=vad_override
         )
+
+        # ── P1b: echo-path auxiliary loss ─────────────────────────────────────
+        # Supervise H directly against the known ground-truth feedback component.
+        # Only when ref is not dropped (H*0 vs nonzero target is a meaningless signal).
+        # Coefficient 0.05 keeps SI-SDR dominant. (DPCRN pattern)
+        if not drop_ref:
+            fb_gt_f  = torch_stft((mains_fb + monitor_fb).detach(), window).unsqueeze(0)
+            fb_est_f = H * ref_f                         # what H predicts feedback is
+            echo_loss = echo_loss + F.mse_loss(fb_est_f.abs(), fb_gt_f.abs().detach())
 
         # ── Output frame (differentiable, soft-clipped, feeds back next frame)
         out_frame = torch_istft(speech_f.squeeze(0))
@@ -295,7 +314,9 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
     # standard practice in speech enhancement literature.
     out_full   = torch.cat(outputs)          # (SEQ_FRAMES * HOP,) — in compute graph
     clean_full = reverb_t.detach()           # (SEQ_FRAMES * HOP,) — no grad
-    return -si_sdr(out_full, clean_full)
+    si_sdr_loss = -si_sdr(out_full, clean_full)
+    echo_aux    = 0.05 * echo_loss / SEQ_FRAMES   # P1b: normalized auxiliary term
+    return si_sdr_loss + echo_aux
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
@@ -310,7 +331,8 @@ def train():
     writer    = SummaryWriter(str(PROJECT_ROOT / 'checkpoints' / 'fdkfnet' / 'tb'))
 
     # ── Load files ────────────────────────────────────────────────────────────
-    vocal_files      = list((PROJECT_ROOT / 'data' / 'clean_vocals').rglob('*.wav'))
+    vocal_files      = [f for f in (PROJECT_ROOT / 'data' / 'clean_vocals').rglob('*.wav')
+                        if not f.name.startswith('._') and '__MACOSX' not in f.parts]
     ir_pool_dir      = PROJECT_ROOT / 'data' / 'ir_pool'
     mains_ir_files   = list(ir_pool_dir.glob('mains_*.wav'))
     monitor_ir_files = list(ir_pool_dir.glob('monitor_*.wav'))
