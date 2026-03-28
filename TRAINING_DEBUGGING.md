@@ -35,6 +35,31 @@ This means epoch 1 of a warm-start starts where the previous run ended — no di
 
 ---
 
+## P1a — Convolutive Noise (high impact, easy code change)
+
+**Problem:** Noise is currently added additively to the mic signal (`mic_frame = reverb_frame + feedback + noise_frame`). The noise clips from DNS Challenge are never convolved with the room IR. This means the model can learn to suppress feedback by spectral pattern-matching, without ever actually learning to use the reference signal for discrimination.
+
+**Why this matters for FDKFNet specifically:** The whole point of the reference signal is to distinguish "sounds that came from the PA (feedback)" from "sounds that didn't (crowd, room tone)." In a real venue, crowd noise, HVAC, and other ambient sounds pass through the same room acoustics as the feedback — they arrive at the mic with the same reverb character. With additive training noise, the feedback is the only reverberant thing in the mix and the model can identify it without needing the reference at all. With convolutive noise, both crowd noise and feedback are reverberant — the only way to tell them apart is coherence with the reference signal. This forces the Kalman filter to actually learn to use the reference.
+
+**Research basis:** REVERB Challenge (2014), WHAMR! dataset (2020), all CHiME challenges — all built around convolving ambient noise with room IRs to simulate realistic conditions.
+
+**Fix:** In `train_one_sequence()` in `recursive_train.py`, convolve the noise with the room IR before mixing (50% of the time — some noise genuinely is non-reverberant, e.g., electrical hum):
+
+```python
+# Current (additive only):
+noise_np = noise_np[:target_len]
+
+# Fix (convolutive 50% of time):
+if random.random() < 0.5:
+    noise_np = fftconvolve(noise_np, room_ir_np)[:target_len].astype(np.float32)
+else:
+    noise_np = noise_np[:target_len]
+```
+
+This uses the DNS Challenge crowd/ambient clips we already have — no new data needed.
+
+---
+
 ## P1 — Increase Above-Threshold Training Ratio (easy, high impact)
 
 **Problem:** 75% of training sequences use sub-Larsen gains (0.3–0.9). For those, doing nothing achieves good SI-SDR. The model may learn "mostly pass through, occasionally suppress." The above-threshold sequences (25%) are the only ones that actually require suppression — and they're a minority.
