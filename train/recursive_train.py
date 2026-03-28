@@ -108,17 +108,20 @@ def si_sdr(estimate: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> t
 def sample_gain():
     """
     Returns (mains_gain, monitor_gain) independently sampled.
-    40% normal (0.2–0.6) | 35% near-threshold (0.6–0.9) | 25% active (0.9–1.5)
+    30% normal (0.2–0.6) | 25% near-threshold (0.6–0.9) | 45% active (0.9–1.5)
     Both paths sampled independently — monitor can be hot while mains is quiet,
     which is the most common failure mode in small venues and HOW settings.
     Above-threshold gains (> 1.0) are safe with SI-SDR loss because SI-SDR is
     scale-invariant and bounded regardless of feedback amplitude.
+    Raised above-threshold from 25%→45%: model needs to see actual Larsen buildup
+    as the common case, not the exception. Below-threshold sequences are easy (do
+    nothing gets good SI-SDR) and dilute the gradient signal for suppression.
     """
     def _one():
         t = random.random()
-        if t < 0.40:   return random.uniform(0.2, 0.6)
-        elif t < 0.75: return random.uniform(0.6, 0.9)
-        else:          return random.uniform(0.9, 1.5)
+        if t < 0.30:   return random.uniform(0.2, 0.6)   # 30% low
+        elif t < 0.55: return random.uniform(0.6, 0.9)   # 25% near-threshold
+        else:          return random.uniform(0.9, 1.5)   # 45% active Larsen
     return _one(), _one()
 
 
