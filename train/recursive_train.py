@@ -89,20 +89,35 @@ def make_console_hpf(cutoff_hz=90, sr=SR):
 
 # ── Gain sampling ──────────────────────────────────────────────────────────────
 
+def si_sdr(estimate: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Scale-Invariant Signal-to-Distortion Ratio (SI-SDR), in dB.
+    Both inputs are (HOP,) time-domain tensors. Returns a scalar.
+    Minimise -SI-SDR during training (higher SI-SDR = better).
+    Bounded and scale-invariant — unaffected by feedback amplitude.
+    """
+    target  = target - target.mean()
+    estimate = estimate - estimate.mean()
+    dot     = (estimate * target).sum()
+    s_target = dot / (target.pow(2).sum() + eps) * target
+    noise   = estimate - s_target
+    return 10 * torch.log10(s_target.pow(2).sum() / (noise.pow(2).sum() + eps))
+
+
 def sample_gain():
     """
     Returns (mains_gain, monitor_gain) independently sampled.
-    Gains are capped below the Larsen threshold (loop gain < 1.0) during initial
-    training. Above-threshold scenarios produce near-infinite STFT values that
-    dominate the loss and prevent convergence. Fine-tune on above-threshold
-    data only after the model handles sub-threshold cases reliably.
-    60% normal (0.2–0.55) | 40% near-threshold (0.55–0.85)
+    40% normal (0.2–0.6) | 35% near-threshold (0.6–0.9) | 25% active (0.9–1.5)
+    Both paths sampled independently — monitor can be hot while mains is quiet,
+    which is the most common failure mode in small venues and HOW settings.
+    Above-threshold gains (> 1.0) are safe with SI-SDR loss because SI-SDR is
+    scale-invariant and bounded regardless of feedback amplitude.
     """
     def _one():
-        if random.random() < 0.60:
-            return random.uniform(0.2, 0.55)
-        else:
-            return random.uniform(0.55, 0.85)
+        t = random.random()
+        if t < 0.40:   return random.uniform(0.2, 0.6)
+        elif t < 0.75: return random.uniform(0.6, 0.9)
+        else:          return random.uniform(0.9, 1.5)
     return _one(), _one()
 
 
@@ -251,16 +266,11 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
         out_frame = torch.tanh(out_frame / CLIP_LEVEL) * CLIP_LEVEL
         outputs.append(out_frame)
 
-        # ── Loss: scale-normalised spectral MSE ───────────────────────────────
-        # Normalise by clean signal power so sequences with strong feedback
-        # (large mic values → large STFT values) don't dominate the gradient.
-        # Without normalisation, loop-gain-near-1 sequences have 100x the loss
-        # of quiet sequences and corrupt the epoch average.
-        clean_f    = torch_stft(reverb_frame.detach(), window).unsqueeze(0)
-        norm       = clean_f.abs().pow(2).mean().clamp(min=1e-8)
-        frame_loss = (F.mse_loss(speech_f.real, clean_f.real)
-                    + F.mse_loss(speech_f.imag, clean_f.imag)) / norm
-        total_loss = total_loss + frame_loss
+        # ── Loss: SI-SDR on time-domain output ────────────────────────────────
+        # SI-SDR is scale-invariant and bounded in dB — unaffected by feedback
+        # amplitude. MSE on raw STFT values produced 100x loss variance between
+        # stable (gain=0.5) and unstable (gain=1.3) sequences, corrupting training.
+        total_loss = total_loss - si_sdr(out_frame, reverb_frame.detach())
 
     if not outputs:
         return None
