@@ -52,7 +52,7 @@ class FDKFNet(nn.Module):
         h = torch.zeros(self.gru.num_layers, batch_size, self.gru.hidden_size, device=device)
         return H, P, h
 
-    def forward_frame(self, mic_f, ref_f, H_prev, P_prev, gru_h):
+    def forward_frame(self, mic_f, ref_f, H_prev, P_prev, gru_h, vad_override=None):
         """
         One STFT frame.
         mic_f, ref_f : (B, F) complex
@@ -92,7 +92,13 @@ class FDKFNet(nn.Module):
         # no meaningful feedback path is active. Use .detach() so gate doesn't block grad.
         VAD_RATIO   = 20.0
         mic_power   = mic_f.abs().pow(2)                      # (B, F)
-        vad_gate    = (mic_power / (ref_power + 1e-8) < VAD_RATIO).float().detach()
+        if vad_override is not None:
+            # During teacher-forced training, ref=clean_vocal causes mic/ref >> VAD_RATIO
+            # at feedback frequencies, freezing H exactly when it should be learning.
+            # Override to 1.0 (always update) during TF training; None = normal inference.
+            vad_gate = torch.full_like(mic_power, vad_override)
+        else:
+            vad_gate = (mic_power / (ref_power + 1e-8) < VAD_RATIO).float().detach()
         # vad_gate = 1.0 → feedback present, update H/P normally
         # vad_gate = 0.0 → clean speech, hold H/P at previous values
 

@@ -227,7 +227,6 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
     H, P, gru_h = model.init_state(1, device)
 
     outputs     = []   # (HOP,) tensors per frame — in compute graph, used for feedback
-    total_loss  = torch.tensor(0.0, device=device)
 
     for t in range(SEQ_FRAMES):
         start, end = t * HOP, t * HOP + HOP
@@ -258,23 +257,32 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
         mic_f = torch_stft(mic_frame, window).unsqueeze(0)   # (1, N_FREQS)
         ref_f = torch_stft(ref_frame, window).unsqueeze(0)
 
-        # ── Model forward (gradients flow through H, P, gru_h across frames) ─
-        speech_f, H, P, gru_h = model.forward_frame(mic_f, ref_f, H, P, gru_h)
+        # ── Model forward ─────────────────────────────────────────────────────
+        # Disable VAD gate during teacher-forced training: with ref=clean_vocal,
+        # mic_power/ref_power >> VAD_RATIO at feedback frequencies, so the gate
+        # freezes H exactly when it should be learning the feedback path.
+        # The gate is only meaningful at inference (ref = true PA loopback).
+        speech_f, H, P, gru_h = model.forward_frame(
+            mic_f, ref_f, H, P, gru_h,
+            vad_override=1.0 if teacher_forcing_prob > 0 else None
+        )
 
         # ── Output frame (differentiable, soft-clipped, feeds back next frame)
         out_frame = torch_istft(speech_f.squeeze(0))
         out_frame = torch.tanh(out_frame / CLIP_LEVEL) * CLIP_LEVEL
         outputs.append(out_frame)
 
-        # ── Loss: SI-SDR on time-domain output ────────────────────────────────
-        # SI-SDR is scale-invariant and bounded in dB — unaffected by feedback
-        # amplitude. MSE on raw STFT values produced 100x loss variance between
-        # stable (gain=0.5) and unstable (gain=1.3) sequences, corrupting training.
-        total_loss = total_loss - si_sdr(out_frame, reverb_frame.detach())
-
     if not outputs:
         return None
-    return total_loss / SEQ_FRAMES
+
+    # ── Loss: SI-SDR over the full sequence ───────────────────────────────────
+    # Computed once over 500ms, not per-frame. Per-frame SI-SDR on 480 samples
+    # is numerically unstable: near-silent frames have target.pow(2) ≈ 0, making
+    # SI-SDR → -inf. A single sequence-level computation is stable and matches
+    # standard practice in speech enhancement literature.
+    out_full   = torch.cat(outputs)          # (SEQ_FRAMES * HOP,) — in compute graph
+    clean_full = reverb_t.detach()           # (SEQ_FRAMES * HOP,) — no grad
+    return -si_sdr(out_full, clean_full)
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
