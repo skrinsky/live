@@ -339,15 +339,23 @@ def train():
                     help='Override learning rate (default: LR constant in script). '
                          'Use a lower value (e.g. 3e-5) when resuming from a checkpoint.')
     args, _ = ap.parse_known_args()
+    resume_tf   = 0.0          # TF to continue from (overridden if checkpoint has it)
+    resume_best = float('inf') # best loss to continue from (overridden if checkpoint has it)
     if args.resume:
         resume_path = Path(args.resume)
         ckpt = torch.load(str(resume_path), map_location=device)
-        model.load_state_dict(ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt)
-        # Back up the source checkpoint so run 3 can resume from it if needed.
+        state = ckpt if isinstance(ckpt, dict) and 'model' in ckpt else {'model': ckpt}
+        model.load_state_dict(state['model'])
+        # Restore TF and best_loss so warm-start continues smoothly without regression.
+        # Checkpoints without these keys default to tf=0.0 (safe: assumes TF fully decayed).
+        resume_tf   = state.get('tf_prob',   0.0)
+        resume_best = state.get('best_loss', float('inf'))
+        # Back up the source checkpoint before anything overwrites it.
         backup = resume_path.parent / (resume_path.stem + '_prev.pt')
         import shutil
         shutil.copy2(str(resume_path), str(backup))
-        print(f"Warm-started weights from {args.resume} (TF and epoch counter reset to 1)")
+        print(f"Warm-started weights from {args.resume}")
+        print(f"  TF continuing from {resume_tf:.2f}, best_loss continuing from {resume_best:.4f}")
         print(f"  Backup saved → {backup}")
 
     if args.lr is not None:
@@ -356,13 +364,16 @@ def train():
         scheduler.base_lrs = [args.lr for _ in scheduler.base_lrs]
         print(f"Learning rate overridden to {args.lr}")
 
-    best_loss = float('inf')
+    best_loss = resume_best
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
 
-        # Teacher-forcing prob: frozen at 1.0 during warmup, then 0.01/epoch decay
-        if epoch <= TF_WARMUP_EPOCHS:
+        # Teacher-forcing prob: frozen at 1.0 during warmup, then 0.01/epoch decay.
+        # On resume, continues decaying from the saved tf_prob rather than resetting to 1.0.
+        if args.resume:
+            tf_prob = max(0.0, resume_tf - (epoch - 1) * TF_DECAY_RATE)
+        elif epoch <= TF_WARMUP_EPOCHS:
             tf_prob = 1.0
         else:
             tf_prob = max(0.0, 1.0 - (epoch - TF_WARMUP_EPOCHS) * TF_DECAY_RATE)
@@ -432,8 +443,12 @@ def train():
 
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save({'epoch': epoch, 'model': model.state_dict()},
-                       str(ckpt_dir / 'best.pt'))
+            torch.save({
+                'epoch':     epoch,
+                'model':     model.state_dict(),
+                'tf_prob':   tf_prob,
+                'best_loss': best_loss,
+            }, str(ckpt_dir / 'best.pt'))
             print("  ✓ New best")
 
 
