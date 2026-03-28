@@ -59,7 +59,7 @@ MAX_IR_SAMPLES = int(1.5 * SR)  # 1.5s cap — F.conv1d cost is O(L_ir * HOP) pe
 
 SEQ_FRAMES       = 100    # BPTT window. Run 2: 100 (1s); next: 200 once stable
 BATCH_SIZE       = 4      # gradient accumulation
-EPOCHS           = 150    # extended to cover warmup + full decay
+EPOCHS           = 300    # extended: SEQ_FRAMES=100 from scratch needs ~2x more epochs
 LR               = 1e-4
 GRAD_CLIP        = 0.5
 CLIP_LEVEL       = 0.95   # soft-clip ceiling on model output in feedback path
