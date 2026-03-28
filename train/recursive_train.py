@@ -209,8 +209,14 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
     hpf = make_console_hpf(np.random.uniform(70, 120))
     reverb_np = sosfilt(hpf, reverb_np).astype(np.float32)
 
-    # Noise scaling
-    noise_np    = noise_np[:target_len]
+    # Noise: 50% convolutive (crowd/ambient convolved with room IR), 50% additive.
+    # Convolutive noise forces the model to use reference coherence to distinguish
+    # feedback from crowd — both arrive with the same reverb character. Without this,
+    # the model can identify feedback by spectral pattern alone, ignoring the reference.
+    if random.random() < 0.5:
+        noise_np = fftconvolve(noise_np, room_ir_np)[:target_len].astype(np.float32)
+    else:
+        noise_np = noise_np[:target_len]
     vocal_rms   = float(np.sqrt(np.mean(reverb_np ** 2))) + 1e-8
     noise_rms   = float(np.sqrt(np.mean(noise_np  ** 2))) + 1e-8
     snr_db      = np.random.uniform(5, 40)
