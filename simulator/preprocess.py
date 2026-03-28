@@ -13,13 +13,10 @@ Usage:
 import argparse, sys
 import soundfile as sf
 import numpy as np
+from math import gcd
 from pathlib import Path
+from scipy.signal import resample_poly
 from tqdm import tqdm
-
-try:
-    import librosa
-except ImportError:
-    sys.exit("librosa not installed — run: pip install librosa")
 
 TARGET_SR   = 48000
 AUDIO_EXTS  = {'.wav', '.flac', '.aiff', '.aif', '.ogg'}
@@ -63,8 +60,9 @@ def process_file(path: Path, dry_run: bool) -> str:
     if dry_run:
         return f"would resample {sr}Hz → {TARGET_SR}Hz ({audio.shape[0]} samples)"
 
-    # Resample using librosa (high-quality sinc resampling)
-    resampled = librosa.resample(audio, orig_sr=sr, target_sr=TARGET_SR)
+    # Resample using scipy.signal.resample_poly (high-quality polyphase resampling)
+    g         = gcd(sr, TARGET_SR)
+    resampled = resample_poly(audio, TARGET_SR // g, sr // g).astype(np.float32)
 
     # Preserve bit depth where possible
     subtype = 'PCM_16'
