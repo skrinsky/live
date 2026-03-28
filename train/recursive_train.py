@@ -335,6 +335,9 @@ def train():
     ap.add_argument('--resume', type=str, default=None,
                     help='Path to checkpoint to warm-start weights from. '
                          'TF schedule and epoch counter always restart from 1.')
+    ap.add_argument('--lr', type=float, default=None,
+                    help='Override learning rate (default: LR constant in script). '
+                         'Use a lower value (e.g. 3e-5) when resuming from a checkpoint.')
     args, _ = ap.parse_known_args()
     if args.resume:
         resume_path = Path(args.resume)
@@ -346,6 +349,12 @@ def train():
         shutil.copy2(str(resume_path), str(backup))
         print(f"Warm-started weights from {args.resume} (TF and epoch counter reset to 1)")
         print(f"  Backup saved → {backup}")
+
+    if args.lr is not None:
+        for pg in optimizer.param_groups:
+            pg['lr'] = args.lr
+        scheduler.base_lrs = [args.lr for _ in scheduler.base_lrs]
+        print(f"Learning rate overridden to {args.lr}")
 
     best_loss = float('inf')
 
