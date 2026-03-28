@@ -58,13 +58,20 @@ MAX_IR_SAMPLES = int(1.5 * SR)  # 1.5s cap — F.conv1d cost is O(L_ir * HOP) pe
 
 SEQ_FRAMES       = 50     # BPTT window. Start here; ramp 50 → 100 → 200 once stable
 BATCH_SIZE       = 4      # gradient accumulation
-EPOCHS           = 100
+EPOCHS           = 150    # extended to cover warmup + full decay
 LR               = 1e-4
 GRAD_CLIP        = 0.5
 CLIP_LEVEL       = 0.95   # soft-clip ceiling on model output in feedback path
 
-TF_START         = 0.9    # initial teacher-forcing probability (ref = clean vocal)
-TF_DECAY_EPOCHS  = 50     # linear decay to 0 — after this, ref = model's own output
+# Teacher-forcing schedule:
+#   Phase 1 (epochs 1–TF_WARMUP_EPOCHS): TF=1.0 — model sees only clean ref.
+#     Model learns supervised speech enhancement before any recursive training.
+#     Prevents the shortcut-collapse that occurs when random-init model output
+#     is fed back as ref before the model produces anything meaningful.
+#   Phase 2 (after warmup): TF decays 0.01/epoch (100 epochs to reach 0).
+#     Slow enough that GRU can adapt incrementally to model output as ref.
+TF_WARMUP_EPOCHS = 25     # epochs of pure supervised training before decay starts
+TF_DECAY_RATE    = 0.01   # TF reduction per epoch after warmup (0.01 = 1%/epoch)
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -291,15 +298,18 @@ def train():
     print(f"BPTT: {SEQ_FRAMES} frames ({SEQ_FRAMES * HOP / SR * 1000:.0f}ms), "
           f"IR cap {MAX_IR_SAMPLES/SR:.1f}s")
     print(f"Dual-path: {len(mains_ir_files)} mains + {len(monitor_ir_files)} monitor IRs")
-    print(f"TF schedule: {TF_START:.1f} → 0 over {TF_DECAY_EPOCHS} epochs")
+    print(f"TF schedule: 1.0 for {TF_WARMUP_EPOCHS} epochs, then -{TF_DECAY_RATE}/epoch to 0")
 
     best_loss = float('inf')
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
 
-        # Teacher-forcing prob: linear decay from TF_START → 0
-        tf_prob = max(0.0, TF_START * (1.0 - (epoch - 1) / TF_DECAY_EPOCHS))
+        # Teacher-forcing prob: frozen at 1.0 during warmup, then 0.01/epoch decay
+        if epoch <= TF_WARMUP_EPOCHS:
+            tf_prob = 1.0
+        else:
+            tf_prob = max(0.0, 1.0 - (epoch - TF_WARMUP_EPOCHS) * TF_DECAY_RATE)
 
         epoch_loss  = 0.0
         n_steps     = 200
