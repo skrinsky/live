@@ -16,10 +16,11 @@ Dual-path:
   where a performer faces both paths at once.
 
 Scheduled sampling (ref signal):
-  teacher_forcing_prob starts at TF_START=0.5 and decays to 0 by TF_DECAY_EPOCHS.
+  TF=1.0 for TF_WARMUP_EPOCHS, then decays TF_DECAY_RATE/epoch to 0.
   During TF phase, ref = clean reverberant vocal (stable warm start).
   After decay, ref = model's own previous output (true deployment condition).
-  This prevents early training instability when the model outputs garbage.
+  VAD gate override is tied per-step to which ref is used (clean→override,
+  model output→normal gate), not to the epoch-level TF probability.
 
 Memory:
   BPTT graph spans SEQ_FRAMES. The feedback convolution at frame t only needs
@@ -248,23 +249,26 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
         # This gives the Kalman filter a correct H(z) reference while GRU learns.
         # Recursive phase (later training): use model's own last output as ref.
         # This matches inference: ref = what the box is actually sending to the PA.
-        if outputs and random.random() >= teacher_forcing_prob:
-            ref_frame = outputs[-1]           # model output — deployment condition
+        # vad_override is tied to the per-step ref choice, not the epoch-level TF prob.
+        # When clean ref is used: override VAD to 1.0 (always update H), because
+        #   mic_power/ref_power >> VAD_RATIO at feedback freqs with clean teacher ref,
+        #   which would freeze H exactly when it should be learning the feedback path.
+        # When model output is used as ref: normal VAD gate (None), matching inference.
+        use_model_ref = bool(outputs) and random.random() >= teacher_forcing_prob
+        if use_model_ref:
+            ref_frame    = outputs[-1]            # model output — deployment condition
+            vad_override = None                   # use normal VAD gate
         else:
-            ref_frame = reverb_frame.detach() # teacher signal — stable warm start
+            ref_frame    = reverb_frame.detach()  # teacher signal — stable warm start
+            vad_override = 1.0                    # clean ref → always update H
 
         # ── Differentiable STFT ───────────────────────────────────────────────
         mic_f = torch_stft(mic_frame, window).unsqueeze(0)   # (1, N_FREQS)
         ref_f = torch_stft(ref_frame, window).unsqueeze(0)
 
         # ── Model forward ─────────────────────────────────────────────────────
-        # Disable VAD gate during teacher-forced training: with ref=clean_vocal,
-        # mic_power/ref_power >> VAD_RATIO at feedback frequencies, so the gate
-        # freezes H exactly when it should be learning the feedback path.
-        # The gate is only meaningful at inference (ref = true PA loopback).
         speech_f, H, P, gru_h = model.forward_frame(
-            mic_f, ref_f, H, P, gru_h,
-            vad_override=1.0 if teacher_forcing_prob > 0 else None
+            mic_f, ref_f, H, P, gru_h, vad_override=vad_override
         )
 
         # ── Output frame (differentiable, soft-clipped, feeds back next frame)
