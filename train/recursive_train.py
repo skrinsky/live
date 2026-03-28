@@ -59,12 +59,12 @@ MAX_IR_SAMPLES = int(1.5 * SR)  # 1.5s cap — F.conv1d cost is O(L_ir * HOP) pe
 SEQ_FRAMES       = 50     # BPTT window. Start here; ramp 50 → 100 → 200 once stable
 BATCH_SIZE       = 4      # gradient accumulation
 EPOCHS           = 100
-LR               = 3e-4
-GRAD_CLIP        = 1.0
+LR               = 1e-4
+GRAD_CLIP        = 0.5
 CLIP_LEVEL       = 0.95   # soft-clip ceiling on model output in feedback path
 
-TF_START         = 0.5    # initial teacher-forcing probability (ref = clean vocal)
-TF_DECAY_EPOCHS  = 30     # linear decay to 0 — after this, ref = model's own output
+TF_START         = 0.9    # initial teacher-forcing probability (ref = clean vocal)
+TF_DECAY_EPOCHS  = 50     # linear decay to 0 — after this, ref = model's own output
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
