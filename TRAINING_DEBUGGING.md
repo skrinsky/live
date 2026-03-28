@@ -75,6 +75,45 @@ Also consider: a **curriculum** that starts at 50% above-threshold for the first
 
 ---
 
+## P1c — Reference Channel Dropout (easy, ~5 lines)
+
+**Source:** DCCRN-E (Microsoft AEC Challenge 2022)
+
+**Problem:** If the reference is always present during training, the model learns to do nearly as well without it via blind enhancement shortcuts. It has no training signal that specifically rewards using the reference over ignoring it.
+
+**Fix:** On 10% of frames, zero out `ref_f` and set `vad_override=0.0` (freeze H/P). The model must do blind enhancement for those frames. This creates a gradient that rewards reference-awareness: the model gets a better loss outcome when the reference is present and used correctly vs. absent.
+
+```python
+# In the frame loop in train_one_sequence(), after computing ref_frame:
+if random.random() < 0.10:
+    ref_frame    = torch.zeros_like(ref_frame)
+    vad_override = 0.0   # freeze H/P when ref is dropped
+```
+
+---
+
+## P1b — Echo-Path Auxiliary Loss (moderate effort, high impact)
+
+**Source:** DPCRN (INTERSPEECH 2022 AEC Challenge)
+
+**Problem:** H (the feedback path estimate) only receives gradient through the final SI-SDR loss on the model output — a weak, indirect signal. The model can achieve decent SI-SDR without H converging to the true feedback transfer function (e.g., by learning a fixed spectral mask). If H is wrong, the model fails catastrophically at inference when the acoustic path changes.
+
+**Fix:** Add a small auxiliary loss that directly supervises H against the known ground-truth feedback component (available in training since we synthesize it):
+
+```python
+# In train_one_sequence(), accumulate per-frame:
+feedback_gt_f = torch_stft((mains_fb + monitor_fb).detach(), window)  # (1, N_FREQS) complex
+H_fb_estimate = H_new * ref_f                                          # (1, N_FREQS) complex
+echo_loss += F.mse_loss(H_fb_estimate.abs(), feedback_gt_f.abs().detach())
+
+# Final loss:
+loss = -si_sdr(out_full, clean_full) + 0.05 * echo_loss / SEQ_FRAMES
+```
+
+Use coefficient 0.05–0.1. The primary objective stays SI-SDR; this just anchors H to the true path. This is uniquely possible in our setup because we synthesize the training data and know the ground-truth feedback signal — real AEC systems don't have this luxury.
+
+---
+
 ## P2 — Add Phase Features to GRU Input (moderate effort, likely high impact)
 
 **Problem:** The GRU only sees log-magnitude features (`abs().pow(2)` → ERB bands). It has no access to phase. But feedback identification is fundamentally phase-sensitive — feedback is correlated with the reference in both magnitude AND phase. A model that can't see phase has to infer it indirectly from magnitude patterns over time.
