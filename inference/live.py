@@ -152,6 +152,10 @@ def main():
             ref_f = stft_frame(ref_block)
             with torch.no_grad():
                 speech_f, H, P, gru_h = model.forward_frame(mic_f, ref_f, H, P, gru_h)
+            if not torch.isfinite(speech_f).all():
+                # Kalman diverged — pass mic through unmodified rather than going silent.
+                print("[WARNING] NaN/Inf in model output — passing mic through", flush=True)
+                speech_f = mic_f
             enhanced = istft_frame(speech_f)
         else:
             enhanced = fdaf.process(mono, ref_block)
