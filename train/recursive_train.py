@@ -294,9 +294,12 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
         # Supervise H directly against the known ground-truth feedback component.
         # Only when ref is not dropped (H*0 vs nonzero target is a meaningless signal).
         # Coefficient 0.05 keeps SI-SDR dominant. (DPCRN pattern)
-        if not drop_ref:
+        if not drop_ref and not use_model_ref:
+            # Only on teacher-forcing frames: ref_f = clean reverb → H*ref_f is a valid
+            # feedback estimate. On model-ref frames, ref_f = model output (speech +
+            # residual), so H*ref_f ≠ feedback and the gradient would be wrong.
             fb_gt_f  = torch_stft((mains_fb + monitor_fb).detach(), window).unsqueeze(0)
-            fb_est_f = H * ref_f                         # what H predicts feedback is
+            fb_est_f = H * ref_f
             echo_loss = echo_loss + F.mse_loss(
                 torch.log1p(fb_est_f.abs()),
                 torch.log1p(fb_gt_f.abs()).detach()
