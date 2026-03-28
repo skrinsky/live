@@ -329,6 +329,18 @@ def train():
     print(f"Dual-path: {len(mains_ir_files)} mains + {len(monitor_ir_files)} monitor IRs")
     print(f"TF schedule: 1.0 for {TF_WARMUP_EPOCHS} epochs, then -{TF_DECAY_RATE}/epoch to 0")
 
+    # ── Optional warm-start from a previous checkpoint ────────────────────────
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--resume', type=str, default=None,
+                    help='Path to checkpoint to warm-start weights from. '
+                         'TF schedule and epoch counter always restart from 1.')
+    args, _ = ap.parse_known_args()
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt)
+        print(f"Warm-started weights from {args.resume} (TF and epoch counter reset to 1)")
+
     best_loss = float('inf')
 
     for epoch in range(1, EPOCHS + 1):
