@@ -144,8 +144,10 @@ def main():
             ref_block = np.zeros(HOP, dtype=np.float32)
 
         # Console HPF — matches recursive_train.py training conditions (90Hz HPF on vocal channel)
-        mono,      _hpf_zi_mic = sosfilt(_console_hpf, mono,      zi=_hpf_zi_mic)
-        ref_block, _hpf_zi_ref = sosfilt(_console_hpf, ref_block, zi=_hpf_zi_ref)
+        mono,      _hpf_zi_mic = sosfilt(_console_hpf, mono.astype(np.float64),      zi=_hpf_zi_mic)
+        ref_block, _hpf_zi_ref = sosfilt(_console_hpf, ref_block.astype(np.float64), zi=_hpf_zi_ref)
+        mono      = mono.astype(np.float32)
+        ref_block = ref_block.astype(np.float32)
 
         if use_fdkf:
             mic_f = stft_frame(mono)

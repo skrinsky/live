@@ -100,8 +100,8 @@ def run_batch(val_dir=None, out_dir=None, checkpoint=None):
         # Console HPF — apply to the full file before the frame loop (stateful, causal).
         # mic: matches training (HPF applied to mic in recursive_train.py).
         # ref: HPF'd here because training teacher-forcing ref is HPF'd reverberant vocal.
-        mic_np = sosfilt(_console_hpf, mic_np)
-        ref_np = sosfilt(_console_hpf, ref_np)
+        mic_np = sosfilt(_console_hpf, mic_np).astype(np.float32)
+        ref_np = sosfilt(_console_hpf, ref_np).astype(np.float32)
 
         # Pad to a whole number of HOP blocks so the last partial frame is not silently dropped.
         pad      = (-min_len) % HOP
