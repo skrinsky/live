@@ -148,6 +148,39 @@ Treat the problem as Acoustic Echo Cancellation (AEC) rather than speech enhance
 
 ---
 
+## Diagnostic Experiment — Blind Enhancer Baseline
+
+**What it is:** Train a model that takes only the mic signal and outputs clean vocal — no reference signal, no Kalman filter. Essentially what De-Feedback does. Compare it to FDKFNet.
+
+**Why it matters:** If blind does nearly as well as FDKFNet, it means the Kalman filter isn't actually exploiting the reference signal properly — either the reference is wrong during training (TF mismatch), or the GRU isn't learning to use it. If FDKFNet is clearly better, the reference is doing real work and the architecture is sound.
+
+**The GTCRN in the repo is NOT this experiment.** GTCRN was trained on DNS3 (traffic, cafeteria noise) — not feedback. Running it on our scenarios would test a noise suppressor against feedback, which aren't the same problem and would tell us nothing useful.
+
+**What to build:** A separate training script `train/blind_train.py` that:
+- Takes only `mic_signal` as input (no ref)
+- Uses a simple GRU-based encoder/decoder (or GTCRN architecture) operating on STFT magnitude
+- Trains on the same simulated data with SI-SDR loss
+- At inference: `enhanced = model(mic_stft)` — no Kalman, no reference
+
+**Training script outline:**
+```python
+# blind_train.py — train a blind vocal enhancer (no reference) as a diagnostic baseline
+# Architecture: GTCRN-style (use gtcrn/gtcrn.py as backbone)
+# Input: mic STFT magnitude (B, T, F)
+# Output: enhanced STFT (B, T, F)
+# Loss: SI-SDR vs clean target
+# Purpose: measure how much the reference signal actually helps FDKFNet
+```
+
+**How to interpret results:**
+- Blind STOI > FDKFNet STOI → reference isn't helping; training distribution or architecture issue
+- FDKFNet STOI > Blind by >0.05 → reference is working, worth continuing FDKFNet path
+- Both score poorly on scenarios 8/9 → data is the ceiling (need singing data + real IRs)
+
+**When to run:** After FDKFNet training stabilizes past -2 dB SI-SDR and VocalSet is added. Not urgent now — first confirm FDKFNet is learning at all on the hard scenarios.
+
+---
+
 ## What The Listening Test Will Tell Us
 
 Before doing P3-P5, listen to `mic.wav` vs `enhanced.wav` in scenarios **8_near_threshold** and **9_above_threshold**. These are the only honest tests.
