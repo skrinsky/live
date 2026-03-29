@@ -64,7 +64,8 @@ def generate_test_set(vocal_dir='data/clean_vocals', out_dir='data/listening_tes
     vocal_root   = PROJECT_ROOT / vocal_dir
     vocal_files  = [
         f for f in vocal_root.rglob('*.wav')
-        if (info := sf.info(str(f))).frames / info.samplerate >= 3.0
+        if not f.name.startswith('._') and '__MACOSX' not in f.parts
+        and (info := sf.info(str(f))).frames / info.samplerate >= 3.0
     ]
     assert vocal_files, f"No vocal files >= 3s found in {vocal_dir}"
 
