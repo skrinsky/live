@@ -1,0 +1,36 @@
+# Core ML — install torch separately via setup.sh (needs CUDA index URL)
+# torch
+# torchaudio
+
+# Audio I/O
+soundfile
+sounddevice
+librosa
+
+# Scientific computing
+numpy
+scipy
+einops
+
+# Training utilities
+tqdm
+tensorboard
+
+# Acoustic simulation
+pyroomacoustics
+
+# Evaluation metrics
+pesq
+pystoi
+
+# Model export
+onnx
+onnxruntime-gpu
+onnxsim
+
+# Data download
+huggingface_hub
+datasets
+
+# Model profiling
+ptflops
