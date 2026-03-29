@@ -1,8 +1,34 @@
 # Training Debugging — What To Try If Current Run Fails
 
-Current status: Training from scratch with SEQ_FRAMES=100, EPOCHS=300, best at -0.85 dB SI-SDR after epoch 150. Warm-starting with `--resume best.pt --lr 1e-5` for another 300 epochs.
+Current status: **FRESH RUN REQUIRED** — windowing bug found and fixed (see P0 below). Previous best checkpoint (-2.1174 dB) used Hann window, producing severe AM distortion at inference. Now using rectangular window. Starting from scratch.
 
 **A run is "failing" if:** loss doesn't move below -1.5 dB SI-SDR after 100+ more epochs, or keeps oscillating positive.
+
+---
+
+## P0 — Hann Window Bug (FIXED 2026-03-29) — ROOT CAUSE OF "BAD RADIO" DISTORTION
+
+**Problem:** `torch_stft` left-pads with zeros and applies Hann window. `torch_istft` takes `irfft(X)[-HOP:]`. For any input x:
+
+```
+irfft(rfft(hann * [zeros(HOP) | x]))[-HOP:] = hann[HOP:] * x
+```
+
+`hann[HOP:]` decays from 1.0 → 0 over HOP=480 samples (10ms). Every frame of audio fades to silence at its end, creating **100Hz amplitude modulation on the voice**. This sounds like "bad radio / car stereo" distortion — the exact symptom observed in the listening test.
+
+**Why the training loss didn't catch it:** SI-SDR is scale-invariant and computed over the full sequence. The windowed output `hann[HOP:]*vocal` has some correlation with `vocal` (enough to give +2.1 dB SI-SDR), but the perceptual quality is terrible. The metric was lying about the model quality.
+
+**Fix (applied):** Use rectangular window (ones) instead of Hann. Then:
+```
+irfft(rfft([zeros(HOP) | x]))[-HOP:] = x exactly
+```
+Perfect reconstruction — no windowing artifact.
+
+**Tradeoff:** Rectangular window has worse spectral isolation than Hann (-13dB first sidelobe vs -31dB). This slightly degrades per-bin Kalman filter accuracy. But it's vastly better than a model that sounds like a broken radio. If future experiments need better spectral isolation, implement proper WOLA (sqrt-Hann analysis + sqrt-Hann synthesis + OLA at 50% overlap) — but this requires careful implementation to avoid the same reconstruction bug.
+
+**Checkpoint compatibility:** Any checkpoint trained with Hann window is incompatible with the rectangular-window inference. **Do not attempt to resume from the old best.pt — retrain from scratch.**
+
+---
 
 ---
 

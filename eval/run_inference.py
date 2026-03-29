@@ -37,7 +37,9 @@ from fdaf import FreqDomainNLMS
 SR    = 48000
 HOP   = 480
 N_FFT = 960
-WIN   = torch.hann_window(N_FFT)
+# Rectangular window (ones): irfft(rfft([zeros|x]))[-HOP:] = x exactly.
+# Hann window was a bug — hann[HOP:] tapers each frame 1→0 over 10ms (100Hz AM distortion).
+WIN   = torch.ones(N_FFT)
 
 # Console HPF — must match recursive_train.py training conditions exactly.
 # Training applies a 2nd-order Butterworth HPF at 90Hz to every frame.
@@ -47,10 +49,10 @@ _console_hpf = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
 
 
 def stft_frame(x_np: np.ndarray) -> torch.Tensor:
-    """HOP-sample numpy block → complex (1, N_FFT//2+1) tensor. Causal left-pad."""
+    """HOP-sample numpy block → complex (1, N_FFT//2+1) tensor. Causal left-pad, rectangular window."""
     x        = torch.from_numpy(x_np).unsqueeze(0)              # (1, HOP)
     x_padded = torch.nn.functional.pad(x, (N_FFT - HOP, 0))     # (1, N_FFT)
-    return torch.fft.rfft(x_padded * WIN, n=N_FFT)               # (1, F)
+    return torch.fft.rfft(x_padded * WIN, n=N_FFT)               # (1, F) — WIN=ones, no taper
 
 
 def istft_frame(X: torch.Tensor) -> np.ndarray:

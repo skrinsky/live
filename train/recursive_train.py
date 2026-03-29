@@ -128,13 +128,20 @@ def sample_gain():
 # ── Differentiable STFT / ISTFT ────────────────────────────────────────────────
 
 def torch_stft(x: torch.Tensor, window: torch.Tensor) -> torch.Tensor:
-    """(HOP,) tensor → (N_FREQS,) complex. Fully differentiable. Causal left-pad."""
+    """(HOP,) tensor → (N_FREQS,) complex. Fully differentiable. Causal left-pad.
+
+    window MUST be rectangular (torch.ones(N_FFT)) so that the ISTFT gives exact
+    reconstruction: irfft(rfft([zeros|x]))[-HOP:] = x. A Hann window breaks this —
+    it multiplies the output by hann[HOP:] (1→0 over 10ms), creating 100Hz AM
+    modulation that sounds like severe distortion ('bad radio'). Rectangular window
+    has wider spectral bins (+13dB first sidelobe vs -31dB for Hann) but correct audio.
+    """
     xp = F.pad(x.unsqueeze(0), (N_FFT - HOP, 0))          # (1, N_FFT)
     return torch.fft.rfft(xp * window, n=N_FFT).squeeze(0) # (N_FREQS,)
 
 
 def torch_istft(X: torch.Tensor) -> torch.Tensor:
-    """(N_FREQS,) complex → (HOP,) tensor. Fully differentiable."""
+    """(N_FREQS,) complex → (HOP,) tensor. Perfect reconstruction with rectangular window."""
     return torch.fft.irfft(X, n=N_FFT)[-HOP:]
 
 
@@ -329,7 +336,9 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
 
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    window = torch.hann_window(N_FFT).to(device)
+    # Rectangular window (ones): irfft(rfft([zeros|x]))[-HOP:] = x exactly.
+    # Hann window was a bug — it tapers each frame 1→0 over 10ms (100Hz AM distortion).
+    window = torch.ones(N_FFT).to(device)
 
     model     = FDKFNet().to(device)
     optimizer = Adam(model.parameters(), lr=LR)
