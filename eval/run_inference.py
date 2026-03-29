@@ -37,9 +37,10 @@ from fdaf import FreqDomainNLMS
 SR    = 48000
 HOP   = 480
 N_FFT = 960
-# Rectangular window (ones): irfft(rfft([zeros|x]))[-HOP:] = x exactly.
-# Hann window was a bug — hann[HOP:] tapers each frame 1→0 over 10ms (100Hz AM distortion).
-WIN   = torch.ones(N_FFT)
+# sqrt(Hann) for WOLA: hann[n] + hann[n+HOP] = 1 (periodic Hann, 50% overlap) →
+# sqrt_hann[n]² + sqrt_hann[n+HOP]² = 1 → exact OLA reconstruction.
+WIN    = torch.hann_window(N_FFT).sqrt()
+WIN_NP = WIN.numpy()   # numpy copy for OLA synthesis
 
 # Console HPF — must match recursive_train.py training conditions exactly.
 # Training applies a 2nd-order Butterworth HPF at 90Hz to every frame.
@@ -48,17 +49,10 @@ WIN   = torch.ones(N_FFT)
 _console_hpf = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
 
 
-def stft_frame(x_np: np.ndarray) -> torch.Tensor:
-    """HOP-sample numpy block → complex (1, N_FFT//2+1) tensor. Causal left-pad, rectangular window."""
-    x        = torch.from_numpy(x_np).unsqueeze(0)              # (1, HOP)
-    x_padded = torch.nn.functional.pad(x, (N_FFT - HOP, 0))     # (1, N_FFT)
-    return torch.fft.rfft(x_padded * WIN, n=N_FFT)               # (1, F) — WIN=ones, no taper
-
-
-def istft_frame(X: torch.Tensor) -> np.ndarray:
-    """Complex (1, F) tensor → HOP-sample numpy block."""
-    x = torch.fft.irfft(X, n=N_FFT)   # (1, N_FFT)
-    return x[0, -HOP:].numpy()
+def stft_frame(x_prev_np: np.ndarray, x_curr_np: np.ndarray) -> torch.Tensor:
+    """Two HOP-sample numpy blocks → complex (1, N_FFT//2+1). 50% overlap sqrt-Hann STFT."""
+    x = torch.from_numpy(np.concatenate([x_prev_np, x_curr_np])).unsqueeze(0)  # (1, N_FFT)
+    return torch.fft.rfft(x * WIN, n=N_FFT)                                     # (1, F)
 
 
 def run_batch(val_dir=None, out_dir=None, checkpoint=None):
@@ -114,12 +108,23 @@ def run_batch(val_dir=None, out_dir=None, checkpoint=None):
 
         if use_fdkf:
             H, P, gru_h = model.init_state(batch_size=1, device='cpu')
+            prev_mic = np.zeros(HOP, dtype=np.float32)
+            prev_ref = np.zeros(HOP, dtype=np.float32)
+            prev_synth_raw = np.zeros(N_FFT, dtype=np.float32)
             for i in range(0, n_frames * HOP, HOP):
-                mic_f = stft_frame(mic_pad[i:i + HOP])
-                ref_f = stft_frame(ref_pad[i:i + HOP])
+                curr_mic = mic_pad[i:i + HOP]
+                curr_ref = ref_pad[i:i + HOP]
+                mic_f = stft_frame(prev_mic, curr_mic)
+                ref_f = stft_frame(prev_ref, curr_ref)
+                prev_mic = curr_mic
+                prev_ref = curr_ref
                 with torch.no_grad():
                     speech_f, H, P, gru_h = model.forward_frame(mic_f, ref_f, H, P, gru_h)
-                enhanced[i:i + HOP] = istft_frame(speech_f)
+                # WOLA synthesis: irfft → sqrt-Hann → OLA
+                x_raw = torch.fft.irfft(speech_f, n=N_FFT)[0].numpy()
+                x_win = x_raw * WIN_NP
+                enhanced[i:i + HOP] = x_win[:HOP] + prev_synth_raw[HOP:]
+                prev_synth_raw = x_win
         else:
             fdaf = FreqDomainNLMS(filter_len=1024, block_size=HOP, mu=0.02)
             for i in range(0, n_frames * HOP, HOP):

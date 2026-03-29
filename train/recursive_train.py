@@ -127,22 +127,15 @@ def sample_gain():
 
 # ── Differentiable STFT / ISTFT ────────────────────────────────────────────────
 
-def torch_stft(x: torch.Tensor, window: torch.Tensor) -> torch.Tensor:
-    """(HOP,) tensor → (N_FREQS,) complex. Fully differentiable. Causal left-pad.
+def torch_stft(x_prev: torch.Tensor, x_curr: torch.Tensor, window: torch.Tensor) -> torch.Tensor:
+    """50% overlap STFT: [x_prev(HOP) | x_curr(HOP)] → (N_FREQS,) complex. Differentiable.
 
-    window MUST be rectangular (torch.ones(N_FFT)) so that the ISTFT gives exact
-    reconstruction: irfft(rfft([zeros|x]))[-HOP:] = x. A Hann window breaks this —
-    it multiplies the output by hann[HOP:] (1→0 over 10ms), creating 100Hz AM
-    modulation that sounds like severe distortion ('bad radio'). Rectangular window
-    has wider spectral bins (+13dB first sidelobe vs -31dB for Hann) but correct audio.
+    Use window = sqrt(hann_window(N_FFT)) for WOLA perfect reconstruction.
+    Periodic Hann satisfies hann[n] + hann[n+HOP] = 1 for HOP = N_FFT//2, so
+    sqrt_hann[n]² + sqrt_hann[n+HOP]² = 1 — exact OLA reconstruction condition.
+    Inherent 1-HOP (10ms) output delay: OLA at frame t reconstructs x_curr[t-1].
     """
-    xp = F.pad(x.unsqueeze(0), (N_FFT - HOP, 0))          # (1, N_FFT)
-    return torch.fft.rfft(xp * window, n=N_FFT).squeeze(0) # (N_FREQS,)
-
-
-def torch_istft(X: torch.Tensor) -> torch.Tensor:
-    """(N_FREQS,) complex → (HOP,) tensor. Perfect reconstruction with rectangular window."""
-    return torch.fft.irfft(X, n=N_FFT)[-HOP:]
+    return torch.fft.rfft(torch.cat([x_prev, x_curr]) * window, n=N_FFT)
 
 
 # ── Differentiable feedback convolution ────────────────────────────────────────
@@ -246,6 +239,12 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
     outputs     = []   # (HOP,) tensors per frame — in compute graph, used for feedback
     echo_loss   = torch.zeros((), device=device)   # P1b: accumulated per-frame
 
+    # WOLA state: carry previous HOP block across frames for 50% overlap analysis
+    # and OLA synthesis.  Initialised to zeros (silence before sequence start).
+    prev_mic_frame = torch.zeros(HOP, device=device)
+    prev_ref_frame = torch.zeros(HOP, device=device)
+    prev_synth_raw = torch.zeros(N_FFT, device=device)  # previous irfft*window output
+
     for t in range(SEQ_FRAMES):
         start, end = t * HOP, t * HOP + HOP
         reverb_frame = reverb_t[start:end]   # clean target for this frame
@@ -288,9 +287,11 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
             ref_frame    = torch.zeros_like(ref_frame)
             vad_override = 0.0   # freeze H/P — no meaningful update without reference
 
-        # ── Differentiable STFT ───────────────────────────────────────────────
-        mic_f = torch_stft(mic_frame, window).unsqueeze(0)   # (1, N_FREQS)
-        ref_f = torch_stft(ref_frame, window).unsqueeze(0)
+        # ── Differentiable STFT (50% overlap: [prev | curr]) ─────────────────
+        mic_f = torch_stft(prev_mic_frame.detach(), mic_frame, window).unsqueeze(0)
+        ref_f = torch_stft(prev_ref_frame.detach(), ref_frame, window).unsqueeze(0)
+        prev_mic_frame = mic_frame.detach()
+        prev_ref_frame = ref_frame   # keep in graph when ref_frame = outputs[-1]
 
         # ── Model forward ─────────────────────────────────────────────────────
         speech_f, H, P, gru_h = model.forward_frame(
@@ -305,16 +306,25 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
             # Only on teacher-forcing frames: ref_f = clean reverb → H*ref_f is a valid
             # feedback estimate. On model-ref frames, ref_f = model output (speech +
             # residual), so H*ref_f ≠ feedback and the gradient would be wrong.
-            fb_gt_f  = torch_stft((mains_fb + monitor_fb).detach(), window).unsqueeze(0)
+            fb_gt_f  = torch_stft(
+                torch.zeros(HOP, device=device),          # no prev context needed for aux loss
+                (mains_fb + monitor_fb).detach(), window
+            ).unsqueeze(0)
             fb_est_f = H * ref_f
             echo_loss = echo_loss + F.mse_loss(
                 torch.log1p(fb_est_f.abs()),
                 torch.log1p(fb_gt_f.abs()).detach()
             )
 
-        # ── Output frame (differentiable, soft-clipped, feeds back next frame)
-        out_frame = torch_istft(speech_f.squeeze(0))
-        out_frame = torch.tanh(out_frame / CLIP_LEVEL) * CLIP_LEVEL
+        # ── WOLA synthesis ────────────────────────────────────────────────────
+        # irfft → apply sqrt-Hann synthesis window → OLA with previous frame.
+        # sqrt_hann[n]² + sqrt_hann[n+HOP]² = hann[n] + hann[n+HOP] = 1  → exact reconstruction.
+        # out_frame reconstructs speech for the *previous* input frame (1-HOP delay).
+        out_raw      = torch.fft.irfft(speech_f.squeeze(0), n=N_FFT)   # (N_FFT,)
+        out_windowed = out_raw * window                                   # synthesis window
+        out_frame    = out_windowed[:HOP] + prev_synth_raw[HOP:]         # OLA step
+        prev_synth_raw = out_windowed                                     # save for next frame
+        out_frame    = torch.tanh(out_frame / CLIP_LEVEL) * CLIP_LEVEL
         outputs.append(out_frame)
 
     if not outputs:
@@ -325,8 +335,11 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
     # is numerically unstable: near-silent frames have target.pow(2) ≈ 0, making
     # SI-SDR → -inf. A single sequence-level computation is stable and matches
     # standard practice in speech enhancement literature.
-    out_full   = torch.cat(outputs)          # (SEQ_FRAMES * HOP,) — in compute graph
-    clean_full = reverb_t.detach()           # (SEQ_FRAMES * HOP,) — no grad
+    # outputs[0] is all-zeros (prev_synth_raw was zero, no prior context).
+    # outputs[t] reconstructs input frame t-1 (inherent 1-HOP WOLA delay).
+    # Align: compare outputs[1:] against reverb_t for frames 0..(SEQ_FRAMES-2).
+    out_full   = torch.cat(outputs[1:])                       # ((SEQ_FRAMES-1)*HOP,) — in graph
+    clean_full = reverb_t[:(SEQ_FRAMES - 1) * HOP].detach()  # aligned target, no grad
     si_sdr_loss = -si_sdr(out_full, clean_full)
     echo_aux    = 0.05 * echo_loss / SEQ_FRAMES   # P1b: normalized auxiliary term
     return si_sdr_loss + echo_aux
@@ -336,9 +349,10 @@ def train_one_sequence(model, vocal_np, mains_ir_np, monitor_ir_np,
 
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # Rectangular window (ones): irfft(rfft([zeros|x]))[-HOP:] = x exactly.
-    # Hann window was a bug — it tapers each frame 1→0 over 10ms (100Hz AM distortion).
-    window = torch.ones(N_FFT).to(device)
+    # sqrt(Hann) for WOLA: periodic Hann satisfies hann[n] + hann[n+HOP] = 1,
+    # so sqrt_hann analysis * sqrt_hann synthesis gives exact OLA reconstruction.
+    # Better spectral isolation than rectangular (-26dB vs -13dB first sidelobe).
+    window = torch.hann_window(N_FFT).sqrt().to(device)
 
     model     = FDKFNet().to(device)
     optimizer = Adam(model.parameters(), lr=LR)

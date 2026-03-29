@@ -40,9 +40,10 @@ SR    = 48000
 HOP   = 480      # 10ms at 48kHz
 N_FFT = 960      # HOP * 2
 
-# Rectangular window (ones): irfft(rfft([zeros|x]))[-HOP:] = x exactly.
-# Hann window was a bug — hann[HOP:] tapers each frame 1→0 over 10ms (100Hz AM distortion).
-WIN_T = torch.ones(N_FFT)   # module-level constant — not reallocated in callback
+# sqrt(Hann) for WOLA: hann[n] + hann[n+HOP] = 1 (periodic Hann, 50% overlap) →
+# sqrt_hann[n]² + sqrt_hann[n+HOP]² = 1 → exact OLA reconstruction.
+WIN_T  = torch.hann_window(N_FFT).sqrt()   # module-level constant — not reallocated in callback
+WIN_NP = WIN_T.numpy()                     # numpy copy for OLA synthesis in callback
 
 TARGET_RMS   = 0.1
 rms_smoother = np.array([TARGET_RMS])
@@ -60,18 +61,17 @@ _console_hpf = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
 _hpf_zi_mic  = sosfilt_zi(_console_hpf) * 0.0
 _hpf_zi_ref  = sosfilt_zi(_console_hpf) * 0.0
 
+# WOLA state — previous HOP blocks for analysis overlap and OLA synthesis.
+# Persists across callbacks for continuous streaming.
+_prev_mic_block  = np.zeros(HOP, dtype=np.float32)
+_prev_ref_block  = np.zeros(HOP, dtype=np.float32)
+_prev_synth_raw  = np.zeros(N_FFT, dtype=np.float32)
 
-def stft_frame(x_np: np.ndarray) -> torch.Tensor:
-    """HOP-sample numpy block → complex (1, N_FFT//2+1) tensor. Causal left-pad, rectangular window."""
-    x        = torch.from_numpy(x_np).unsqueeze(0)   # (1, HOP)
-    x_padded = F.pad(x, (N_FFT - HOP, 0))            # (1, N_FFT)
-    return torch.fft.rfft(x_padded * WIN_T, n=N_FFT)  # (1, F)
 
-
-def istft_frame(X: torch.Tensor) -> np.ndarray:
-    """Complex (1, F) tensor → HOP-sample numpy block."""
-    x = torch.fft.irfft(X, n=N_FFT)   # (1, N_FFT)
-    return x[0, -HOP:].numpy()
+def stft_frame(x_prev_np: np.ndarray, x_curr_np: np.ndarray) -> torch.Tensor:
+    """Two HOP-sample numpy blocks → complex (1, N_FFT//2+1). 50% overlap sqrt-Hann STFT."""
+    x = torch.from_numpy(np.concatenate([x_prev_np, x_curr_np])).unsqueeze(0)  # (1, N_FFT)
+    return torch.fft.rfft(x * WIN_T, n=N_FFT)                                   # (1, F)
 
 
 def main():
@@ -114,7 +114,7 @@ def main():
 
     def callback(indata, outdata, frames, time, status):
         nonlocal H, P, gru_h
-        global _hpf_zi_mic, _hpf_zi_ref, _dc_zi
+        global _hpf_zi_mic, _hpf_zi_ref, _dc_zi, _prev_mic_block, _prev_ref_block, _prev_synth_raw
 
         if status:
             print(status)
@@ -152,15 +152,21 @@ def main():
         ref_block = ref_block.astype(np.float32)
 
         if use_fdkf:
-            mic_f = stft_frame(mono)
-            ref_f = stft_frame(ref_block)
+            mic_f = stft_frame(_prev_mic_block, mono)
+            ref_f = stft_frame(_prev_ref_block, ref_block)
+            _prev_mic_block = mono.copy()
+            _prev_ref_block = ref_block.copy()
             with torch.no_grad():
                 speech_f, H, P, gru_h = model.forward_frame(mic_f, ref_f, H, P, gru_h)
             if not torch.isfinite(speech_f).all():
                 # Kalman diverged — pass mic through unmodified rather than going silent.
                 print("[WARNING] NaN/Inf in model output — passing mic through", flush=True)
                 speech_f = mic_f
-            enhanced = istft_frame(speech_f)
+            # WOLA synthesis: irfft → sqrt-Hann → OLA with previous frame
+            x_raw  = torch.fft.irfft(speech_f, n=N_FFT)[0].numpy()
+            x_win  = x_raw * WIN_NP
+            enhanced = x_win[:HOP] + _prev_synth_raw[HOP:]
+            _prev_synth_raw = x_win
         else:
             enhanced = fdaf.process(mono, ref_block)
 
