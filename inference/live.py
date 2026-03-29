@@ -40,7 +40,9 @@ SR    = 48000
 HOP   = 480      # 10ms at 48kHz
 N_FFT = 960      # HOP * 2
 
-WIN_T = torch.hann_window(N_FFT)   # module-level constant — not reallocated in callback
+# Rectangular window (ones): irfft(rfft([zeros|x]))[-HOP:] = x exactly.
+# Hann window was a bug — hann[HOP:] tapers each frame 1→0 over 10ms (100Hz AM distortion).
+WIN_T = torch.ones(N_FFT)   # module-level constant — not reallocated in callback
 
 TARGET_RMS   = 0.1
 rms_smoother = np.array([TARGET_RMS])
@@ -60,7 +62,7 @@ _hpf_zi_ref  = sosfilt_zi(_console_hpf) * 0.0
 
 
 def stft_frame(x_np: np.ndarray) -> torch.Tensor:
-    """HOP-sample numpy block → complex (1, N_FFT//2+1) tensor. Causal left-pad."""
+    """HOP-sample numpy block → complex (1, N_FFT//2+1) tensor. Causal left-pad, rectangular window."""
     x        = torch.from_numpy(x_np).unsqueeze(0)   # (1, HOP)
     x_padded = F.pad(x, (N_FFT - HOP, 0))            # (1, N_FFT)
     return torch.fft.rfft(x_padded * WIN_T, n=N_FFT)  # (1, F)
