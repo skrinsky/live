@@ -97,12 +97,13 @@ class HybridLoss(nn.Module):
         self.register_buffer('window', win)
 
     @staticmethod
-    def _sisnr(y_pred, y_true):
-        """SI-SDR on (..., T) tensors. Returns scalar."""
-        dot   = (y_pred * y_true).sum(-1, keepdim=True)
-        s_tgt = dot / (y_true.pow(2).sum(-1, keepdim=True) + 1e-8) * y_true
-        return -(s_tgt.norm(dim=-1)**2 /
-                 (y_pred - s_tgt).norm(dim=-1).pow(2).clamp(1e-8)).log10().mean()
+    def _sdr(y_pred, y_true):
+        """Scale-sensitive SDR on (..., T) tensors. Returns scalar.
+        Unlike SI-SDR, penalises amplitude mismatch — a quieter prediction
+        is NOT equivalent to a full-amplitude one. This prevents the model
+        from learning broadband attenuation as a shortcut."""
+        return -(y_true.pow(2).sum(-1) /
+                 (y_pred - y_true).pow(2).sum(-1).clamp(1e-8)).log10().mean()
 
     def forward(self, pred, true):
         """pred, true: (B, F, T, 2)"""
@@ -112,37 +113,38 @@ class HybridLoss(nn.Module):
         tm = (tr**2 + ti**2 + 1e-12).sqrt()
 
         # ── Base STFT terms ────────────────────────────────────────────────────
-        real_loss = F.mse_loss(pr / pm.pow(0.7), tr / tm.pow(0.7))
-        imag_loss = F.mse_loss(pi / pm.pow(0.7), ti / tm.pow(0.7))
-        mag_loss  = F.mse_loss(pm.pow(0.3),       tm.pow(0.3))
+        # Compression 0.5 (was 0.3): less aggressive compression = amplitude
+        # mismatches hurt more, preventing the model outputting a quiet but
+        # spectrally-correct signal and getting away with it.
+        real_loss = F.mse_loss(pr / pm.pow(0.5), tr / tm.pow(0.5))
+        imag_loss = F.mse_loss(pi / pm.pow(0.5), ti / tm.pow(0.5))
+        mag_loss  = F.mse_loss(pm.pow(0.5),       tm.pow(0.5))
 
         # ── Time-domain signals ────────────────────────────────────────────────
         y_pred = torch.istft(pr + 1j * pi, N_FFT, HOP, N_FFT, self.window)
         y_true = torch.istft(tr + 1j * ti, N_FFT, HOP, N_FFT, self.window)
 
-        # ── Full-sequence SI-SDR ───────────────────────────────────────────────
-        sisnr_full = self._sisnr(y_pred, y_true)
+        # ── Full-sequence SDR (scale-sensitive) ────────────────────────────────
+        sdr_full = self._sdr(y_pred, y_true)
 
         # ── Onset-weighted magnitude loss ──────────────────────────────────────
-        # Per-frame mag error, then weight by exp(-t/tau) so early frames matter more.
         T = pm.shape[2]
         t = torch.arange(T, dtype=pm.dtype, device=pm.device)
         onset_w = torch.exp(-t / self.ONSET_TAU)
         onset_w = onset_w / onset_w.sum()
-        # per-frame mean over batch and frequency, then weighted sum over time
-        frame_mag = ((pm.pow(0.3) - tm.pow(0.3))**2).mean(dim=(0, 1))   # (T,)
+        frame_mag = ((pm.pow(0.5) - tm.pow(0.5))**2).mean(dim=(0, 1))   # (T,)
         onset_mag_loss = (frame_mag * onset_w).sum()
 
-        # ── Early SI-SDR (first EARLY_SECS seconds) ───────────────────────────
+        # ── Early SDR (first EARLY_SECS seconds) ───────────────────────────────
         early_samps = int(self.EARLY_SECS * SR)
-        sisnr_early = self._sisnr(y_pred[..., :early_samps],
-                                  y_true[..., :early_samps])
+        sdr_early = self._sdr(y_pred[..., :early_samps],
+                               y_true[..., :early_samps])
 
         return (30 * (real_loss + imag_loss)
                 + 70 * mag_loss
-                +  1 * sisnr_full
+                +  1 * sdr_full
                 +  2 * onset_mag_loss
-                + 0.5 * sisnr_early)
+                + 0.5 * sdr_early)
 
 
 # ── Per-step training function ─────────────────────────────────────────────────
