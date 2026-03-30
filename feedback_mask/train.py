@@ -153,9 +153,10 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     # Truncate to FEEDBACK_TRUNC samples (50ms): captures the resonant modes
     # that drive instability; longer tail is already covered by room_ir reverb.
     mains_gain, monitor_gain = sample_gain()
-    mains_h   = _norm_ir(mains_ir_np[:FEEDBACK_TRUNC])   * mains_gain
-    monitor_h = _norm_ir(monitor_ir_np[:FEEDBACK_TRUNC]) * monitor_gain
-    h_combined = mains_h[:FEEDBACK_TRUNC] + monitor_h[:FEEDBACK_TRUNC]
+    trunc      = min(len(mains_ir_np), len(monitor_ir_np), FEEDBACK_TRUNC)
+    mains_h    = _norm_ir(mains_ir_np[:trunc])   * mains_gain
+    monitor_h  = _norm_ir(monitor_ir_np[:trunc]) * monitor_gain
+    h_combined = mains_h + monitor_h
 
     if h_combined.max() == 0:
         # Both paths silent — no feedback, pass noisy clean through
