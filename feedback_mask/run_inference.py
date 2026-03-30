@@ -70,7 +70,7 @@ def run_batch(val_dir=None, out_dir=None, checkpoint=None):
         mic_spec = torch.stack([mic_stft.real, mic_stft.imag], dim=-1)  # (1, F, T, 2)
 
         with torch.no_grad():
-            enh_spec = model(mic_spec)
+            enh_spec, _ = model(mic_spec)
 
         enh_c   = enh_spec[..., 0] + 1j * enh_spec[..., 1]   # (1, F, T)
         enh_t   = torch.istft(enh_c, N_FFT, HOP, N_FFT, window)

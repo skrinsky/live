@@ -49,7 +49,7 @@ LR           = 3e-4      # higher than FDKFNet — simpler gradient path allows 
 GRAD_CLIP    = 1.0
 MAX_IR_LEN         = int(1.5 * SR)
 FEEDBACK_TRUNC     = int(0.05 * SR)   # 50ms — captures resonant modes, keeps IIR order low
-N_STEPS            = 200              # sequences per epoch
+N_STEPS            = 400              # sequences per epoch (higher = smoother loss curve)
 
 
 def make_hpf(cutoff_hz=90):
@@ -247,26 +247,46 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     noise_scale = vocal_rms / noise_rms * 10**(-snr_db / 20)
     noisy_clean = (target_np + noise_np * noise_scale).astype(np.float64)
 
-    # Recursive feedback — IIR filter closes the PA→room→mic loop.
+    # ── Pure-feedback case (10%): no vocal, mic is open between songs ──────────
+    # Model must learn to output silence when only feedback is present.
+    if random.random() < 0.10:
+        noisy_clean = (noise_np[:SEQ_LEN] * 0.05).astype(np.float64)   # near-silence input
+        target_np   = np.zeros(SEQ_LEN, dtype=np.float32)               # target: silence
+
+    # ── Recursive feedback — IIR filter closes the PA→room→mic loop ─────────
     # Truncate to FEEDBACK_TRUNC samples (50ms): captures the resonant modes
     # that drive instability; longer tail is already covered by room_ir reverb.
-    mains_gain, monitor_gain = sample_gain()
     trunc      = min(len(mains_ir_np), len(monitor_ir_np), FEEDBACK_TRUNC)
-    mains_h    = _norm_ir(mains_ir_np[:trunc])   * mains_gain
-    monitor_h  = _norm_ir(monitor_ir_np[:trunc]) * monitor_gain
-    h_combined = mains_h + monitor_h
+    mains_norm = _norm_ir(mains_ir_np[:trunc])
+    mon_norm   = _norm_ir(monitor_ir_np[:trunc])
 
-    # Narrow-band resonators — placed at actual modal frequencies if room dims are known
-    h_combined = _add_resonators(h_combined, SR, ir_path=room_ir_path)
-
-    if h_combined.max() == 0:
-        mic_np = noisy_clean.astype(np.float32)
+    # 50% of clips ramp from stable → howling to simulate feedback building up
+    # (vocalist walks toward monitor, engineer nudges fader, mic cups, etc.)
+    if random.random() < 0.50:
+        gain_lo  = random.uniform(0.2, 0.9)
+        gain_hi  = random.uniform(1.0, 2.5)
+        split    = random.randint(int(0.2 * SEQ_LEN), int(0.5 * SEQ_LEN))
+        h_lo     = _add_resonators(mains_norm * gain_lo + mon_norm * gain_lo,
+                                   SR, ir_path=room_ir_path)
+        h_hi     = _add_resonators(mains_norm * gain_hi + mon_norm * gain_hi,
+                                   SR, ir_path=room_ir_path)
+        a_lo = np.concatenate([[1.0], -h_lo.astype(np.float64)])
+        a_hi = np.concatenate([[1.0], -h_hi.astype(np.float64)])
+        zi   = np.zeros(len(a_lo) - 1)
+        y1, zi = lfilter([1.0], a_lo, noisy_clean[:split], zi=zi)
+        y2, _  = lfilter([1.0], a_hi, noisy_clean[split:], zi=zi)
+        mic_np = np.concatenate([y1, y2])
     else:
-        a = np.concatenate([[1.0], -h_combined.astype(np.float64)])
-        mic_np = lfilter([1.0], a, noisy_clean.astype(np.float64))
-        # lfilter overflows float64 for gain >> 1 over long sequences — replace before clip
-        mic_np = np.nan_to_num(mic_np, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
+        mains_gain, monitor_gain = sample_gain()
+        h_combined = _add_resonators(mains_norm * mains_gain + mon_norm * monitor_gain,
+                                     SR, ir_path=room_ir_path)
+        if h_combined.max() == 0:
+            mic_np = noisy_clean.copy()
+        else:
+            a      = np.concatenate([[1.0], -h_combined.astype(np.float64)])
+            mic_np = lfilter([1.0], a, noisy_clean)
 
+    mic_np = np.nan_to_num(mic_np, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
     mic_np = np.clip(mic_np, -1.0, 1.0)
 
     # Mic frequency response — same profile applied to both mic and target so the
@@ -283,21 +303,9 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     mic_spec = torch.stack([mic_stft.real, mic_stft.imag], dim=-1)
     tgt_spec = torch.stack([tgt_stft.real, tgt_stft.imag], dim=-1)
 
-    enh_spec = model(mic_spec)
+    enh_spec, _ = model(mic_spec)
 
-    # ── Stability loss (physics-informed Nyquist constraint) ────────────────────
-    # Penalise output bins where |enhanced(ω)| × |H(ω)| > 0.9 (approaching
-    # instability). h_combined already incorporates the sample's gain scaling, so
-    # the penalty is stronger for above-threshold samples and near-zero for
-    # sub-threshold ones — no manual conditioning needed.
-    # Weight 0.1 (not 0.5): gently nudges the model toward notching at feedback
-    # frequencies without dominating the reconstruction objective.
-    H_full    = np.abs(np.fft.rfft(h_combined.astype(np.float64), n=N_FFT))[:N_FREQ]
-    H_mag     = torch.from_numpy(H_full.astype(np.float32)).to(device)        # (F,)
-    enh_mag   = (enh_spec[..., 0]**2 + enh_spec[..., 1]**2 + 1e-12).sqrt()   # (1, F, T)
-    stab_loss = F.relu(enh_mag * H_mag[None, :, None] - 0.9).mean()
-
-    return criterion(enh_spec, tgt_spec) + 0.1 * stab_loss
+    return criterion(enh_spec, tgt_spec)
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────

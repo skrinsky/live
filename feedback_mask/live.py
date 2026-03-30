@@ -82,9 +82,12 @@ def main():
     rms_smooth  = np.array([TARGET_RMS])
     # STFT buffer: (1, N_FREQ, CONTEXT_FRAMES, 2) — rolled each callback
     stft_buf    = torch.zeros(1, N_FREQ, CONTEXT_FRAMES, 2)
+    # GRU hidden state — persisted across callbacks so the model has continuous
+    # temporal memory matching how it was trained (full-sequence inter-GRU context)
+    gru_h       = None   # (h1, h2) set after first model call
 
     def callback(indata, outdata, frames, time, status):
-        nonlocal dc_zi, hpf_zi, prev_block, prev_synth, rms_smooth, stft_buf
+        nonlocal dc_zi, hpf_zi, prev_block, prev_synth, rms_smooth, stft_buf, gru_h
 
         if status:
             print(status)
@@ -114,9 +117,9 @@ def main():
         stft_buf[:, :, -1, 0] = frm.real
         stft_buf[:, :, -1, 1] = frm.imag
 
-        # Model inference on full context window
+        # Model inference — pass and update persistent GRU hidden state
         with torch.no_grad():
-            enh_spec = model(stft_buf)   # (1, N_FREQ, CONTEXT_FRAMES, 2)
+            enh_spec, gru_h = model(stft_buf, gru_h)   # (1, N_FREQ, CONTEXT_FRAMES, 2)
 
         # Take only the current (last) output frame for synthesis
         enh_c = enh_spec[:, :, -1, 0] + 1j * enh_spec[:, :, -1, 1]   # (1, N_FREQ)

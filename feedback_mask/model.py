@@ -171,20 +171,22 @@ class DPGRNN(nn.Module):
         self.inter_fc  = nn.Linear(hidden, hidden)
         self.inter_ln  = nn.LayerNorm((width, hidden))
 
-    def forward(self, x):
-        """x: (B,C,T,F)"""
-        # Intra: across frequency bins per frame
+    def forward(self, x, inter_h=None):
+        """x: (B,C,T,F), inter_h: optional GRU hidden state from previous call.
+        Returns (output, inter_h) so callers can persist state across chunks."""
+        # Intra: across frequency bins per frame (bidirectional — no state to carry)
         B, C, T, F = x.shape
         xi = x.permute(0, 2, 3, 1).reshape(B * T, F, C)           # (B*T, F, C)
         xi = self.intra_fc(self.intra_rnn(xi)[0])                   # (B*T, F, C)
         xi = self.intra_ln(xi.reshape(B, T, F, C)) + x.permute(0, 2, 3, 1)  # (B,T,F,C)
 
-        # Inter: across time frames per frequency bin
+        # Inter: across time frames per frequency bin (causal — state carries over)
         xo = xi.permute(0, 2, 1, 3).reshape(B * F, T, C)           # (B*F, T, C)
-        xo = self.inter_fc(self.inter_rnn(xo)[0])                   # (B*F, T, C)
+        xo, inter_h = self.inter_rnn(xo, inter_h)                   # persist hidden state
+        xo = self.inter_fc(xo)                                       # (B*F, T, C)
         xo = self.inter_ln(xo.reshape(B, F, T, C).permute(0, 2, 1, 3)) + xi  # (B,T,F,C)
 
-        return xo.permute(0, 3, 1, 2)   # (B,C,T,F)
+        return xo.permute(0, 3, 1, 2), inter_h   # (B,C,T,F), hidden
 
 
 class Mask(nn.Module):
@@ -231,8 +233,15 @@ class FeedbackMaskNet(nn.Module):
         ])
         self.mask = Mask()
 
-    def forward(self, spec):
-        """spec: (B, F, T, 2) → enhanced: (B, F, T, 2)"""
+    def forward(self, spec, h=None):
+        """spec: (B, F, T, 2) → (enhanced: (B, F, T, 2), h: GRU state tuple)
+
+        h is a (h1, h2) tuple of inter-GRU hidden states from the two DPGRNNs.
+        Pass None to reset (training / first inference block).
+        Pass the returned h back in on subsequent calls to maintain temporal context
+        across chunk boundaries — used by live.py for streaming inference.
+        """
+        h1, h2 = (None, None) if h is None else h
         spec_ref = spec  # save for mask application
 
         r, i  = spec[..., 0].permute(0,2,1), spec[..., 1].permute(0,2,1)   # (B,T,F)
@@ -247,8 +256,8 @@ class FeedbackMaskNet(nn.Module):
             feat = layer(feat)
             skips.append(feat)
 
-        feat = self.dpgrnn1(feat)
-        feat = self.dpgrnn2(feat)
+        feat, h1 = self.dpgrnn1(feat, h1)
+        feat, h2 = self.dpgrnn2(feat, h2)
 
         for k, layer in enumerate(self.decoder):
             feat = layer(feat + skips[4 - k])
@@ -256,7 +265,7 @@ class FeedbackMaskNet(nn.Module):
         mask = self.erb.bs(feat)    # (B,2,T,F)
 
         enh  = self.mask(mask, spec_ref.permute(0,3,2,1))   # (B,2,T,F)
-        return enh.permute(0,3,2,1)   # (B,F,T,2)
+        return enh.permute(0,3,2,1), (h1, h2)   # (B,F,T,2), hidden state
 
 
 if __name__ == '__main__':
@@ -264,5 +273,5 @@ if __name__ == '__main__':
     n = sum(p.numel() for p in model.parameters())
     print(f'Parameters: {n:,}')
     x = torch.randn(1, N_FREQ, 100, 2)
-    y = model(x)
+    y, _ = model(x)
     print(f'Input {tuple(x.shape)} → Output {tuple(y.shape)}')
