@@ -74,17 +74,34 @@ def sample_gain():
 
 class HybridLoss(nn.Module):
     """
-    Compressed complex STFT loss + SI-SDR.
-    Adapted from GTCRN original (gtcrn/loss.py) for 48 kHz / N_FFT=960.
+    Compressed complex STFT loss + SI-SDR + onset speed + early vocal quality.
 
-    Compressed MSE gives dense per-bin gradient at every frame, making this
-    substantially more convex than sequence-level SI-SDR alone.
-    Weight: 30*(RI loss) + 70*(magnitude loss) + SI-SDR  (same as original).
+    Base terms (dense learning signal):
+      30 × RI compressed MSE   — phase-aware per-bin gradient every frame
+      70 × magnitude MSE       — perceptual spectral reconstruction
+       1 × SI-SDR full seq     — overall signal quality
+
+    Refinement terms (nudge toward fast suppression and clean vocals at onset):
+      10 × onset-weighted mag  — frames near t=0 weighted by exp(-t/50),
+                                  penalises residual feedback surviving early frames
+       1 × SI-SDR first second — rewards output sounding clean immediately at onset,
+                                  not just averaged over the whole 4s clip
     """
+    ONSET_TAU   = 50    # frames — onset weight decay (~500ms at 10ms/frame)
+    EARLY_SECS  = 1.0   # seconds of signal used for early SI-SDR term
+
     def __init__(self):
         super().__init__()
         win = torch.hann_window(N_FFT).sqrt()
         self.register_buffer('window', win)
+
+    @staticmethod
+    def _sisnr(y_pred, y_true):
+        """SI-SDR on (..., T) tensors. Returns scalar."""
+        dot   = (y_pred * y_true).sum(-1, keepdim=True)
+        s_tgt = dot / (y_true.pow(2).sum(-1, keepdim=True) + 1e-8) * y_true
+        return -(s_tgt.norm(dim=-1)**2 /
+                 (y_pred - s_tgt).norm(dim=-1).pow(2).clamp(1e-8)).log10().mean()
 
     def forward(self, pred, true):
         """pred, true: (B, F, T, 2)"""
@@ -93,20 +110,38 @@ class HybridLoss(nn.Module):
         pm = (pr**2 + pi**2 + 1e-12).sqrt()
         tm = (tr**2 + ti**2 + 1e-12).sqrt()
 
+        # ── Base STFT terms ────────────────────────────────────────────────────
         real_loss = F.mse_loss(pr / pm.pow(0.7), tr / tm.pow(0.7))
         imag_loss = F.mse_loss(pi / pm.pow(0.7), ti / tm.pow(0.7))
         mag_loss  = F.mse_loss(pm.pow(0.3),       tm.pow(0.3))
 
-        # SI-SDR in time domain
-        pred_c  = pr + 1j * pi
-        true_c  = tr + 1j * ti
-        y_pred  = torch.istft(pred_c, N_FFT, HOP, N_FFT, self.window)
-        y_true  = torch.istft(true_c, N_FFT, HOP, N_FFT, self.window)
-        dot     = (y_pred * y_true).sum(-1, keepdim=True)
-        s_tgt   = dot / (y_true.pow(2).sum(-1, keepdim=True) + 1e-8) * y_true
-        sisnr   = -(s_tgt.norm(dim=-1)**2 / (y_pred - s_tgt).norm(dim=-1).pow(2).clamp(1e-8)).log10().mean()
+        # ── Time-domain signals ────────────────────────────────────────────────
+        y_pred = torch.istft(pr + 1j * pi, N_FFT, HOP, N_FFT, self.window)
+        y_true = torch.istft(tr + 1j * ti, N_FFT, HOP, N_FFT, self.window)
 
-        return 30 * (real_loss + imag_loss) + 70 * mag_loss + sisnr
+        # ── Full-sequence SI-SDR ───────────────────────────────────────────────
+        sisnr_full = self._sisnr(y_pred, y_true)
+
+        # ── Onset-weighted magnitude loss ──────────────────────────────────────
+        # Per-frame mag error, then weight by exp(-t/tau) so early frames matter more.
+        T = pm.shape[2]
+        t = torch.arange(T, dtype=pm.dtype, device=pm.device)
+        onset_w = torch.exp(-t / self.ONSET_TAU)
+        onset_w = onset_w / onset_w.sum()
+        # per-frame mean over batch and frequency, then weighted sum over time
+        frame_mag = ((pm.pow(0.3) - tm.pow(0.3))**2).mean(dim=(0, 1))   # (T,)
+        onset_mag_loss = (frame_mag * onset_w).sum()
+
+        # ── Early SI-SDR (first EARLY_SECS seconds) ───────────────────────────
+        early_samps = int(self.EARLY_SECS * SR)
+        sisnr_early = self._sisnr(y_pred[..., :early_samps],
+                                  y_true[..., :early_samps])
+
+        return (30 * (real_loss + imag_loss)
+                + 70 * mag_loss
+                +  1 * sisnr_full
+                + 10 * onset_mag_loss
+                +  1 * sisnr_early)
 
 
 # ── Per-step training function ─────────────────────────────────────────────────
