@@ -38,6 +38,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / 'feedback_mask'))
 
 from model import FeedbackMaskNet, SR, N_FFT, HOP, N_FREQ
+from mic_profiles import apply_random_mic_response, MIC_NAMES
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 SEQ_SECS     = 4.0       # seconds per training clip
@@ -152,6 +153,24 @@ def _norm_ir(ir):
     return ir / (peak + 1e-8)
 
 
+def _add_resonators(h, sr, n=None):
+    """
+    Add random narrow-band room-mode resonators to feedback IR h.
+    Real venues have sharp modal resonances that synthetic IRs miss.
+    Each resonator is a decaying sinusoid at a random frequency with high Q.
+    """
+    n = n if n is not None else random.randint(0, 3)
+    t = np.arange(len(h)) / sr
+    for _ in range(n):
+        freq     = random.uniform(100, 4000)          # Hz — typical feedback range
+        Q        = random.uniform(15, 80)             # high Q = narrow bandwidth
+        gain     = random.uniform(0.05, 0.3)
+        decay    = np.pi * freq / Q
+        resonance = gain * np.exp(-decay * t) * np.sin(2 * np.pi * freq * t)
+        h = h + resonance.astype(h.dtype)
+    return h
+
+
 def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
                    room_ir_np, noise_np, device, window):
     """
@@ -193,26 +212,45 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     monitor_h  = _norm_ir(monitor_ir_np[:trunc]) * monitor_gain
     h_combined = mains_h + monitor_h
 
+    # Narrow-band resonators — simulate room modal resonances missing from synthetic IRs
+    h_combined = _add_resonators(h_combined, SR)
+
     if h_combined.max() == 0:
-        # Both paths silent — no feedback, pass noisy clean through
         mic_np = noisy_clean.astype(np.float32)
     else:
-        # lfilter denominator: [1, -h[0], -h[1], ...] implements the closed loop
         a = np.concatenate([[1.0], -h_combined.astype(np.float64)])
         mic_np = lfilter([1.0], a, noisy_clean).astype(np.float32)
 
     mic_np = np.clip(mic_np, -1.0, 1.0)
 
+    # Mic frequency response — same profile applied to both mic and target so the
+    # model sees consistent coloration and only needs to suppress the feedback
+    mic_name  = random.choice(MIC_NAMES)
+    mic_np    = apply_random_mic_response(mic_np,    SR, mic_name=mic_name)
+    target_np = apply_random_mic_response(target_np, SR, mic_name=mic_name)
+
     # STFT → (1, F, T, 2)
-    mic_t   = torch.from_numpy(mic_np).unsqueeze(0).to(device)
-    tgt_t   = torch.from_numpy(target_np).unsqueeze(0).to(device)
+    mic_t    = torch.from_numpy(mic_np).unsqueeze(0).to(device)
+    tgt_t    = torch.from_numpy(target_np).unsqueeze(0).to(device)
     mic_stft = torch.stft(mic_t, N_FFT, HOP, N_FFT, window, return_complex=True)
     tgt_stft = torch.stft(tgt_t, N_FFT, HOP, N_FFT, window, return_complex=True)
     mic_spec = torch.stack([mic_stft.real, mic_stft.imag], dim=-1)
     tgt_spec = torch.stack([tgt_stft.real, tgt_stft.imag], dim=-1)
 
     enh_spec = model(mic_spec)
-    return criterion(enh_spec, tgt_spec)
+    base_loss = criterion(enh_spec, tgt_spec)
+
+    # Physics-informed stability loss (Nyquist criterion):
+    # If the model's output is played through the PA and feedback path,
+    # does any frequency bin still have loop gain ≥ 1? Penalise if so.
+    H_mag  = torch.from_numpy(
+        np.abs(np.fft.rfft(h_combined, n=N_FFT)).astype(np.float32)
+    ).to(device)                                              # (N_FREQ,)
+    enh_mag    = (enh_spec[..., 0]**2 + enh_spec[..., 1]**2 + 1e-12).sqrt()  # (1,F,T)
+    loop_gain  = enh_mag * H_mag.unsqueeze(0).unsqueeze(-1)  # (1,F,T)
+    stab_loss  = F.relu(loop_gain - 0.9).mean()
+
+    return base_loss + 0.5 * stab_loss
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
