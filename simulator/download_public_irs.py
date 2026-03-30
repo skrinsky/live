@@ -1,13 +1,13 @@
 """
 simulator/download_public_irs.py — Download public IR datasets to data/public_irs/.
 
-Sources (all open-licensed, suitable for commercial use except where noted):
-  1. C4DM — Queen Mary University London (CC BY-NC-SA)   Zenodo 6497436
-     Great Hall (800-seat venue) + Octagon (Victorian domed hall)
-  2. ARNI — Variable acoustics lab (CC BY 4.0)            Zenodo 6985104
-     132K IRs from one room — sample 500 spread by RT60 range
-  3. Aachen AIR — RWTH Aachen (MIT)                       manual URL
-  4. OpenAIR — openairlib.net (CC, per-space license)     manual download
+Sources (all open-licensed):
+  1. EchoThief (free, non-commercial)  — 115 real spaces: studios, halls, churches
+     Direct zip download from echothief.com
+  2. ARNI (CC BY 4.0)                  Zenodo 6985104
+     Variable acoustics lab — 132K IRs, sample 500 spread by RT60
+  3. Aachen AIR (MIT)                  direct zip from RWTH Aachen
+  4. OpenAIR (CC per-space)            manual download — openairlib.net
 
 Usage:
     python simulator/download_public_irs.py              # all automated sources
@@ -38,11 +38,9 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # Format: [Lx, Ly, Lz] in metres. Approximate but physically grounded.
 
 ROOM_DIMENSIONS = {
-    'c4dm_great_hall':  [29.0, 15.0, 10.5],   # Queen Mary Great Hall
-    'c4dm_octagon':     [20.0, 20.0, 14.0],   # Octagon (approx inscribed rect)
-    'arni_lab':         [ 7.3,  6.2,  2.7],   # ARNI variable-acoustics lab
-    'aachen_stairway':  [ 6.0,  3.5, 15.0],   # Aachen AIR stairway
-    'aachen_aula':      [30.0, 13.0, 10.0],   # Aula Carolina great hall
+    'arni':         [ 7.3,  6.2,  2.7],   # ARNI variable-acoustics lab (Aalto)
+    'aachen':       [30.0, 13.0, 10.0],   # Aachen AIR — Aula Carolina great hall
+    # EchoThief spaces have no published dimensions — resonators use RT60 fallback
 }
 
 
@@ -104,35 +102,32 @@ def download_file(url, dest, desc=''):
     return dest
 
 
-# ── C4DM ──────────────────────────────────────────────────────────────────────
+# ── EchoThief ─────────────────────────────────────────────────────────────────
 
-def download_c4dm():
-    print('\n=== C4DM (Queen Mary) — Zenodo 6497436 ===')
-    sub = OUT_DIR / 'c4dm'
+def download_echothief():
+    """
+    EchoThief — 115 real spaces (recording studios, concert halls, churches,
+    stairwells, tunnels). Free for non-commercial use.
+    http://www.echothief.com
+    """
+    print('\n=== EchoThief — 115 real spaces ===')
+    sub = OUT_DIR / 'echothief'
     sub.mkdir(exist_ok=True)
-    files = zenodo_files('6497436')
-    for f in files:
-        name = f['key']
-        url  = f['links']['self']
-        dest = sub / name
-        if dest.exists():
-            print(f'  {name} already exists, skipping')
-            continue
-        tmp = download_file(url, sub / ('_tmp_' + name), desc=name)
-        tmp.rename(dest)
-    # Extract any archives
-    for arc in sub.glob('*.zip'):
-        print(f'  Extracting {arc.name} ...')
-        with zipfile.ZipFile(arc) as z:
-            z.extractall(sub)
-        arc.unlink()
-    for arc in sub.glob('*.tar.gz'):
-        print(f'  Extracting {arc.name} ...')
-        with tarfile.open(arc) as t:
-            t.extractall(sub)
-        arc.unlink()
+
+    existing = list(sub.rglob('*.wav'))
+    if existing:
+        print(f'  Already have {len(existing)} files, skipping')
+        return existing
+
+    url  = 'http://www.echothief.com/wp-content/uploads/2016/03/EchoThiefImpulseResponseLibrary.zip'
+    dest = sub / 'EchoThief.zip'
+    download_file(url, dest, desc='EchoThief IR library')
+    print('  Extracting ...')
+    with zipfile.ZipFile(dest) as z:
+        z.extractall(sub)
+    dest.unlink()
     wavs = list(sub.rglob('*.wav'))
-    print(f'  C4DM: {len(wavs)} wav files in {sub}')
+    print(f'  EchoThief: {len(wavs)} wav files in {sub}')
     return wavs
 
 
@@ -254,17 +249,17 @@ def save_dimensions():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--skip-arni',  action='store_true',
+    ap.add_argument('--skip-arni',      action='store_true',
                     help='Skip ARNI (large download — ~2GB for 500-file sample)')
-    ap.add_argument('--skip-c4dm',  action='store_true')
-    ap.add_argument('--skip-aachen', action='store_true')
+    ap.add_argument('--skip-echothief', action='store_true')
+    ap.add_argument('--skip-aachen',    action='store_true')
     ap.add_argument('--arni-n',     type=int, default=500,
                     help='Number of ARNI IRs to sample (default 500)')
     args = ap.parse_args()
 
     total = []
-    if not args.skip_c4dm:
-        total += download_c4dm()
+    if not args.skip_echothief:
+        total += download_echothief()
     if not args.skip_arni:
         total += download_arni(n_target=args.arni_n)
     if not args.skip_aachen:
