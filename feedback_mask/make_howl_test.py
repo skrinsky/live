@@ -113,14 +113,18 @@ def main():
             room_ir = np.random.randn(len(t)).astype(np.float32) * np.exp(-6.9 * t / 0.4)
             room_ir /= np.abs(room_ir).max() + 1e-8
 
+        # HPF the dry vocal to match training conditions
+        dry_np = sosfilt(hpf, vocal_np[:duration_samps]).astype(np.float32)
+
         for name, gain in scenarios:
             mic_np, clean_np = simulate(vocal_np, room_ir, fb_ir, gain,
                                         duration_samps, hpf)
             out_dir = out_root / f'{i+1:02d}_{name}'
             out_dir.mkdir(parents=True, exist_ok=True)
-            sf.write(str(out_dir / 'mic.wav'),   mic_np,   SR, subtype='PCM_16')
+            sf.write(str(out_dir / 'dry.wav'),   dry_np,   SR, subtype='PCM_16')  # unprocessed vocal
+            sf.write(str(out_dir / 'mic.wav'),   mic_np,   SR, subtype='PCM_16')  # mic with feedback
             sf.write(str(out_dir / 'ref.wav'),   clean_np, SR, subtype='PCM_16')  # PA send ≈ clean vocal
-            sf.write(str(out_dir / 'clean.wav'), clean_np, SR, subtype='PCM_16')
+            sf.write(str(out_dir / 'clean.wav'), clean_np, SR, subtype='PCM_16')  # reverberant target
             print(f'  {out_dir.name}/mic.wav   gain={gain}')
 
     print(f'\nDone — {args.n_scenarios * len(scenarios)} files → {out_root}/')
