@@ -153,26 +153,70 @@ def _norm_ir(ir):
     return ir / (peak + 1e-8)
 
 
-def _add_resonators(h, sr, n=None):
+def _load_room_dimensions():
+    """Load room_dimensions.json written by download_public_irs.py, or return {}."""
+    meta = PROJECT_ROOT / 'data' / 'public_irs' / 'room_dimensions.json'
+    if meta.exists():
+        import json
+        with open(meta) as f:
+            return json.load(f)
+    return {}
+
+_ROOM_DIMS = _load_room_dimensions()
+
+
+def _modal_freqs_for_ir(ir_path):
     """
-    Add random narrow-band room-mode resonators to feedback IR h.
-    Real venues have sharp modal resonances that synthetic IRs miss.
-    Each resonator is a decaying sinusoid at a random frequency with high Q.
+    Return axial mode frequencies for the room this IR was measured in,
+    using the room_dimensions.json lookup. Falls back to None if unknown.
+    """
+    if not _ROOM_DIMS:
+        return None
+    path_str = str(ir_path).lower()
+    for key, dims in _ROOM_DIMS.items():
+        if key.split('_')[0] in path_str:   # e.g. 'c4dm', 'arni', 'aachen'
+            Lx, Ly, Lz = dims
+            c = 343.0
+            modes = []
+            for nx in range(4):
+                for ny in range(4):
+                    for nz in range(4):
+                        if nx == ny == nz == 0:
+                            continue
+                        f = c / 2 * np.sqrt((nx/Lx)**2 + (ny/Ly)**2 + (nz/Lz)**2)
+                        if f <= 4000:
+                            modes.append(f)
+            return sorted(modes) if modes else None
+    return None
+
+
+def _add_resonators(h, sr, ir_path=None, n=None):
+    """
+    Add narrow-band room-mode resonators to feedback IR h.
+    If ir_path is from a known room (room_dimensions.json), resonators are
+    placed at the actual axial modal frequencies of that room.
+    Otherwise, frequencies are random in the 100–4000 Hz feedback range.
     """
     n = n if n is not None else random.randint(0, 3)
+    if n == 0:
+        return h
+    modal_freqs = _modal_freqs_for_ir(ir_path) if ir_path else None
     t = np.arange(len(h)) / sr
     for _ in range(n):
-        freq     = random.uniform(100, 4000)          # Hz — typical feedback range
-        Q        = random.uniform(15, 80)             # high Q = narrow bandwidth
-        gain     = random.uniform(0.05, 0.3)
-        decay    = np.pi * freq / Q
+        if modal_freqs:
+            freq = random.choice(modal_freqs)
+        else:
+            freq = random.uniform(100, 4000)
+        Q         = random.uniform(15, 80)
+        gain      = random.uniform(0.05, 0.3)
+        decay     = np.pi * freq / Q
         resonance = gain * np.exp(-decay * t) * np.sin(2 * np.pi * freq * t)
         h = h + resonance.astype(h.dtype)
     return h
 
 
 def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
-                   room_ir_np, noise_np, device, window):
+                   room_ir_np, noise_np, device, window, room_ir_path=None):
     """
     Recursive feedback simulation → STFT → model → loss.
 
@@ -212,8 +256,8 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     monitor_h  = _norm_ir(monitor_ir_np[:trunc]) * monitor_gain
     h_combined = mains_h + monitor_h
 
-    # Narrow-band resonators — simulate room modal resonances missing from synthetic IRs
-    h_combined = _add_resonators(h_combined, SR)
+    # Narrow-band resonators — placed at actual modal frequencies if room dims are known
+    h_combined = _add_resonators(h_combined, SR, ir_path=room_ir_path)
 
     if h_combined.max() == 0:
         mic_np = noisy_clean.astype(np.float32)
@@ -325,8 +369,10 @@ def train():
             monitor_ir_np = monitor_ir_np[:MAX_IR_LEN]
 
             if room_ir_files:
-                room_ir_np, _ = sf.read(str(random.choice(room_ir_files)), dtype='float32')
+                room_ir_path = random.choice(room_ir_files)
+                room_ir_np, _ = sf.read(str(room_ir_path), dtype='float32')
             else:
+                room_ir_path = None
                 rt60       = np.random.uniform(0.2, 2.0)
                 t_arr      = np.arange(int(rt60 * SR)) / SR
                 room_ir_np = np.random.randn(len(t_arr)).astype(np.float32)
@@ -343,7 +389,7 @@ def train():
             loss = train_one_step(
                 model, criterion, vocal_np,
                 mains_ir_np, monitor_ir_np, room_ir_np, noise_np,
-                device, window
+                device, window, room_ir_path=room_ir_path
             )
 
             if not torch.isfinite(loss):
