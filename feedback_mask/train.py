@@ -263,7 +263,9 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
         mic_np = noisy_clean.astype(np.float32)
     else:
         a = np.concatenate([[1.0], -h_combined.astype(np.float64)])
-        mic_np = lfilter([1.0], a, noisy_clean).astype(np.float32)
+        mic_np = lfilter([1.0], a, noisy_clean.astype(np.float64))
+        # lfilter overflows float64 for gain >> 1 over long sequences — replace before clip
+        mic_np = np.nan_to_num(mic_np, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
 
     mic_np = np.clip(mic_np, -1.0, 1.0)
 
