@@ -56,18 +56,33 @@ def make_hpf(cutoff_hz=90):
     return butter(2, cutoff_hz / (SR / 2), btype='high', output='sos')
 
 
-def sample_gain():
+def sample_gain(epoch):
     """
-    Gain relative to normalised IR (unit spectral peak).
-    <1.0 = stable (decaying resonance), =1.0 = marginal, >1.0 = howl.
-    Distribution: 10% silent path / 10% sub-threshold / 10% near-threshold / 70% howling.
+    Curriculum gain distribution.
+
+    Phase 1 (epochs 1-149): onset-heavy.
+      Model learns to detect and notch at the stability threshold.
+      Mostly near-threshold cases where the mic still has vocal information.
+      10% off / 15% sub-threshold / 60% near-threshold (0.7-1.2) / 15% moderate (1.2-1.8)
+      No extreme cases — too little vocal info to learn from.
+
+    Phase 2 (epochs 150+): refine for severe feedback.
+      Model already knows onset detection; now learns to break a full howl.
+      10% off / 10% sub-threshold / 35% near-threshold / 30% moderate / 15% extreme (1.8-2.5)
     """
     def _one():
         t = random.random()
-        if t < 0.10:   return 0.0                       # path completely off
-        elif t < 0.20: return random.uniform(0.2, 0.7)  # sub-threshold
-        elif t < 0.30: return random.uniform(0.7, 1.0)  # near-threshold ringing
-        else:          return random.uniform(1.0, 2.5)  # above-threshold howl (70%)
+        if epoch < 150:
+            if t < 0.10:   return 0.0                        # path off
+            elif t < 0.25: return random.uniform(0.2, 0.7)   # sub-threshold (15%)
+            elif t < 0.85: return random.uniform(0.7, 1.2)   # near-threshold onset (60%)
+            else:          return random.uniform(1.2, 1.8)   # moderate severe (15%)
+        else:
+            if t < 0.10:   return 0.0                        # path off
+            elif t < 0.20: return random.uniform(0.2, 0.7)   # sub-threshold (10%)
+            elif t < 0.55: return random.uniform(0.7, 1.2)   # near-threshold (35%)
+            elif t < 0.85: return random.uniform(1.2, 1.8)   # moderate severe (30%)
+            else:          return random.uniform(1.8, 2.5)   # extreme (15%)
     return _one(), _one()
 
 
@@ -218,7 +233,7 @@ def _add_resonators(h, sr, ir_path=None, n=None):
 
 
 def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
-                   room_ir_np, noise_np, device, window, room_ir_path=None):
+                   room_ir_np, noise_np, device, window, room_ir_path=None, epoch=1):
     """
     Recursive feedback simulation → STFT → model → loss.
 
@@ -266,7 +281,7 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     # (vocalist walks toward monitor, engineer nudges fader, mic cups, etc.)
     if random.random() < 0.50:
         gain_lo  = random.uniform(0.2, 0.9)
-        gain_hi  = random.uniform(1.0, 2.5)
+        gain_hi  = random.uniform(1.0, 1.8 if epoch < 150 else 2.5)
         split    = random.randint(int(0.2 * SEQ_LEN), int(0.5 * SEQ_LEN))
         h_lo     = _add_resonators(mains_norm * gain_lo + mon_norm * gain_lo,
                                    SR, ir_path=room_ir_path)
@@ -279,7 +294,7 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
         y2, _  = lfilter([1.0], a_hi, noisy_clean[split:], zi=zi)
         mic_np = np.concatenate([y1, y2])
     else:
-        mains_gain, monitor_gain = sample_gain()
+        mains_gain, monitor_gain = sample_gain(epoch)
         h_combined = _add_resonators(mains_norm * mains_gain + mon_norm * monitor_gain,
                                      SR, ir_path=room_ir_path)
         if h_combined.max() == 0:
@@ -408,7 +423,7 @@ def train():
             loss = train_one_step(
                 model, criterion, vocal_np,
                 mains_ir_np, monitor_ir_np, room_ir_np, noise_np,
-                device, window, room_ir_path=room_ir_path
+                device, window, room_ir_path=room_ir_path, epoch=epoch
             )
 
             if not torch.isfinite(loss):
