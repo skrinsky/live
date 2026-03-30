@@ -74,7 +74,8 @@ def main():
     ir_pool_dir  = PROJECT_ROOT / 'data' / 'ir_pool'
     mains_irs    = list(ir_pool_dir.glob('mains_*.wav'))
     monitor_irs  = list(ir_pool_dir.glob('monitor_*.wav'))
-    room_irs     = list((PROJECT_ROOT / 'data' / 'public_irs').rglob('*.wav'))
+    room_irs     = [f for f in (PROJECT_ROOT / 'data' / 'public_irs').rglob('*.wav')
+                    if not f.name.startswith('._') and '__MACOSX' not in str(f)]
 
     assert vocal_files, 'No files in data/clean_vocals/'
     assert mains_irs,   'No mains IRs — run simulator/generate_ir_pool.py'
