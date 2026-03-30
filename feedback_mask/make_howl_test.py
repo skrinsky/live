@@ -117,13 +117,15 @@ def main():
             out_dir = out_root / f'{i+1:02d}_{name}'
             out_dir.mkdir(parents=True, exist_ok=True)
             sf.write(str(out_dir / 'mic.wav'),   mic_np,   SR, subtype='PCM_16')
+            sf.write(str(out_dir / 'ref.wav'),   clean_np, SR, subtype='PCM_16')  # PA send ≈ clean vocal
             sf.write(str(out_dir / 'clean.wav'), clean_np, SR, subtype='PCM_16')
             print(f'  {out_dir.name}/mic.wav   gain={gain}')
 
     print(f'\nDone — {args.n_scenarios * len(scenarios)} files → {out_root}/')
     print('Run inference on each scenario:')
     print('  for d in data/howl_test/*/; do')
-    print('    python feedback_mask/run_inference.py --val-dir "$d" --out-dir "$d"')
+    print('    python eval/run_inference.py --val-dir "$d" --out-dir "$d"          # FDKFNet')
+    print('    python feedback_mask/run_inference.py --val-dir "$d" --out-dir "$d" # GTCRN')
     print('  done')
 
 
