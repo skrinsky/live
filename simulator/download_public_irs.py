@@ -15,6 +15,7 @@ Usage:
 """
 
 import sys
+import re
 import argparse
 import json
 import random
@@ -119,7 +120,7 @@ def download_echothief():
         print(f'  Already have {len(existing)} files, skipping')
         return existing
 
-    url  = 'http://www.echothief.com/wp-content/uploads/2016/03/EchoThiefImpulseResponseLibrary.zip'
+    url  = 'https://www.echothief.com/wp-content/uploads/2024/07/EchoThiefImpulseResponseLibrary.zip'
     dest = sub / 'EchoThief.zip'
     download_file(url, dest, desc='EchoThief IR library')
     print('  Extracting ...')
@@ -236,6 +237,79 @@ def download_aachen():
         return []
 
 
+# ── OpenAIR ───────────────────────────────────────────────────────────────────
+
+OPENAIR_PAGE_IDS = [
+    406, 1293, 416, 425, 435, 1413, 441, 1346, 459, 1167, 468, 476, 1323,
+    483, 494, 502, 508, 518, 1565, 525, 571, 577, 584, 595, 602, 611, 1361,
+    626, 632, 638, 652, 659, 665, 670, 683, 715, 688, 696, 702, 709, 722,
+    729, 1516, 678, 1274, 735, 740, 452, 644, 1543, 745, 752, 764, 770,
+    776, 782, 790, 797,
+]
+
+def _scrape_openair_zip_url(page_id):
+    """Fetch an OpenAIR space page and return the webfiles.york.ac.uk ZIP URL."""
+    url = f'https://www.openair.hosted.york.ac.uk/?page_id={page_id}'
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        match = re.search(r'https://webfiles\.york\.ac\.uk/OPENAIR/IRs/[^"\'>\s]+\.zip', r.text)
+        return match.group(0) if match else None
+    except Exception:
+        return None
+
+
+def download_openair():
+    """
+    Download all 59 OpenAIR spaces by scraping each space page for its ZIP URL.
+    Includes churches, cathedrals, concert halls, and performance spaces.
+    """
+    print('\n=== OpenAIR — 59 spaces (churches, halls, cathedrals) ===')
+    sub = OUT_DIR / 'openair'
+    sub.mkdir(exist_ok=True)
+
+    existing = list(sub.rglob('*.wav'))
+    if len(existing) > 100:
+        print(f'  Already have {len(existing)} files, skipping')
+        return existing
+
+    downloaded = 0
+    failed     = []
+    for i, page_id in enumerate(OPENAIR_PAGE_IDS):
+        zip_url = _scrape_openair_zip_url(page_id)
+        if not zip_url:
+            failed.append(page_id)
+            print(f'  [{i+1}/{len(OPENAIR_PAGE_IDS)}] page_id={page_id} — no ZIP link found')
+            continue
+
+        slug     = zip_url.split('/')[-2]
+        zip_dest = sub / f'{slug}.zip'
+        space_dir = sub / slug
+
+        if space_dir.exists() and list(space_dir.rglob('*.wav')):
+            print(f'  [{i+1}/{len(OPENAIR_PAGE_IDS)}] {slug} already extracted')
+            downloaded += 1
+            continue
+
+        try:
+            print(f'  [{i+1}/{len(OPENAIR_PAGE_IDS)}] {slug}', end=' ', flush=True)
+            download_file(zip_url, zip_dest)
+            space_dir.mkdir(exist_ok=True)
+            with zipfile.ZipFile(zip_dest) as z:
+                z.extractall(space_dir)
+            zip_dest.unlink()
+            downloaded += 1
+        except Exception as e:
+            print(f'  Warning: {slug} failed: {e}')
+            failed.append(page_id)
+
+    wavs = list(sub.rglob('*.wav'))
+    print(f'  OpenAIR: {downloaded} spaces downloaded, {len(wavs)} wav files')
+    if failed:
+        print(f'  Failed page IDs: {failed}')
+    return wavs
+
+
 # ── Save room dimensions metadata ─────────────────────────────────────────────
 
 def save_dimensions():
@@ -253,6 +327,7 @@ def main():
                     help='Skip ARNI (large download — ~2GB for 500-file sample)')
     ap.add_argument('--skip-echothief', action='store_true')
     ap.add_argument('--skip-aachen',    action='store_true')
+    ap.add_argument('--skip-openair',   action='store_true')
     ap.add_argument('--arni-n',     type=int, default=500,
                     help='Number of ARNI IRs to sample (default 500)')
     args = ap.parse_args()
@@ -260,16 +335,16 @@ def main():
     total = []
     if not args.skip_echothief:
         total += download_echothief()
-    if not args.skip_arni:
-        total += download_arni(n_target=args.arni_n)
+    if not args.skip_openair:
+        total += download_openair()
     if not args.skip_aachen:
         total += download_aachen()
+    if not args.skip_arni:
+        total += download_arni(n_target=args.arni_n)
 
     save_dimensions()
 
     print(f'\n=== Done — {len(total)} IR files in {OUT_DIR} ===')
-    print('\nManual downloads still needed:')
-    print('  OpenAIR: https://www.openairlib.net  → download per-space, extract to data/public_irs/openair/')
     print('\nThen run:')
     print('  python simulator/preprocess.py   # resample all to 48kHz')
     print('  python feedback_mask/train.py    # training will pick up new IRs automatically')
