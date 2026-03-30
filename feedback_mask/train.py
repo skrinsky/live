@@ -372,6 +372,7 @@ def train():
             if room_ir_files:
                 room_ir_path = random.choice(room_ir_files)
                 room_ir_np, _ = sf.read(str(room_ir_path), dtype='float32')
+                if room_ir_np.ndim > 1: room_ir_np = room_ir_np.mean(1)
             else:
                 room_ir_path = None
                 rt60       = np.random.uniform(0.2, 2.0)
