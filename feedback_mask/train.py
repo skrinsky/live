@@ -60,14 +60,14 @@ def sample_gain():
     """
     Gain relative to normalised IR (unit spectral peak).
     <1.0 = stable (decaying resonance), =1.0 = marginal, >1.0 = howl.
-    Distribution: 15% silent path / 20% sub-threshold / 25% near-threshold / 40% howling.
+    Distribution: 10% silent path / 10% sub-threshold / 10% near-threshold / 70% howling.
     """
     def _one():
         t = random.random()
-        if t < 0.15:   return 0.0                       # path completely off
-        elif t < 0.35: return random.uniform(0.2, 0.7)  # sub-threshold
-        elif t < 0.60: return random.uniform(0.7, 1.0)  # near-threshold ringing
-        else:          return random.uniform(1.0, 2.5)  # above-threshold howl
+        if t < 0.10:   return 0.0                       # path completely off
+        elif t < 0.20: return random.uniform(0.2, 0.7)  # sub-threshold
+        elif t < 0.30: return random.uniform(0.7, 1.0)  # near-threshold ringing
+        else:          return random.uniform(1.0, 2.5)  # above-threshold howl (70%)
     return _one(), _one()
 
 
@@ -83,9 +83,9 @@ class HybridLoss(nn.Module):
        1 × SI-SDR full seq     — overall signal quality
 
     Refinement terms (nudge toward fast suppression and clean vocals at onset):
-      10 × onset-weighted mag  — frames near t=0 weighted by exp(-t/50),
+       2 × onset-weighted mag  — frames near t=0 weighted by exp(-t/50),
                                   penalises residual feedback surviving early frames
-       1 × SI-SDR first second — rewards output sounding clean immediately at onset,
+     0.5 × SI-SDR first second — rewards output sounding clean immediately at onset,
                                   not just averaged over the whole 4s clip
     """
     ONSET_TAU   = 50    # frames — onset weight decay (~500ms at 10ms/frame)
@@ -141,8 +141,8 @@ class HybridLoss(nn.Module):
         return (30 * (real_loss + imag_loss)
                 + 70 * mag_loss
                 +  1 * sisnr_full
-                + 10 * onset_mag_loss
-                +  1 * sisnr_early)
+                +  2 * onset_mag_loss
+                + 0.5 * sisnr_early)
 
 
 # ── Per-step training function ─────────────────────────────────────────────────
@@ -282,19 +282,20 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     tgt_spec = torch.stack([tgt_stft.real, tgt_stft.imag], dim=-1)
 
     enh_spec = model(mic_spec)
-    base_loss = criterion(enh_spec, tgt_spec)
 
-    # Physics-informed stability loss (Nyquist criterion):
-    # If the model's output is played through the PA and feedback path,
-    # does any frequency bin still have loop gain ≥ 1? Penalise if so.
-    H_mag  = torch.from_numpy(
-        np.abs(np.fft.rfft(h_combined, n=N_FFT)).astype(np.float32)
-    ).to(device)                                              # (N_FREQ,)
-    enh_mag    = (enh_spec[..., 0]**2 + enh_spec[..., 1]**2 + 1e-12).sqrt()  # (1,F,T)
-    loop_gain  = enh_mag * H_mag.unsqueeze(0).unsqueeze(-1)  # (1,F,T)
-    stab_loss  = F.relu(loop_gain - 0.9).mean()
+    # ── Stability loss (physics-informed Nyquist constraint) ────────────────────
+    # Penalise output bins where |enhanced(ω)| × |H(ω)| > 0.9 (approaching
+    # instability). h_combined already incorporates the sample's gain scaling, so
+    # the penalty is stronger for above-threshold samples and near-zero for
+    # sub-threshold ones — no manual conditioning needed.
+    # Weight 0.1 (not 0.5): gently nudges the model toward notching at feedback
+    # frequencies without dominating the reconstruction objective.
+    H_full    = np.abs(np.fft.rfft(h_combined.astype(np.float64), n=N_FFT))[:N_FREQ]
+    H_mag     = torch.from_numpy(H_full.astype(np.float32)).to(device)        # (F,)
+    enh_mag   = (enh_spec[..., 0]**2 + enh_spec[..., 1]**2 + 1e-12).sqrt()   # (1, F, T)
+    stab_loss = F.relu(enh_mag * H_mag[None, :, None] - 0.9).mean()
 
-    return base_loss + 0.5 * stab_loss
+    return criterion(enh_spec, tgt_spec) + 0.1 * stab_loss
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
@@ -311,7 +312,7 @@ def train():
     model     = FeedbackMaskNet().to(device)
     criterion = HybridLoss().to(device)
     optimizer = Adam(model.parameters(), lr=args.lr or LR)
-    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     ckpt_dir  = PROJECT_ROOT / 'checkpoints' / 'gtcrn_feedback'
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     writer    = SummaryWriter(str(ckpt_dir / 'tb'))
