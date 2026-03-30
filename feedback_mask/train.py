@@ -324,7 +324,8 @@ def train():
     mains_ir_files   = list(ir_pool_dir.glob('mains_*.wav'))
     monitor_ir_files = list(ir_pool_dir.glob('monitor_*.wav'))
     noise_files      = list((PROJECT_ROOT / 'data' / 'noise').rglob('*.wav'))
-    room_ir_files    = list((PROJECT_ROOT / 'data' / 'public_irs').rglob('*.wav'))
+    room_ir_files    = [f for f in (PROJECT_ROOT / 'data' / 'public_irs').rglob('*.wav')
+                        if not f.name.startswith('._') and '__MACOSX' not in f.parts]
 
     assert vocal_files,      'No vocal files in data/clean_vocals/'
     assert mains_ir_files,   'No mains IRs — run simulator/generate_ir_pool.py'
