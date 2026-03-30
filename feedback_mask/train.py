@@ -367,13 +367,17 @@ def train():
 
             mains_ir_np,   _ = sf.read(str(random.choice(mains_ir_files)),   dtype='float32')
             monitor_ir_np, _ = sf.read(str(random.choice(monitor_ir_files)), dtype='float32')
+            # Stereo mains/monitor = L and R speakers; mono mic picks up both — sum channels
+            if mains_ir_np.ndim > 1:   mains_ir_np   = mains_ir_np.sum(1)
+            if monitor_ir_np.ndim > 1: monitor_ir_np = monitor_ir_np.sum(1)
             mains_ir_np   = mains_ir_np[:MAX_IR_LEN]
             monitor_ir_np = monitor_ir_np[:MAX_IR_LEN]
 
             if room_ir_files:
                 room_ir_path = random.choice(room_ir_files)
                 room_ir_np, _ = sf.read(str(room_ir_path), dtype='float32')
-                if room_ir_np.ndim > 1: room_ir_np = room_ir_np.mean(1)
+                # Stereo room IR = two mic positions; pick one randomly for training diversity
+                if room_ir_np.ndim > 1: room_ir_np = room_ir_np[:, random.randint(0, room_ir_np.shape[1] - 1)]
             else:
                 room_ir_path = None
                 rt60       = np.random.uniform(0.2, 2.0)
