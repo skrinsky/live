@@ -107,6 +107,7 @@ def main():
 
         if room_irs:
             room_ir, _ = sf.read(str(random.choice(room_irs)), dtype='float32')
+            if room_ir.ndim > 1: room_ir = room_ir[:, random.randint(0, room_ir.shape[1] - 1)]
         else:
             t = np.arange(int(0.4 * SR)) / SR
             room_ir = np.random.randn(len(t)).astype(np.float32) * np.exp(-6.9 * t / 0.4)
