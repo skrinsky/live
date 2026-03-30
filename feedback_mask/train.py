@@ -9,7 +9,7 @@ Why this is more convex than FDKFNet:
   - No self-referential contamination (model output not in training loop)
   - HybridLoss gives STFT-domain gradient signal at every bin, every frame —
     much denser than sequence-level SI-SDR alone
-  - Same feedback simulation data as FDKFNet, just open-loop
+  - Recursive IIR feedback simulation (lfilter closes the PA→room→mic loop)
 
 Approach mirrors De-Feedback (Alpha Labs): learn to separate vocal from
 feedback/reverb/noise as a spectral separation problem, not echo cancellation.
@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import soundfile as sf
 from pathlib import Path
-from scipy.signal import fftconvolve, butter, sosfilt
+from scipy.signal import fftconvolve, butter, sosfilt, lfilter
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
@@ -46,8 +46,9 @@ BATCH_SIZE   = 4         # gradient accumulation steps before optimizer.step()
 EPOCHS       = 300
 LR           = 3e-4      # higher than FDKFNet — simpler gradient path allows faster LR
 GRAD_CLIP    = 1.0
-MAX_IR_LEN   = int(1.5 * SR)
-N_STEPS      = 200       # sequences per epoch
+MAX_IR_LEN         = int(1.5 * SR)
+FEEDBACK_TRUNC     = int(0.05 * SR)   # 50ms — captures resonant modes, keeps IIR order low
+N_STEPS            = 200              # sequences per epoch
 
 
 def make_hpf(cutoff_hz=90):
@@ -55,12 +56,17 @@ def make_hpf(cutoff_hz=90):
 
 
 def sample_gain():
-    """Same distribution as FDKFNet: 30% low / 25% near-threshold / 45% active."""
+    """
+    Gain relative to normalised IR (unit spectral peak).
+    <1.0 = stable (decaying resonance), =1.0 = marginal, >1.0 = howl.
+    Distribution: 15% silent path / 20% sub-threshold / 25% near-threshold / 40% howling.
+    """
     def _one():
         t = random.random()
-        if t < 0.30:   return random.uniform(0.2, 0.6)
-        elif t < 0.55: return random.uniform(0.6, 0.9)
-        else:          return random.uniform(0.9, 1.5)
+        if t < 0.15:   return 0.0                       # path completely off
+        elif t < 0.35: return random.uniform(0.2, 0.7)  # sub-threshold
+        elif t < 0.60: return random.uniform(0.7, 1.0)  # near-threshold ringing
+        else:          return random.uniform(1.0, 2.5)  # above-threshold howl
     return _one(), _one()
 
 
@@ -105,16 +111,25 @@ class HybridLoss(nn.Module):
 
 # ── Per-step training function ─────────────────────────────────────────────────
 
+def _norm_ir(ir):
+    """Normalise IR to unit spectral peak so gain=1.0 is exactly the stability threshold."""
+    peak = np.abs(np.fft.rfft(ir, n=max(len(ir) * 4, 4096))).max()
+    return ir / (peak + 1e-8)
+
+
 def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
                    room_ir_np, noise_np, device, window):
     """
-    Open-loop feedback simulation → STFT → model → loss.
-    No recursive BPTT. Feedback is simulated as:
-        feedback = conv(reverb_vocal, mains_ir) * mains_gain
-                 + conv(reverb_vocal, monitor_ir) * monitor_gain
-        mic = reverb_vocal + feedback + noise
-    This assumes the PA plays the vocal directly — valid first approximation and
-    exactly the training regime needed for single-channel spectral separation.
+    Recursive feedback simulation → STFT → model → loss.
+
+    mic[n] = speech[n] + gain × Σ h[k] × mic[n-k]   (IIR via lfilter)
+
+    gain < 1.0  → decaying resonance
+    gain = 1.0  → sustained tone (marginal stability)
+    gain > 1.0  → exponential howl, clipped at ±1 (saturated squeal)
+
+    Target is always the reverberant clean vocal — model learns to invert the
+    feedback loop and output clean speech regardless of gain level.
     Returns scalar loss tensor with graph attached.
     """
     # Room reverb → target (what the model should output)
@@ -124,18 +139,7 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     hpf       = make_hpf(np.random.uniform(70, 120))
     target_np = sosfilt(hpf, target_np).astype(np.float32)
 
-    # Feedback paths (mains + monitor, independently gated and gained)
-    mains_gain, monitor_gain = sample_gain()
-    drop_mains   = random.random() < 0.2
-    drop_monitor = random.random() < 0.2
-
-    mains_fb   = (fftconvolve(target_np, mains_ir_np)[:SEQ_LEN] * mains_gain
-                  if not drop_mains else np.zeros(SEQ_LEN, dtype=np.float32))
-    monitor_fb = (fftconvolve(target_np, monitor_ir_np)[:SEQ_LEN] * monitor_gain
-                  if not drop_monitor else np.zeros(SEQ_LEN, dtype=np.float32))
-    feedback_np = (mains_fb + monitor_fb).astype(np.float32)
-
-    # Noise — 50% convolutive (same as FDKFNet P1a)
+    # Noise — 50% convolutive
     noise_np = noise_np[:SEQ_LEN]
     if random.random() < 0.5:
         noise_np = fftconvolve(noise_np, room_ir_np)[:SEQ_LEN].astype(np.float32)
@@ -143,8 +147,24 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     noise_rms   = float(np.sqrt(np.mean(noise_np**2)))  + 1e-8
     snr_db      = np.random.uniform(5, 40)
     noise_scale = vocal_rms / noise_rms * 10**(-snr_db / 20)
+    noisy_clean = (target_np + noise_np * noise_scale).astype(np.float64)
 
-    mic_np = (target_np + feedback_np + noise_np * noise_scale).astype(np.float32)
+    # Recursive feedback — IIR filter closes the PA→room→mic loop.
+    # Truncate to FEEDBACK_TRUNC samples (50ms): captures the resonant modes
+    # that drive instability; longer tail is already covered by room_ir reverb.
+    mains_gain, monitor_gain = sample_gain()
+    mains_h   = _norm_ir(mains_ir_np[:FEEDBACK_TRUNC])   * mains_gain
+    monitor_h = _norm_ir(monitor_ir_np[:FEEDBACK_TRUNC]) * monitor_gain
+    h_combined = mains_h[:FEEDBACK_TRUNC] + monitor_h[:FEEDBACK_TRUNC]
+
+    if h_combined.max() == 0:
+        # Both paths silent — no feedback, pass noisy clean through
+        mic_np = noisy_clean.astype(np.float32)
+    else:
+        # lfilter denominator: [1, -h[0], -h[1], ...] implements the closed loop
+        a = np.concatenate([[1.0], -h_combined.astype(np.float64)])
+        mic_np = lfilter([1.0], a, noisy_clean).astype(np.float32)
+
     mic_np = np.clip(mic_np, -1.0, 1.0)
 
     # STFT → (1, F, T, 2)
