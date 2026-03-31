@@ -43,9 +43,9 @@ from mic_profiles import apply_random_mic_response, MIC_NAMES
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 SEQ_SECS     = 4.0       # seconds per training clip
 SEQ_LEN      = int(SEQ_SECS * SR)
-BATCH_SIZE   = 4         # gradient accumulation steps before optimizer.step()
+BATCH_SIZE   = 16        # gradient accumulation steps before optimizer.step()
 EPOCHS       = 300
-LR           = 3e-4      # higher than FDKFNet — simpler gradient path allows faster LR
+LR           = 1e-4      # reduced from 3e-4: mask supervision adds variance, needs stable LR
 GRAD_CLIP    = 1.0
 MAX_IR_LEN         = int(1.5 * SR)
 FEEDBACK_TRUNC     = int(0.05 * SR)   # 50ms — captures resonant modes, keeps IIR order low
