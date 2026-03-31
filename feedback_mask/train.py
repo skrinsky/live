@@ -30,7 +30,7 @@ import soundfile as sf
 from pathlib import Path
 from scipy.signal import fftconvolve, butter, sosfilt, lfilter
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -76,7 +76,7 @@ def sample_gain(epoch):
             if t < 0.10:   return 0.0                        # path off
             elif t < 0.25: return random.uniform(0.2, 0.7)   # sub-threshold (15%)
             elif t < 0.85: return random.uniform(0.7, 1.2)   # near-threshold onset (60%)
-            else:          return random.uniform(1.2, 1.8)   # moderate severe (15%)
+            else:          return random.uniform(1.2, 1.4)   # moderate severe (15%) — capped at 1.4 to keep examples learnable
         else:
             if t < 0.10:   return 0.0                        # path off
             elif t < 0.20: return random.uniform(0.2, 0.7)   # sub-threshold (10%)
@@ -281,7 +281,7 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     # (vocalist walks toward monitor, engineer nudges fader, mic cups, etc.)
     if random.random() < 0.50:
         gain_lo  = random.uniform(0.2, 0.9)
-        gain_hi  = random.uniform(1.0, 1.8 if epoch < 150 else 2.5)
+        gain_hi  = random.uniform(1.0, 1.4 if epoch < 150 else 2.5)
         split    = random.randint(int(0.2 * SEQ_LEN), int(0.5 * SEQ_LEN))
         h_lo     = _add_resonators(mains_norm * gain_lo + mon_norm * gain_lo,
                                    SR, ir_path=room_ir_path)
@@ -339,7 +339,8 @@ def train():
     model     = FeedbackMaskNet().to(device)
     criterion = HybridLoss().to(device)
     optimizer = Adam(model.parameters(), lr=args.lr or LR)
-    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
+                                   patience=10, min_lr=1e-6)
     ckpt_dir  = PROJECT_ROOT / 'checkpoints' / 'gtcrn_feedback'
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     writer    = SummaryWriter(str(ckpt_dir / 'tb'))
@@ -445,7 +446,7 @@ def train():
             optimizer.zero_grad()
 
         avg_loss = epoch_loss / max(valid_steps // BATCH_SIZE, 1)
-        scheduler.step()
+        scheduler.step(avg_loss)
         writer.add_scalar('loss/train', avg_loss, epoch)
         best_str = f'{best_loss:.4f}' if best_loss < float('inf') else 'none'
         print(f'Epoch {epoch:3d} | loss {avg_loss:.4f} | best {best_str} | valid {valid_steps}/{N_STEPS}')
