@@ -37,7 +37,7 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / 'feedback_detect'))
 
-from model import FeedbackDetector, SR, N_FFT, HOP, N_FREQ
+from model import FeedbackDetector, SR, N_FFT, HOP, N_FREQ, prepare_features
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 SEQ_SECS        = 4.0
@@ -269,7 +269,7 @@ def train():
                 device, window, epoch
             )
 
-            prob, _ = model(mic_mag)   # (1, N_FREQ, T)
+            prob, _ = model(prepare_features(mic_mag))   # (1, N_FREQ, T)
 
             loss = F.binary_cross_entropy_with_logits(
                 torch.logit(prob.clamp(1e-6, 1 - 1e-6)),

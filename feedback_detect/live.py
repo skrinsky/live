@@ -59,11 +59,13 @@ def run(threshold=DETECT_THRESH, q=NOTCH_Q, depth_db=NOTCH_DEPTH, checkpoint=Non
     hpf_zi       = np.zeros((2, 1))
     # GRU hidden state — persists across callbacks
     gru_h        = None
+    # Log-magnitude history for delta features (last 10 frames per bin)
+    lm_history   = np.zeros((N_FREQ, 11), dtype=np.float32)
 
     bin_freqs = np.fft.rfftfreq(N_FFT, d=1.0 / SR)   # Hz per bin
 
     def callback(indata, outdata, frames, time, status):
-        nonlocal analysis_buf, hpf_zi, gru_h
+        nonlocal analysis_buf, hpf_zi, gru_h, lm_history
 
         # ── Pre-processing ────────────────────────────────────────────────
         block = indata[:, 0].copy()                             # mono
@@ -80,8 +82,24 @@ def run(threshold=DETECT_THRESH, q=NOTCH_Q, depth_db=NOTCH_DEPTH, checkpoint=Non
                              return_complex=True)           # (1, N_FREQ, 1)
         mag     = stft.abs()                                # (1, N_FREQ, 1)
 
+        # Build delta features from history buffer.
+        # torch.roll is useless with T=1 (delta=0 always), so we maintain
+        # lm_history manually.  lm_history[:, k] = log_mag from k frames ago.
+        lm_now  = torch.log(mag[0, :, 0] + 1e-8).cpu().numpy()  # (N_FREQ,)
+        lm_history = np.roll(lm_history, 1, axis=1)
+        lm_history[:, 0] = lm_now
+
+        feat_np = np.stack([
+            lm_history[:, 0],
+            lm_history[:, 0] - lm_history[:, 1],
+            lm_history[:, 0] - lm_history[:, 4],
+            lm_history[:, 0] - lm_history[:, 10],
+        ], axis=0)                                          # (N_DELTA, N_FREQ)
+        features = torch.from_numpy(feat_np).to(device)
+        features = features.unsqueeze(0).unsqueeze(-1)     # (1, N_DELTA, N_FREQ, 1)
+
         with torch.no_grad():
-            prob, gru_h = model(mag, gru_h)                # (1, N_FREQ, 1)
+            prob, gru_h = model(features, gru_h)           # (1, N_FREQ, 1)
 
         prob_np = prob[0, :, 0].cpu().numpy()              # (N_FREQ,)
 

@@ -25,7 +25,7 @@ from scipy.signal import butter, sosfilt
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / 'feedback_detect'))
 
-from model import FeedbackDetector, SR, N_FFT, HOP, N_FREQ
+from model import FeedbackDetector, SR, N_FFT, HOP, N_FREQ, prepare_features
 from notch  import NotchBank
 from live   import _cluster_bins
 
@@ -83,7 +83,7 @@ def run_batch(val_dir=None, out_dir=None, checkpoint=None,
             mag   = stft.abs()
 
             with torch.no_grad():
-                prob, gru_h = model(mag, gru_h)
+                prob, gru_h = model(prepare_features(mag), gru_h)
 
             prob_np = prob[0, :, 0].cpu().numpy()
             above   = (prob_np > threshold) & (bin_freqs >= 80.0)
