@@ -142,7 +142,7 @@ class HybridLoss(nn.Module):
         # Clamp before istft: early-training model output can be extreme,
         # causing istft overflow → NaN SDR loss. Clamp is tight enough to
         # not affect well-trained outputs (normal STFT bins << 1e3).
-        y_pred = torch.istft((pr + 1j * pi).clamp(-1e3, 1e3), N_FFT, HOP, N_FFT, self.window)
+        y_pred = torch.istft(pr.clamp(-1e3, 1e3) + 1j * pi.clamp(-1e3, 1e3), N_FFT, HOP, N_FFT, self.window)
         y_true = torch.istft(tr + 1j * ti,                    N_FFT, HOP, N_FFT, self.window)
 
         # ── Full-sequence SDR (scale-sensitive) ────────────────────────────────
