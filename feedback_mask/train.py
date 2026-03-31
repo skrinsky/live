@@ -120,12 +120,14 @@ class HybridLoss(nn.Module):
         return -(y_true.pow(2).sum(-1) /
                  (y_pred - y_true).pow(2).sum(-1).clamp(1e-8)).log10().mean()
 
-    def forward(self, pred, true):
-        """pred, true: (B, F, T, 2)"""
+    def forward(self, pred, true, mic):
+        """pred, true, mic: (B, F, T, 2)"""
         pr, pi = pred[..., 0], pred[..., 1]
         tr, ti = true[..., 0], true[..., 1]
+        mr, mi = mic[..., 0],  mic[..., 1]
         pm = (pr**2 + pi**2 + 1e-12).sqrt()
         tm = (tr**2 + ti**2 + 1e-12).sqrt()
+        mm = (mr**2 + mi**2 + 1e-12).sqrt()
 
         # ── Base STFT terms ────────────────────────────────────────────────────
         # Compression 0.5 (was 0.3): less aggressive compression = amplitude
@@ -155,11 +157,23 @@ class HybridLoss(nn.Module):
         sdr_early = self._sdr(y_pred[..., :early_samps],
                                y_true[..., :early_samps])
 
+        # ── Direct mask supervision ────────────────────────────────────────────
+        # We generate synthetic data, so we know exactly where feedback is.
+        # Ideal mask: target_mag / mic_mag — suppress where mic has extra energy
+        # (feedback), pass through where mic ≈ target (clean vocal).
+        # Predicted mask: enhanced_mag / mic_mag — what the model actually did.
+        # Per-bin, per-frame MSE gives direct gradient signal about WHERE to
+        # suppress, not just indirect signal from reconstruction error.
+        ideal_mask = (tm / (mm + 1e-8)).clamp(0.0, 1.0)
+        pred_mask  = (pm / (mm + 1e-8)).clamp(0.0, 1.0)
+        mask_loss  = F.mse_loss(pred_mask, ideal_mask)
+
         return (30 * (real_loss + imag_loss)
                 + 70 * mag_loss
                 +  1 * sdr_full
                 +  2 * onset_mag_loss
-                + 0.5 * sdr_early)
+                + 0.5 * sdr_early
+                + 10 * mask_loss)
 
 
 # ── Per-step training function ─────────────────────────────────────────────────
@@ -322,7 +336,7 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
 
     enh_spec, _ = model(mic_spec)
 
-    return criterion(enh_spec, tgt_spec)
+    return criterion(enh_spec, tgt_spec, mic_spec)
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
