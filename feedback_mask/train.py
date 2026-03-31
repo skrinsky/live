@@ -49,7 +49,8 @@ LR           = 1e-4      # reduced from 3e-4: mask supervision adds variance, ne
 GRAD_CLIP    = 1.0
 MAX_IR_LEN         = int(1.5 * SR)
 FEEDBACK_TRUNC     = int(0.05 * SR)   # 50ms — captures resonant modes, keeps IIR order low
-N_STEPS            = 400              # sequences per epoch (higher = smoother loss curve)
+N_STEPS            = 1600             # sequences per epoch — scaled up with BATCH_SIZE=16 to
+                                      # maintain ~100 optimizer steps/epoch (was 400/4=100)
 
 
 def make_hpf(cutoff_hz=90):
@@ -138,8 +139,11 @@ class HybridLoss(nn.Module):
         mag_loss  = F.mse_loss(pm.pow(0.5),       tm.pow(0.5))
 
         # ── Time-domain signals ────────────────────────────────────────────────
-        y_pred = torch.istft(pr + 1j * pi, N_FFT, HOP, N_FFT, self.window)
-        y_true = torch.istft(tr + 1j * ti, N_FFT, HOP, N_FFT, self.window)
+        # Clamp before istft: early-training model output can be extreme,
+        # causing istft overflow → NaN SDR loss. Clamp is tight enough to
+        # not affect well-trained outputs (normal STFT bins << 1e3).
+        y_pred = torch.istft((pr + 1j * pi).clamp(-1e3, 1e3), N_FFT, HOP, N_FFT, self.window)
+        y_true = torch.istft(tr + 1j * ti,                    N_FFT, HOP, N_FFT, self.window)
 
         # ── Full-sequence SDR (scale-sensitive) ────────────────────────────────
         sdr_full = self._sdr(y_pred, y_true)
@@ -173,7 +177,7 @@ class HybridLoss(nn.Module):
                 +  1 * sdr_full
                 +  2 * onset_mag_loss
                 + 0.5 * sdr_early
-                + 10 * mask_loss)
+                + 40 * mask_loss)
 
 
 # ── Per-step training function ─────────────────────────────────────────────────
@@ -290,6 +294,14 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     trunc      = min(len(mains_ir_np), len(monitor_ir_np), FEEDBACK_TRUNC)
     mains_norm = _norm_ir(mains_ir_np[:trunc])
     mon_norm   = _norm_ir(monitor_ir_np[:trunc])
+    # Renormalise combined IR: mains and monitor may have aligned resonances,
+    # making the sum exceed unit spectral peak even at gain=1.0 — causing
+    # unexpected instability and NaN losses before the gain is applied.
+    _combined_check = mains_norm + mon_norm
+    _combined_peak  = np.abs(np.fft.rfft(_combined_check, n=max(len(_combined_check)*4, 4096))).max()
+    if _combined_peak > 1.0:
+        mains_norm = mains_norm / (_combined_peak + 1e-8)
+        mon_norm   = mon_norm   / (_combined_peak + 1e-8)
 
     # 50% of clips ramp from stable → howling to simulate feedback building up
     # (vocalist walks toward monitor, engineer nudges fader, mic cups, etc.)
@@ -354,7 +366,7 @@ def train():
     criterion = HybridLoss().to(device)
     optimizer = Adam(model.parameters(), lr=args.lr or LR)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
-                                   patience=10, min_lr=1e-6)
+                                   patience=5, min_lr=1e-6)
     ckpt_dir  = PROJECT_ROOT / 'checkpoints' / 'gtcrn_feedback'
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     writer    = SummaryWriter(str(ckpt_dir / 'tb'))
