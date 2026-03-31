@@ -116,10 +116,11 @@ def run(threshold=DETECT_THRESH, q=NOTCH_Q, depth_db=NOTCH_DEPTH, checkpoint=Non
         if outdata.shape[1] > 1:
             outdata[:, 1] = processed
 
-        if detected_freqs:
-            freqs_str = ', '.join(f'{f:.0f}' for f in detected_freqs)
-            active    = ', '.join(f'{f:.0f}' for f in notch_bank.active_freqs)
-            print(f'\rDetected: [{freqs_str}] Hz   Notches: [{active}] Hz    ', end='')
+        if notch_bank.active_notches:
+            notch_str = ', '.join(f'{f:.0f}Hz/{d:.0f}dB'
+                                  for f, d in notch_bank.active_notches)
+            det_str   = ', '.join(f'{f:.0f}' for f in detected_freqs) or '—'
+            print(f'\rDetected: [{det_str}]   Active: [{notch_str}]    ', end='')
 
     print(f'Running at {SR} Hz, block={BLOCK_SIZE} samples ({1000*BLOCK_SIZE/SR:.1f} ms)')
     print(f'Detection threshold={threshold}, Q={q}, depth={depth_db} dB')
