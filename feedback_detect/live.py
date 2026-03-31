@@ -108,7 +108,7 @@ def run(threshold=DETECT_THRESH, q=NOTCH_Q, depth_db=NOTCH_DEPTH, checkpoint=Non
         detected_freqs = _cluster_bins(bin_freqs, prob_np, above_thresh)
 
         # ── Notch bank ────────────────────────────────────────────────────
-        notch_bank.update(detected_freqs)
+        notch_bank.update(detected_freqs, bin_freqs, prob_np)
         processed = notch_bank.process(block_hpf)
 
         # ── Output ────────────────────────────────────────────────────────

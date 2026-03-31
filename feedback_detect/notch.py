@@ -82,59 +82,119 @@ class NotchBank:
       - Releases back toward 0 when not detected (slow, ~2.5 s)
       - Is removed once it releases past EXPIRE_THRESH_DB
 
-    This creates a per-frequency compressor that finds the minimum stable cut:
-    if the loop is just barely unstable, the notch settles shallow; if heavily
-    ringing, it stays deep.
+    Two-mode attack, stepped release, harmonic pre-emption:
+
+    COLD attack (new frequency, no history):
+        Slam to max_depth_db instantly. Cut hard, ask questions later.
+
+    WARM re-attack (frequency already tracked, currently releasing):
+        Step back WARM_REATTACK_DB from current depth. Already has context,
+        a moderate additional cut is enough.
+
+    Release (stepped):
+        Hold HOLD_FRAMES_PER_STEP frames, then give back RELEASE_STEP_DB.
+        Each step probes stability before releasing further. Settles at the
+        shallowest depth that keeps the loop stable.
+
+    Harmonic pre-emption:
+        When update() is called with bin_freqs + prob_np, for each confirmed
+        ringing fundamental F it scans 2F, 3F, 4F, 5F. If any harmonic bin
+        shows sub-threshold activity (prob > HARMONIC_PROB_THRESH), a light
+        preemptive notch is placed at HARMONIC_DEPTH_DB. This mirrors the
+        live-engineer instinct: if 200Hz is ringing and 400Hz is stirring,
+        get ahead of it now rather than wait for a full ring.
+        Harmonic notches behave identically to primary ones after placement —
+        if they later cross the primary threshold they simply get deepened.
 
     Workflow each audio frame:
-      1. notch_bank.update(detected_freqs)   — drive attack/release
-      2. out = notch_bank.process(block)     — apply all active notches
+      1. notch_bank.update(detected_freqs, bin_freqs, prob_np)
+      2. out = notch_bank.process(block)
     """
 
-    MAX_NOTCHES          = 8
-    FREQ_TOL_HZ          = 75       # Hz — bins within this are the same resonance
-    ATTACK_DB_PER_FRAME  = 8.0      # depth change per frame on detection  (~3 frames to -24)
-    RELEASE_DB_PER_FRAME = 0.1      # depth change per frame on release    (~240 frames = 2.4s)
-    EXPIRE_THRESH_DB     = -0.5     # remove notch when it releases past this
+    MAX_NOTCHES           = 8
+    FREQ_TOL_HZ           = 75      # Hz — bins within this are the same resonance
+    WARM_REATTACK_DB      = 12.0    # re-trigger while releasing: step back this far
+    RELEASE_STEP_DB       = 6.0     # give back this many dB per release step
+    HOLD_FRAMES_PER_STEP  = 50      # frames to hold before trying next release step (~0.5s)
+    EXPIRE_THRESH_DB      = -0.5    # remove notch when it releases past this
+    HARMONIC_PROB_THRESH  = 0.15    # sub-threshold prob to trigger harmonic pre-emption
+    HARMONIC_DEPTH_DB     = -12.0   # initial depth for harmonic notches (lighter than primary)
+    HARMONIC_MULTIPLES    = (2, 3, 4, 5)
 
-    def __init__(self, sr=48000, q=30.0, depth_db=-24.0):
+    def __init__(self, sr=48000, q=30.0, depth_db=-48.0):
         self.sr            = sr
         self.q             = q
-        self.max_depth_db  = depth_db   # deepest allowed cut (typically -24 dB)
-        # {freq_hz: [BiquadNotch, current_depth_db]}
+        self.max_depth_db  = depth_db
+        # {freq_hz: [BiquadNotch, current_depth_db, hold_counter]}
         self._notches: dict[float, list] = {}
 
     # ── public ────────────────────────────────────────────────────────────────
 
-    def update(self, detected_freqs: list[float]):
+    def update(self, detected_freqs: list[float],
+               bin_freqs: 'np.ndarray | None' = None,
+               prob_np:   'np.ndarray | None' = None):
         """
-        Drive attack/release from a list of detected feedback frequencies (Hz).
+        Drive cold/warm attack, stepped release, and harmonic pre-emption.
         Call once per audio frame, before process().
+
+        detected_freqs : confirmed ringing frequencies (prob > primary threshold)
+        bin_freqs      : Hz value of each STFT bin  — required for harmonic scan
+        prob_np        : per-bin probability array   — required for harmonic scan
         """
         triggered: set[float] = set()
 
-        # Attack: deepen notches for every detected frequency
+        # ── Primary detections ────────────────────────────────────────────
         for freq in detected_freqs:
             existing = self._find_close(freq)
             if existing is not None:
+                # Warm re-attack: already tracked, step back moderately
                 triggered.add(existing)
-                new_depth = max(self._notches[existing][1] - self.ATTACK_DB_PER_FRAME,
+                new_depth = max(self._notches[existing][1] - self.WARM_REATTACK_DB,
                                 self.max_depth_db)
                 self._notches[existing][1] = new_depth
+                self._notches[existing][2] = self.HOLD_FRAMES_PER_STEP
                 self._notches[existing][0].set_depth(new_depth)
             else:
-                key = self._add(freq)
+                # Cold attack: new frequency — slam to max depth immediately
+                key = self._add(freq, self.max_depth_db)
                 triggered.add(key)
 
-        # Release: shallow-up notches that weren't triggered this frame
+        # ── Harmonic pre-emption ─────────────────────────────────────────
+        # For each confirmed fundamental, check 2x–5x harmonic bins.
+        # If sub-threshold activity is present, place a light preemptive notch.
+        if bin_freqs is not None and prob_np is not None:
+            for fund_freq in detected_freqs:
+                for n in self.HARMONIC_MULTIPLES:
+                    h_freq = fund_freq * n
+                    if h_freq > bin_freqs[-1]:
+                        break                           # above Nyquist
+                    # Find closest bin to this harmonic
+                    idx = int(np.argmin(np.abs(bin_freqs - h_freq)))
+                    if prob_np[idx] < self.HARMONIC_PROB_THRESH:
+                        continue                        # no activity here
+                    existing = self._find_close(h_freq)
+                    if existing is not None:
+                        triggered.add(existing)         # already tracked, hold it
+                        self._notches[existing][2] = self.HOLD_FRAMES_PER_STEP
+                    else:
+                        # Light preemptive notch — shallower than primary cold attack
+                        key = self._add(h_freq, self.HARMONIC_DEPTH_DB)
+                        triggered.add(key)
+
+        # ── Stepped release for untriggered notches ───────────────────────
         for freq in list(self._notches):
             if freq not in triggered:
-                new_depth = self._notches[freq][1] + self.RELEASE_DB_PER_FRAME
-                if new_depth >= self.EXPIRE_THRESH_DB:
-                    del self._notches[freq]    # fully released — remove
+                hold = self._notches[freq][2] - 1
+                if hold > 0:
+                    self._notches[freq][2] = hold
                 else:
-                    self._notches[freq][1] = new_depth
-                    self._notches[freq][0].set_depth(new_depth)
+                    new_depth = self._notches[freq][1] + self.RELEASE_STEP_DB
+                    if new_depth >= self.EXPIRE_THRESH_DB:
+                        del self._notches[freq]
+                    else:
+                        self._notches[freq][1] = new_depth
+                        self._notches[freq][2] = self.HOLD_FRAMES_PER_STEP
+                        self._notches[freq][0].set_depth(new_depth)
 
     def process(self, audio_block: np.ndarray) -> np.ndarray:
         """Apply all active notches in series."""
@@ -164,12 +224,12 @@ class NotchBank:
                 return existing
         return None
 
-    def _add(self, freq: float) -> float:
-        """Create a new notch at depth=0 (attack will drive it deep). Returns its key."""
+    def _add(self, freq: float, depth_db: float) -> float:
+        """Add a new notch at depth_db. Returns its key."""
         if len(self._notches) >= self.MAX_NOTCHES:
             # Evict the shallowest notch (most released, least active)
             shallowest = max(self._notches, key=lambda f: self._notches[f][1])
             del self._notches[shallowest]
-        notch = BiquadNotch(freq, sr=self.sr, q=self.q, depth_db=0.0)
-        self._notches[freq] = [notch, 0.0]
+        notch = BiquadNotch(freq, sr=self.sr, q=self.q, depth_db=depth_db)
+        self._notches[freq] = [notch, depth_db, self.HOLD_FRAMES_PER_STEP]
         return freq

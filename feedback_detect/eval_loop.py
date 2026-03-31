@@ -109,7 +109,7 @@ def simulate(voice_np, noise_np, feedback_ir, gain,
             above   = (prob_np > 0.5) & (_bin_freqs >= 80.0)
             freqs   = _cluster_bins(_bin_freqs, prob_np, above)
 
-            notch_bank.update(freqs)
+            notch_bank.update(freqs, _bin_freqs, prob_np)
             out_block = notch_bank.process(mic_block)
         else:
             out_block = mic_block.copy()
