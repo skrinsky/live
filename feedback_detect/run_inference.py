@@ -151,8 +151,8 @@ def _save_plot(mic_np, enh_np, notch_log, plot_path, val_dir):
         plt.savefig(str(plot_path), dpi=120)
         plt.close(fig)
         print(f'  Saved plot → {plot_path.name}')
-    except ImportError:
-        pass   # librosa / matplotlib not available — skip plot
+    except Exception:
+        pass   # librosa / matplotlib not available or broken — skip plot
 
 
 if __name__ == '__main__':
