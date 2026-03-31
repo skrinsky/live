@@ -117,12 +117,14 @@ class HybridLoss(nn.Module):
         """Scale-sensitive SDR on (..., T) tensors. Returns scalar.
         Unlike SI-SDR, penalises amplitude mismatch — a quieter prediction
         is NOT equivalent to a full-amplitude one. This prevents the model
-        from learning broadband attenuation as a shortcut."""
-        return -(y_true.pow(2).sum(-1) /
+        from learning broadband attenuation as a shortcut.
+        Numerator clamped to 1e-8 to prevent log10(0) for silence targets
+        (pure-feedback training clips where target = zeros)."""
+        return -(y_true.pow(2).sum(-1).clamp(1e-8) /
                  (y_pred - y_true).pow(2).sum(-1).clamp(1e-8)).log10().mean()
 
-    def forward(self, pred, true, mic):
-        """pred, true, mic: (B, F, T, 2)"""
+    def forward(self, pred, true, mic, epoch=1):
+        """pred, true, mic: (B, F, T, 2), epoch: current training epoch (for mask warmup)"""
         pr, pi = pred[..., 0], pred[..., 1]
         tr, ti = true[..., 0], true[..., 1]
         mr, mi = mic[..., 0],  mic[..., 1]
@@ -172,12 +174,18 @@ class HybridLoss(nn.Module):
         pred_mask  = (pm / (mm + 1e-8)).clamp(0.0, 1.0)
         mask_loss  = F.mse_loss(pred_mask, ideal_mask)
 
+        # Mask weight warmup: ramp 0→10 over first 50 epochs, hold at 10.
+        # Model starts with near-zero output → mask_loss≈1.0 early.
+        # At weight 40 this dominates and destabilises training.
+        # Let reconstruction learning settle first, then add mask supervision.
+        mask_w = min(10.0, 10.0 * epoch / 50.0)
+
         return (30 * (real_loss + imag_loss)
                 + 70 * mag_loss
                 +  1 * sdr_full
                 +  2 * onset_mag_loss
                 + 0.5 * sdr_early
-                + 40 * mask_loss)
+                + mask_w * mask_loss)
 
 
 # ── Per-step training function ─────────────────────────────────────────────────
@@ -348,7 +356,7 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
 
     enh_spec, _ = model(mic_spec)
 
-    return criterion(enh_spec, tgt_spec, mic_spec)
+    return criterion(enh_spec, tgt_spec, mic_spec, epoch=epoch)
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
