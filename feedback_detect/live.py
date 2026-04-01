@@ -104,7 +104,7 @@ def run(threshold=DETECT_THRESH, q=NOTCH_Q, depth_db=NOTCH_DEPTH, checkpoint=Non
         prob_np = prob[0, :, 0].cpu().numpy()              # (N_FREQ,)
 
         # Feedback bins: probability above threshold, above min frequency
-        above_thresh = (prob_np > threshold) & (bin_freqs >= MIN_FREQ_HZ) & (bin_freqs <= 16000.0)
+        above_thresh = (prob_np > threshold) & (bin_freqs >= MIN_FREQ_HZ) & (bin_freqs < SR / 2)
         detected_freqs = _cluster_bins(bin_freqs, prob_np, above_thresh)
 
         # ── Notch bank ────────────────────────────────────────────────────
