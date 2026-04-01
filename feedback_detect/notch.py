@@ -119,8 +119,8 @@ class NotchBank:
       2. out = notch_bank.process(block)
     """
 
-    MAX_NOTCHES           = 8
-    FREQ_TOL_HZ           = 75      # Hz — bins within this are the same resonance
+    MAX_NOTCHES           = 16
+    FREQ_TOL_HZ           = 150     # Hz — bins within this are the same resonance
     RELEASE_STEP_DB       = 6.0     # give back this many dB per probe step
     HOLD_FRAMES_PER_STEP  = 100     # frames between probe steps (~1s at 100fps)
     IDLE_FRAMES_TO_EXPIRE = 6000    # frames at 0dB with no detection before removal (~60s)
