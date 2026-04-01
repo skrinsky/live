@@ -129,6 +129,8 @@ class VoiceRestorer(nn.Module):
                   0 = keep notch, 1 = restore fully to pre-notch level
         h_new : updated GRU hidden state
         """
+        spectral = spectral.float()
+        pitch    = pitch.float()
         B, _, F, T = spectral.shape
 
         # Broadcast pitch features across frequency axis → (B, N_PITCH, F, T)
