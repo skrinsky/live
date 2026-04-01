@@ -186,6 +186,10 @@ def run_eval(gain=1.3, duration_s=8.0, checkpoint=None, out_dir=None):
     print(f'\nGain={gain}  duration={duration_s}s  IR_len={len(ir)} samples')
     print(f'{"":─<60}')
 
+    # ── Clean reference (no feedback loop) ───────────────────────────────
+    clean_np = sosfilt(_hpf_sos, (voice_np + noise_np)).astype(np.float32)
+    clean_np = np.clip(clean_np, -1.0, 1.0)
+
     # ── A) Raw feedback ───────────────────────────────────────────────────
     print('Running A: raw feedback (no model)…')
     mic_raw, box_raw = simulate(voice_np, noise_np, ir, gain=gain)
@@ -194,7 +198,7 @@ def run_eval(gain=1.3, duration_s=8.0, checkpoint=None, out_dir=None):
 
     # ── B) Suppressed ─────────────────────────────────────────────────────
     print('Running B: with FeedbackDetector + NotchBank…')
-    notch_bank = NotchBank(sr=SR, q=30.0, depth_db=-24.0)
+    notch_bank = NotchBank(sr=SR, q=30.0, depth_db=-48.0)
     mic_sup, box_sup = simulate(voice_np, noise_np, ir, gain=gain,
                                 model=model, notch_bank=notch_bank,
                                 device=device, window=window)
@@ -203,15 +207,17 @@ def run_eval(gain=1.3, duration_s=8.0, checkpoint=None, out_dir=None):
     print(f'  Notches held at end: {notch_bank.active_notches}')
 
     # ── Save audio ────────────────────────────────────────────────────────
-    sf.write(str(out_dir / 'raw_feedback.wav'),   mic_raw, SR, subtype='PCM_16')
-    sf.write(str(out_dir / 'suppressed_mic.wav'), mic_sup, SR, subtype='PCM_16')
-    sf.write(str(out_dir / 'suppressed_out.wav'), box_sup, SR, subtype='PCM_16')
+    sf.write(str(out_dir / 'clean_reference.wav'), clean_np, SR, subtype='PCM_16')
+    sf.write(str(out_dir / 'raw_feedback.wav'),    mic_raw,  SR, subtype='PCM_16')
+    sf.write(str(out_dir / 'suppressed_mic.wav'),  mic_sup,  SR, subtype='PCM_16')
+    sf.write(str(out_dir / 'suppressed_out.wav'),  box_sup,  SR, subtype='PCM_16')
     print(f'\nAudio saved to {out_dir}/')
-    print('  raw_feedback.wav   — what the mic hears with no suppression')
-    print('  suppressed_mic.wav — what the mic hears with the model in the loop')
-    print('  suppressed_out.wav — what goes to the speaker (post-notch)')
+    print('  clean_reference.wav — voice with no loop (target)')
+    print('  raw_feedback.wav    — loop closed, no suppression (worst case)')
+    print('  suppressed_mic.wav  — loop closed, model in the path (result)')
+    print('  suppressed_out.wav  — what goes to the speaker post-notch')
 
-    _save_plot(mic_raw, mic_sup, box_sup, gain,
+    _save_plot(mic_raw, mic_sup, box_sup, clean_np, gain,
                out_dir / 'loop_comparison.png')
 
 
@@ -219,20 +225,21 @@ def _rms_db(x):
     return 20.0 * np.log10(float(np.sqrt(np.mean(x ** 2))) + 1e-8)
 
 
-def _save_plot(raw, sup_mic, sup_out, gain, path):
+def _save_plot(raw, sup_mic, sup_out, clean, gain, path):
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         import librosa, librosa.display
 
-        sigs   = [raw,       sup_mic,          sup_out]
+        sigs   = [clean,            raw,                        sup_mic,                          sup_out]
         titles = [
-            f'A: raw mic (gain={gain}) — loop closes, rings up',
-            'B: suppressed mic — what the mic hears with model in loop',
-            'B: speaker output — what the notch passes to the PA',
+            'clean reference — no feedback loop (target)',
+            f'raw feedback (gain={gain}) — loop closes, rings up',
+            'suppressed mic — what the mic hears with model in loop',
+            'speaker output — what the notch passes to the PA',
         ]
-        fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+        fig, axes = plt.subplots(4, 1, figsize=(14, 13), sharex=True)
         for ax, sig, title in zip(axes, sigs, titles):
             db = librosa.amplitude_to_db(
                 np.abs(librosa.stft(sig, n_fft=N_FFT, hop_length=HOP)),
