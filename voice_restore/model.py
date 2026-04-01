@@ -31,9 +31,12 @@ import torch
 import torch.nn as nn
 
 PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / 'feedback_detect'))
 
-from model import SR, N_FFT, HOP, N_FREQ  # reuse constants
+# Mirror feedback_detect/model.py constants — keep in sync if those change
+SR     = 48000
+N_FFT  = 1024
+HOP    = 480
+N_FREQ = N_FFT // 2 + 1   # 513
 
 N_SPECTRAL = 3   # log_mag_notched, notch_mask_db (normalised), harmonic_template
 N_PITCH    = 4   # f0_norm, confidence, delta_f0_norm, delta2_f0_norm

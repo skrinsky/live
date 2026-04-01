@@ -40,11 +40,11 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / 'feedback_detect'))
-sys.path.insert(0, str(PROJECT_ROOT / 'voice_restore'))
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from model   import SR, N_FFT, HOP, N_FREQ
-from model   import VoiceRestorer, harmonic_template, normalise_f0, apply_restoration
+from voice_restore.model import (SR, N_FFT, HOP, N_FREQ,
+                                  VoiceRestorer, harmonic_template,
+                                  normalise_f0, apply_restoration)
 
 try:
     import torchcrepe
