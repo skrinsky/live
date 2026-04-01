@@ -49,9 +49,9 @@ from voice_restore.model import (SR, N_FFT, HOP, N_FREQ,
 try:
     import torchcrepe
     CREPE_AVAILABLE = True
-except ImportError:
+except Exception as _crepe_err:
     CREPE_AVAILABLE = False
-    print('WARNING: torchcrepe not installed — install with: pip install torchcrepe')
+    print(f'WARNING: torchcrepe unavailable ({type(_crepe_err).__name__}: {_crepe_err})')
     print('         F0 will be zero-initialised (no pitch information).')
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
