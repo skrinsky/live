@@ -166,11 +166,13 @@ def run_eval(input_path: str, notch_specs: list[tuple], ckpt_path: Path, out_dir
     out_notched  = notched_np
     out_restored = _istft(restored_stft)
 
-    # Trim to original length
-    L = len(audio_np)
+    # Align all outputs to the shortest length
+    L = min(len(audio_np), len(out_restored))
+    out_clean    = out_clean[:L]
+    out_notched  = out_notched[:L]
     out_restored = out_restored[:L]
 
-    # Loudness-match to input
+    # Loudness-match restored to input
     def _rms(x): return float(np.sqrt(np.mean(x**2))) + 1e-8
     out_restored = out_restored * (_rms(out_clean) / _rms(out_restored))
 
@@ -185,7 +187,7 @@ def run_eval(input_path: str, notch_specs: list[tuple], ckpt_path: Path, out_dir
     print('  eval_restored.wav — after restorer')
 
     # ── Quick SNR estimate ─────────────────────────────────────────────────────
-    err_notch    = out_clean - out_notched[:L]
+    err_notch    = out_clean - out_notched
     err_restored = out_clean - out_restored
     snr_notch    = 10*np.log10(_rms(out_clean)**2 / _rms(err_notch)**2)
     snr_restored = 10*np.log10(_rms(out_clean)**2 / _rms(err_restored)**2)
