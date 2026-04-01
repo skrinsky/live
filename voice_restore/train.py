@@ -219,7 +219,7 @@ def build_pitch_features(f0_np: np.ndarray,
     delta     = np.gradient(f0_norm)
     delta2    = np.gradient(delta)
 
-    return np.stack([f0_norm, conf, delta, delta2], axis=0)   # (4, T)
+    return np.stack([f0_norm, conf, delta, delta2], axis=0).astype(np.float32)   # (4, T)
 
 
 def build_harmonic_features(f0_np: np.ndarray, n_frames: int) -> np.ndarray:
