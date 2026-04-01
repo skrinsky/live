@@ -82,29 +82,37 @@ class NotchBank:
       - Releases back toward 0 when not detected (slow, ~2.5 s)
       - Is removed once it releases past EXPIRE_THRESH_DB
 
-    Two-mode attack, stepped release, harmonic pre-emption:
+    Attack/release design:
 
-    COLD attack (new frequency, no history):
-        Slam to max_depth_db instantly. Cut hard, ask questions later.
+    Any detection (new OR re-triggered):
+        Slam to max_depth_db immediately — fully kill the ring first.
+        "Warm" just means the filter already exists and is running (no click);
+        the depth is the same as a cold attack. You must break the ring
+        completely before probing for the minimum.
 
-    WARM re-attack (frequency already tracked, currently releasing):
-        Step back WARM_REATTACK_DB from current depth. Already has context,
-        a moderate additional cut is enough.
+    Release (stepped probe):
+        Hold HOLD_FRAMES_PER_STEP (~1s), then give back RELEASE_STEP_DB (6dB).
+        Repeat until depth reaches 0dB (pass-through). The notch stays in the
+        bank silently at 0dB — filter still running, no audible effect.
 
-    Release (stepped):
-        Hold HOLD_FRAMES_PER_STEP frames, then give back RELEASE_STEP_DB.
-        Each step probes stability before releasing further. Settles at the
-        shallowest depth that keeps the loop stable.
+    Re-triggered at any depth including 0dB:
+        Slam back to max_depth_db. Re-probe upward from full depth.
+
+    Convergence:
+        Over multiple speech events, every probe cycle restarts from max_depth
+        and gets re-triggered at approximately the same point. That point IS
+        the minimum stable cut for this room and frequency — found dynamically,
+        not hardcoded.
+
+    Expiry:
+        After IDLE_FRAMES_TO_EXPIRE (~60s) at 0dB with no detection, remove.
+        Frequency may genuinely no longer be problematic (mic moved, gain
+        changed). During a show, problematic frequencies typically persist.
 
     Harmonic pre-emption:
-        When update() is called with bin_freqs + prob_np, for each confirmed
-        ringing fundamental F it scans 2F, 3F, 4F, 5F. If any harmonic bin
-        shows sub-threshold activity (prob > HARMONIC_PROB_THRESH), a light
-        preemptive notch is placed at HARMONIC_DEPTH_DB. This mirrors the
-        live-engineer instinct: if 200Hz is ringing and 400Hz is stirring,
-        get ahead of it now rather than wait for a full ring.
-        Harmonic notches behave identically to primary ones after placement —
-        if they later cross the primary threshold they simply get deepened.
+        When update() receives bin_freqs + prob_np, scans 2F–5F harmonics of
+        each confirmed fundamental. Sub-threshold activity → light notch placed
+        preemptively at HARMONIC_DEPTH_DB, same attack/release rules apply.
 
     Workflow each audio frame:
       1. notch_bank.update(detected_freqs, bin_freqs, prob_np)
@@ -113,12 +121,11 @@ class NotchBank:
 
     MAX_NOTCHES           = 8
     FREQ_TOL_HZ           = 75      # Hz — bins within this are the same resonance
-    WARM_REATTACK_DB      = 12.0    # re-trigger while releasing: step back this far
-    RELEASE_STEP_DB       = 6.0     # give back this many dB per release step
-    HOLD_FRAMES_PER_STEP  = 100     # frames to hold before trying next release step (~1s)
-    EXPIRE_THRESH_DB      = -0.5    # remove notch when it releases past this
+    RELEASE_STEP_DB       = 6.0     # give back this many dB per probe step
+    HOLD_FRAMES_PER_STEP  = 100     # frames between probe steps (~1s at 100fps)
+    IDLE_FRAMES_TO_EXPIRE = 6000    # frames at 0dB with no detection before removal (~60s)
     HARMONIC_PROB_THRESH  = 0.15    # sub-threshold prob to trigger harmonic pre-emption
-    HARMONIC_DEPTH_DB     = -12.0   # initial depth for harmonic notches (lighter than primary)
+    HARMONIC_DEPTH_DB     = -12.0   # initial depth for harmonic notches
     HARMONIC_MULTIPLES    = (2, 3, 4, 5)
 
     def __init__(self, sr=48000, q=30.0, depth_db=-48.0):
@@ -126,6 +133,7 @@ class NotchBank:
         self.q             = q
         self.max_depth_db  = depth_db
         # {freq_hz: [BiquadNotch, current_depth_db, hold_counter]}
+        # hold_counter: frames until next probe step; when at 0dB counts idle frames
         self._notches: dict[float, list] = {}
 
     # ── public ────────────────────────────────────────────────────────────────
@@ -143,55 +151,62 @@ class NotchBank:
         """
         triggered: set[float] = set()
 
-        # ── Primary detections ────────────────────────────────────────────
+        # ── Primary detections: any detection → slam to max depth ─────────
         for freq in detected_freqs:
             existing = self._find_close(freq)
             if existing is not None:
-                # Warm re-attack: already tracked, step back moderately
                 triggered.add(existing)
-                new_depth = max(self._notches[existing][1] - self.WARM_REATTACK_DB,
-                                self.max_depth_db)
-                self._notches[existing][1] = new_depth
+                self._notches[existing][1] = self.max_depth_db
                 self._notches[existing][2] = self.HOLD_FRAMES_PER_STEP
-                self._notches[existing][0].set_depth(new_depth)
+                self._notches[existing][0].set_depth(self.max_depth_db)
             else:
-                # Cold attack: new frequency — slam to max depth immediately
                 key = self._add(freq, self.max_depth_db)
                 triggered.add(key)
 
-        # ── Harmonic pre-emption ─────────────────────────────────────────
-        # For each confirmed fundamental, check 2x–5x harmonic bins.
-        # If sub-threshold activity is present, place a light preemptive notch.
+        # ── Harmonic pre-emption ──────────────────────────────────────────
         if bin_freqs is not None and prob_np is not None:
             for fund_freq in detected_freqs:
                 for n in self.HARMONIC_MULTIPLES:
                     h_freq = fund_freq * n
                     if h_freq > bin_freqs[-1]:
-                        break                           # above Nyquist
-                    # Find closest bin to this harmonic
+                        break
                     idx = int(np.argmin(np.abs(bin_freqs - h_freq)))
                     if prob_np[idx] < self.HARMONIC_PROB_THRESH:
-                        continue                        # no activity here
+                        continue
                     existing = self._find_close(h_freq)
                     if existing is not None:
-                        triggered.add(existing)         # already tracked, hold it
+                        triggered.add(existing)
+                        # Harmonic re-trigger also slams to max
+                        self._notches[existing][1] = self.max_depth_db
                         self._notches[existing][2] = self.HOLD_FRAMES_PER_STEP
+                        self._notches[existing][0].set_depth(self.max_depth_db)
                     else:
-                        # Light preemptive notch — shallower than primary cold attack
                         key = self._add(h_freq, self.HARMONIC_DEPTH_DB)
                         triggered.add(key)
 
-        # ── Stepped release for untriggered notches ───────────────────────
+        # ── Stepped release / idle expiry for untriggered notches ─────────
         for freq in list(self._notches):
             if freq not in triggered:
                 hold = self._notches[freq][2] - 1
                 if hold > 0:
                     self._notches[freq][2] = hold
+                    continue
+
+                current_depth = self._notches[freq][1]
+
+                if current_depth >= 0.0:
+                    # Already at 0dB (pass-through) — counting idle time
+                    # hold_counter expired means idle period is over → remove
+                    del self._notches[freq]
                 else:
-                    new_depth = self._notches[freq][1] + self.RELEASE_STEP_DB
-                    if new_depth >= self.EXPIRE_THRESH_DB:
-                        del self._notches[freq]
+                    new_depth = current_depth + self.RELEASE_STEP_DB
+                    if new_depth >= 0.0:
+                        # Reached 0dB — sit here silently, start idle countdown
+                        self._notches[freq][1] = 0.0
+                        self._notches[freq][2] = self.IDLE_FRAMES_TO_EXPIRE
+                        self._notches[freq][0].set_depth(0.0)
                     else:
+                        # Normal probe step upward
                         self._notches[freq][1] = new_depth
                         self._notches[freq][2] = self.HOLD_FRAMES_PER_STEP
                         self._notches[freq][0].set_depth(new_depth)
