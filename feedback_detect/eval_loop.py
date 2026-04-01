@@ -106,7 +106,7 @@ def simulate(voice_np, noise_np, feedback_ir, gain,
                 prob, gru_h = model(features, gru_h)
 
             prob_np = prob[0, :, 0].cpu().numpy()
-            above   = (prob_np > 0.5) & (_bin_freqs >= 80.0)
+            above   = (prob_np > 0.5) & (_bin_freqs >= 80.0) & (_bin_freqs <= 16000.0)
             freqs   = _cluster_bins(_bin_freqs, prob_np, above)
 
             notch_bank.update(freqs, _bin_freqs, prob_np)
