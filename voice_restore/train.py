@@ -78,6 +78,9 @@ FREQ_RANGE      = (80.0, 18000.0)
 DEPTH_RANGE_DB  = (-48.0, -12.0)
 Q_RANGE         = (5.0, 30.0)
 
+ATTACK_SAMPS  = int(0.020 * SR)   # 20 ms attack ramp
+RELEASE_SAMPS = int(0.020 * SR)   # 20 ms release ramp
+
 _hpf_sos = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
 
 
@@ -132,7 +135,7 @@ def extract_f0(audio_path: Path, device='cpu') -> tuple[np.ndarray, np.ndarray]:
 # ── Notch simulation ──────────────────────────────────────────────────────────
 
 def simulate_notch_bank(n_notches: int, sr: int = SR) -> list[dict]:
-    """Draw random notch parameters from the same distribution as NotchBank."""
+    """Draw random notch parameters including random onset/duration within the clip."""
     notches = []
     used_freqs = []
     for _ in range(n_notches):
@@ -140,11 +143,40 @@ def simulate_notch_bank(n_notches: int, sr: int = SR) -> list[dict]:
             freq  = random.uniform(*FREQ_RANGE)
             if all(abs(freq - f) > 100.0 for f in used_freqs):
                 break
-        depth = random.uniform(*DEPTH_RANGE_DB)
-        q     = random.uniform(*Q_RANGE)
-        notches.append({'freq': freq, 'depth_db': depth, 'q': q})
+        depth      = random.uniform(*DEPTH_RANGE_DB)
+        q          = random.uniform(*Q_RANGE)
+        onset_frac = random.uniform(0.0, 0.6)
+        dur_frac   = random.uniform(0.15, max(0.16, 1.0 - onset_frac))
+        notches.append({'freq': freq, 'depth_db': depth, 'q': q,
+                        'onset_frac': onset_frac, 'dur_frac': dur_frac})
         used_freqs.append(freq)
     return notches
+
+
+def make_depth_envelope(depth_db: float, onset_frac: float, dur_frac: float,
+                         n_samples: int) -> np.ndarray:
+    """
+    Per-sample depth envelope for one notch (values in [depth_db, 0]).
+    Ramps in over ATTACK_SAMPS, holds at depth_db, ramps out over RELEASE_SAMPS.
+    """
+    env    = np.zeros(n_samples, dtype=np.float32)
+    onset  = int(onset_frac * n_samples)
+    dur    = max(1, int(dur_frac * n_samples))
+    end    = min(onset + dur, n_samples)
+    seg    = end - onset
+    if seg <= 0:
+        return env
+    atk = min(ATTACK_SAMPS, seg // 2)
+    rel = min(RELEASE_SAMPS, seg // 2)
+    atk_end   = onset + atk
+    hold_end  = max(atk_end, end - rel)
+    if atk_end > onset:
+        env[onset:atk_end] = np.linspace(0.0, depth_db, atk_end - onset, dtype=np.float32)
+    if hold_end > atk_end:
+        env[atk_end:hold_end] = depth_db
+    if end > hold_end:
+        env[hold_end:end] = np.linspace(depth_db, 0.0, end - hold_end, dtype=np.float32)
+    return env
 
 
 def notch_frequency_response(freq_hz: float, depth_db: float,
@@ -170,18 +202,29 @@ def notch_frequency_response(freq_hz: float, depth_db: float,
 
 def apply_notch_bank_to_audio(audio_np: np.ndarray,
                                notches: list[dict],
+                               n_frames: int,
                                sr: int = SR) -> tuple[np.ndarray, np.ndarray]:
     """
-    Apply a list of notch dicts to audio, return (notched_audio, mask_db).
+    Apply notches with time-varying depth envelopes.
 
-    mask_db : (N_FREQ,) cumulative per-bin attenuation of the full notch bank.
+    Each notch has a random onset and duration within the clip, with 20 ms
+    attack/release ramps, so the mask changes per frame — forcing the model
+    to use pitch context rather than memorising a static notch pattern.
+
+    Returns:
+      notched_audio : (n_samples,) float32
+      mask_db       : (N_FREQ, n_frames) float32, ≤ 0
     """
     from scipy.signal import lfilter
-    notched = audio_np.copy().astype(np.float32)
-    mask_db = np.zeros(N_FREQ, dtype=np.float32)
+    n_samples = len(audio_np)
+    notched   = audio_np.copy().astype(np.float32)
+    mask_db   = np.zeros((N_FREQ, n_frames), dtype=np.float32)
 
     for n in notches:
         freq, depth_db, q = n['freq'], n['depth_db'], n['q']
+        onset_frac, dur_frac = n['onset_frac'], n['dur_frac']
+
+        # Biquad coefficients (fixed)
         w0    = 2.0 * np.pi * freq / sr
         alpha = np.sin(w0) / (2.0 * q)
         cosw  = np.cos(w0)
@@ -189,10 +232,21 @@ def apply_notch_bank_to_audio(audio_np: np.ndarray,
         a0, a1, a2 = 1.0 + alpha, -2.0 * cosw, 1.0 - alpha
         b = np.array([b0 / a0, b1 / a0, b2 / a0])
         a = np.array([1.0, a1 / a0, a2 / a0])
-        dry_mix = 10.0 ** (depth_db / 20.0)
-        filtered = lfilter(b, a, notched)
-        notched  = (1.0 - dry_mix) * filtered + dry_mix * notched
-        mask_db += notch_frequency_response(freq, depth_db, q, sr)
+
+        # Filter full signal (one pass, fixed coefficients)
+        filtered = lfilter(b, a, notched).astype(np.float32)
+
+        # Per-sample depth envelope → time-varying wet/dry blend
+        depth_env = make_depth_envelope(depth_db, onset_frac, dur_frac, n_samples)
+        dry_mix   = (10.0 ** (depth_env / 20.0)).astype(np.float32)
+        notched   = (1.0 - dry_mix) * filtered + dry_mix * notched
+
+        # Per-frame mask: scale full-depth frequency shape by envelope at each frame
+        fr_shape = notch_frequency_response(freq, depth_db, q, sr)  # (N_FREQ,) ≤ 0
+        for t in range(n_frames):
+            s           = min(t * HOP, n_samples - 1)
+            scale       = float(depth_env[s]) / depth_db if depth_db != 0 else 0.0
+            mask_db[:, t] += fr_shape * scale
 
     return notched, np.clip(mask_db, -96.0, 0.0)
 
@@ -263,21 +317,22 @@ def make_training_pair(vocal_path: Path,
     noisy   = (vocal_np + noise_np[:SEQ_LEN] * (v_rms / n_rms * 10 ** (-snr_db / 20))
                ).astype(np.float32)
 
-    # ── Simulate notch bank ───────────────────────────────────────────────────
-    n_notches  = random.randint(1, MAX_NOTCHES_SIM)
-    notches    = simulate_notch_bank(n_notches)
-    notched_np, mask_db = apply_notch_bank_to_audio(noisy, notches)
-    # mask_db: (N_FREQ,) — same for all frames (notches are static in this sim)
-
-    # ── STFT ──────────────────────────────────────────────────────────────────
+    # ── STFT helper + get T from clean signal first ───────────────────────────
     def _stft_mag(x):
         t  = torch.from_numpy(x).unsqueeze(0).to(device)
         st = torch.stft(t, N_FFT, HOP, N_FFT, window, return_complex=True)
         return st.abs()[0]   # (N_FREQ, T)
 
-    clean_mag   = _stft_mag(noisy)
-    notched_mag = _stft_mag(notched_np)
+    clean_mag = _stft_mag(noisy)
     T = clean_mag.shape[1]
+
+    # ── Simulate notch bank (time-varying depths) ──────────────────────────────
+    n_notches   = random.randint(1, MAX_NOTCHES_SIM)
+    notches     = simulate_notch_bank(n_notches)
+    notched_np, mask_db = apply_notch_bank_to_audio(noisy, notches, T)
+    # mask_db: (N_FREQ, T) — depth varies per frame, model must use pitch
+
+    notched_mag = _stft_mag(notched_np)
 
     # ── F0 / pitch features ───────────────────────────────────────────────────
     key = str(vocal_path)
@@ -295,8 +350,8 @@ def make_training_pair(vocal_path: Path,
 
     # ── Assemble spectral input ───────────────────────────────────────────────
     log_notched = torch.log(notched_mag + 1e-8)                  # (N_FREQ, T)
-    # Normalise notch mask to [-1, 0] (0 = unnotched)
-    mask_t      = torch.from_numpy(mask_db[:, None]).to(device).expand(-1, T) / 96.0
+    # mask_db is (N_FREQ, T) — time-varying per-frame depth
+    mask_t      = torch.from_numpy(mask_db).to(device) / 96.0   # normalised [-1, 0]
     harm_t      = torch.from_numpy(harm_np).to(device)
 
     spectral = torch.stack([log_notched, mask_t, harm_t], dim=0).unsqueeze(0)
@@ -305,8 +360,7 @@ def make_training_pair(vocal_path: Path,
     pitch_t  = torch.from_numpy(pitch_np).to(device).unsqueeze(0)
     # → (1, 4, T)
 
-    mask_db_t = (torch.from_numpy(mask_db[:, None]).to(device)
-                 .expand(-1, T).unsqueeze(0))
+    mask_db_t = torch.from_numpy(mask_db).to(device).unsqueeze(0)
     # → (1, N_FREQ, T) — actual dB values for loss weighting
 
     return spectral, pitch_t, mask_db_t, clean_mag.unsqueeze(0), notched_mag.unsqueeze(0)
