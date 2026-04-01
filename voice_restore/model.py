@@ -38,9 +38,9 @@ N_FFT  = 1024
 HOP    = 480
 N_FREQ = N_FFT // 2 + 1   # 513
 
-N_SPECTRAL = 3   # log_mag_notched, notch_mask_db (normalised), harmonic_template
+N_SPECTRAL = 2   # log_mag_notched, harmonic_template
 N_PITCH    = 4   # f0_norm, confidence, delta_f0_norm, delta2_f0_norm
-N_IN       = N_SPECTRAL + N_PITCH   # 7 channels total (pitch broadcast to freq axis)
+N_IN       = N_SPECTRAL + N_PITCH   # 6 channels total (pitch broadcast to freq axis)
 
 # F0 range for normalisation
 F0_MIN_HZ  = 50.0
@@ -118,7 +118,7 @@ class VoiceRestorer(nn.Module):
                 h:        torch.Tensor | None = None):
         """
         spectral : (B, N_SPECTRAL, N_FREQ, T)
-                   channels: [log_mag_notched, notch_mask_db_norm, harmonic_template]
+                   channels: [log_mag_notched, harmonic_template]
         pitch    : (B, N_PITCH, T)
                    channels: [f0_norm, confidence, delta_f0_norm, delta2_f0_norm]
         h        : GRU hidden (1, B*N_FREQ, gru_hidden) or None

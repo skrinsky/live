@@ -350,12 +350,13 @@ def make_training_pair(vocal_path: Path,
 
     # ── Assemble spectral input ───────────────────────────────────────────────
     log_notched = torch.log(notched_mag + 1e-8)                  # (N_FREQ, T)
-    # mask_db is (N_FREQ, T) — time-varying per-frame depth
-    mask_t      = torch.from_numpy(mask_db).to(device) / 96.0   # normalised [-1, 0]
     harm_t      = torch.from_numpy(harm_np).to(device)
 
-    spectral = torch.stack([log_notched, mask_t, harm_t], dim=0).unsqueeze(0)
-    # → (1, 3, N_FREQ, T)
+    # Mask is NOT a model input — the model must infer suppressed bins from
+    # pitch context, not from an explicit mask channel. Mask is only used as
+    # a hard ceiling in apply_restoration and for loss weighting.
+    spectral = torch.stack([log_notched, harm_t], dim=0).unsqueeze(0)
+    # → (1, 2, N_FREQ, T)
 
     pitch_t  = torch.from_numpy(pitch_np).to(device).unsqueeze(0)
     # → (1, 4, T)
