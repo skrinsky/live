@@ -111,7 +111,7 @@ def extract_f0(audio_path: Path, device='cpu') -> tuple[np.ndarray, np.ndarray]:
     if sr != SR:
         return np.zeros(4, dtype=np.float32), np.zeros(4, dtype=np.float32)
 
-    audio_t = torch.from_numpy(audio_np).unsqueeze(0).to(device)
+    audio_t = torch.from_numpy(audio_np).float().unsqueeze(0).to(device)
     with torch.no_grad():
         f0, confidence = torchcrepe.predict(
             audio_t, SR,
