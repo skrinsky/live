@@ -115,7 +115,7 @@ class NotchBank:
     FREQ_TOL_HZ           = 75      # Hz — bins within this are the same resonance
     WARM_REATTACK_DB      = 12.0    # re-trigger while releasing: step back this far
     RELEASE_STEP_DB       = 6.0     # give back this many dB per release step
-    HOLD_FRAMES_PER_STEP  = 50      # frames to hold before trying next release step (~0.5s)
+    HOLD_FRAMES_PER_STEP  = 100     # frames to hold before trying next release step (~1s)
     EXPIRE_THRESH_DB      = -0.5    # remove notch when it releases past this
     HARMONIC_PROB_THRESH  = 0.15    # sub-threshold prob to trigger harmonic pre-emption
     HARMONIC_DEPTH_DB     = -12.0   # initial depth for harmonic notches (lighter than primary)

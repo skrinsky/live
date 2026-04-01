@@ -42,7 +42,7 @@ _bin_freqs  = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
 # ── Simulation ──────────────────────────────────────────────────────────────
 
 def simulate(voice_np, noise_np, feedback_ir, gain,
-             model=None, notch_bank=None, device='cpu', window=None):
+             model=None, notch_bank=None, device='cpu', window=None, threshold=0.4):
     """
     Closed-loop simulation for one audio clip.
 
@@ -106,7 +106,7 @@ def simulate(voice_np, noise_np, feedback_ir, gain,
                 prob, gru_h = model(features, gru_h)
 
             prob_np = prob[0, :, 0].cpu().numpy()
-            above   = (prob_np > 0.5) & (_bin_freqs >= 80.0) & (_bin_freqs < SR / 2)
+            above   = (prob_np > threshold) & (_bin_freqs >= 80.0) & (_bin_freqs < SR / 2)
             freqs   = _cluster_bins(_bin_freqs, prob_np, above)
 
             notch_bank.update(freqs, _bin_freqs, prob_np)
@@ -125,7 +125,7 @@ def simulate(voice_np, noise_np, feedback_ir, gain,
 
 # ── Evaluation ───────────────────────────────────────────────────────────────
 
-def run_eval(gain=1.3, duration_s=8.0, checkpoint=None, out_dir=None):
+def run_eval(gain=1.3, duration_s=30.0, threshold=0.4, checkpoint=None, out_dir=None):
     ckpt_path = Path(checkpoint or CHECKPOINT)
     assert ckpt_path.exists(), f'No checkpoint at {ckpt_path} — train first.'
 
@@ -201,7 +201,8 @@ def run_eval(gain=1.3, duration_s=8.0, checkpoint=None, out_dir=None):
     notch_bank = NotchBank(sr=SR, q=30.0, depth_db=-48.0)
     mic_sup, box_sup = simulate(voice_np, noise_np, ir, gain=gain,
                                 model=model, notch_bank=notch_bank,
-                                device=device, window=window)
+                                device=device, window=window,
+                                threshold=threshold)
     rms_sup = _rms_db(mic_sup)
     print(f'  mic RMS: {rms_sup:.1f} dB  (Δ {rms_sup - rms_raw:+.1f} dB vs raw)')
     print(f'  Notches held at end: {notch_bank.active_notches}')
@@ -262,10 +263,12 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--gain',       type=float, default=1.3,
                     help='Feedback loop gain (>1 = unstable, try 1.2–1.8)')
-    ap.add_argument('--duration',   type=float, default=8.0,
+    ap.add_argument('--duration',   type=float, default=30.0,
                     help='Simulation length in seconds')
+    ap.add_argument('--threshold',  type=float, default=0.4,
+                    help='Detection probability threshold (default 0.4)')
     ap.add_argument('--checkpoint', type=str,   default=None)
     ap.add_argument('--out-dir',    type=str,   default=None)
     args = ap.parse_args()
-    run_eval(gain=args.gain, duration_s=args.duration,
+    run_eval(gain=args.gain, duration_s=args.duration, threshold=args.threshold,
              checkpoint=args.checkpoint, out_dir=args.out_dir)
