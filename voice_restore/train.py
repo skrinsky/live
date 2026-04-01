@@ -476,7 +476,7 @@ def train():
             restored_mag = apply_restoration(notched_mag, mask_db_t, gain)
 
             # Build harmonic template tensor for loss weighting
-            harm_t = spectral[0, 2]   # (N_FREQ, T)
+            harm_t = spectral[0, 1]   # (N_FREQ, T) — channel 1 is harmonic_template
 
             loss = weighted_log_mag_loss(restored_mag, clean_mag,
                                           mask_db_t[0], harm_t)
