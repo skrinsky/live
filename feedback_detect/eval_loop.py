@@ -198,7 +198,7 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4, checkpoint=None, out_dir=
 
     # ── B) Suppressed ─────────────────────────────────────────────────────
     print('Running B: with FeedbackDetector + NotchBank…')
-    notch_bank = NotchBank(sr=SR, q=30.0, depth_db=-48.0)
+    notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
     mic_sup, box_sup = simulate(voice_np, noise_np, ir, gain=gain,
                                 model=model, notch_bank=notch_bank,
                                 device=device, window=window,
