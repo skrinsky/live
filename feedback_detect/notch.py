@@ -120,7 +120,9 @@ class NotchBank:
     MAX_NOTCHES           = 24
     FREQ_TOL_HZ           = 150     # Hz — bins within this are the same resonance
     RELEASE_STEP_DB       = 6.0     # give back this many dB per probe step
-    HOLD_FRAMES_PER_STEP  = 100     # frames between probe steps (~1s at 100fps)
+    HOLD_FRAMES_PER_STEP  = 2       # frames between probe steps (~20ms at 100fps)
+    LOCKED_HOLD_FRAMES    = 500     # frames between probes once locked (~5s at 100fps)
+    LOCK_THRESHOLD        = 3       # re-triggers to declare minimum found → lock in
     IDLE_FRAMES_TO_EXPIRE = 6000    # frames at 0dB with no detection before removal (~60s)
     HARMONIC_PROB_THRESH  = 0.15    # sub-threshold prob to trigger harmonic pre-emption
     HARMONIC_DEPTH_DB     = -12.0   # initial depth for harmonic notches
@@ -133,7 +135,7 @@ class NotchBank:
         self.sr            = sr
         self.q             = q          # kept for external callers; internal uses MAX_Q
         self.max_depth_db  = depth_db
-        # {freq_hz: [BiquadNotch, current_depth_db, hold_counter, current_q]}
+        # {freq_hz: [BiquadNotch, current_depth_db, hold_counter, current_q, retrigger_count]}
         self._notches: dict[float, list] = {}
 
     # ── public ────────────────────────────────────────────────────────────────
@@ -200,15 +202,16 @@ class NotchBank:
                         self._notches[freq][2] = self.IDLE_FRAMES_TO_EXPIRE
                         self._notches[freq][0].set_depth(0.0)
                     else:
-                        # Normal probe step upward
+                        # Normal probe step upward — reset lock so it re-learns if it returns
                         self._notches[freq][1] = new_depth
+                        self._notches[freq][4] = 0
                         self._notches[freq][2] = self.HOLD_FRAMES_PER_STEP
                         self._notches[freq][0].set_depth(new_depth)
 
     def process(self, audio_block: np.ndarray) -> np.ndarray:
         """Apply all active notches in series."""
         y = audio_block.astype(np.float32)
-        for notch, _, __, ___ in self._notches.values():
+        for notch, _, __, ___, ____ in self._notches.values():
             y = notch.process(y)
         return y
 
@@ -227,7 +230,7 @@ class NotchBank:
     # ── private ───────────────────────────────────────────────────────────────
 
     def _retrigger(self, freq: float):
-        """Slam depth to max and widen Q on a re-trigger."""
+        """Slam depth to max, widen Q, increment re-trigger count → lock in when stable."""
         state = self._notches[freq]
         # Widen Q — each re-trigger says "the notch is too narrow"
         current_q = state[3]
@@ -237,8 +240,11 @@ class NotchBank:
             state[0].set_q(new_q)
         # Slam depth
         state[1] = self.max_depth_db
-        state[2] = self.HOLD_FRAMES_PER_STEP
         state[0].set_depth(self.max_depth_db)
+        # Lock in after LOCK_THRESHOLD re-triggers — minimum found, probe slowly
+        state[4] += 1
+        state[2] = (self.LOCKED_HOLD_FRAMES if state[4] >= self.LOCK_THRESHOLD
+                    else self.HOLD_FRAMES_PER_STEP)
 
     def _find_close(self, freq: float) -> float | None:
         """Return the existing notch frequency closest to freq, if within FREQ_TOL_HZ."""
@@ -254,5 +260,5 @@ class NotchBank:
             shallowest = max(self._notches, key=lambda f: self._notches[f][1])
             del self._notches[shallowest]
         notch = BiquadNotch(freq, sr=self.sr, q=self.MAX_Q, depth_db=depth_db)
-        self._notches[freq] = [notch, depth_db, self.HOLD_FRAMES_PER_STEP, self.MAX_Q]
+        self._notches[freq] = [notch, depth_db, self.HOLD_FRAMES_PER_STEP, self.MAX_Q, 0]
         return freq
