@@ -46,13 +46,22 @@ from voice_restore.model import (SR, N_FFT, HOP, N_FREQ,
                                   VoiceRestorer, harmonic_template,
                                   normalise_f0, apply_restoration)
 
+# Stub resampy before importing torchcrepe — resampy→numba breaks on Python 3.13.
+# torchcrepe only calls resampy.resample; replace with torchaudio (already required).
 try:
+    import sys as _sys, types as _types
+    import torchaudio.functional as _taf
+    _resampy = _types.ModuleType('resampy')
+    _resampy.resample = lambda x, sr_orig, sr_target, **kw: _taf.resample(
+        torch.from_numpy(x.copy()), int(sr_orig), int(sr_target)).numpy()
+    _sys.modules.setdefault('resampy', _resampy)
     import torchcrepe
     CREPE_AVAILABLE = True
 except Exception as _crepe_err:
     CREPE_AVAILABLE = False
     print(f'WARNING: torchcrepe unavailable ({type(_crepe_err).__name__}: {_crepe_err})')
     print('         F0 will be zero-initialised (no pitch information).')
+
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 SEQ_SECS    = 2.0
