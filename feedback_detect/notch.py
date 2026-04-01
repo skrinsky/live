@@ -127,9 +127,9 @@ class NotchBank:
     HARMONIC_PROB_THRESH  = 0.15    # sub-threshold prob to trigger harmonic pre-emption
     HARMONIC_DEPTH_DB     = -12.0   # initial depth for harmonic notches
     HARMONIC_MULTIPLES    = (2, 3, 4, 5)
-    MAX_Q                 = 30.0    # starting Q for every new notch (surgical)
-    MIN_Q                 = 5.0     # widest allowed notch (~200 Hz BW at 1 kHz)
-    Q_WIDEN_FACTOR        = 0.75    # multiply Q by this on each re-trigger
+    MAX_Q                 = 30.0    # narrowest Q (surgical) — target after convergence
+    MIN_Q                 = 5.0     # widest Q (aggressive) — starting point, ~200Hz BW at 1kHz
+    Q_NARROW_FACTOR       = 1.25    # multiply Q by this each probe step (wide → narrow)
 
     def __init__(self, sr=48000, q=30.0, depth_db=-48.0):
         self.sr            = sr
@@ -202,11 +202,15 @@ class NotchBank:
                         self._notches[freq][2] = self.IDLE_FRAMES_TO_EXPIRE
                         self._notches[freq][0].set_depth(0.0)
                     else:
-                        # Normal probe step upward — reset lock so it re-learns if it returns
+                        # Normal probe step — release depth, narrow Q, reset lock
                         self._notches[freq][1] = new_depth
                         self._notches[freq][4] = 0
                         self._notches[freq][2] = self.HOLD_FRAMES_PER_STEP
                         self._notches[freq][0].set_depth(new_depth)
+                        new_q = min(self.MAX_Q, self._notches[freq][3] * self.Q_NARROW_FACTOR)
+                        if new_q != self._notches[freq][3]:
+                            self._notches[freq][3] = new_q
+                            self._notches[freq][0].set_q(new_q)
 
     def process(self, audio_block: np.ndarray) -> np.ndarray:
         """Apply all active notches in series."""
@@ -230,14 +234,12 @@ class NotchBank:
     # ── private ───────────────────────────────────────────────────────────────
 
     def _retrigger(self, freq: float):
-        """Slam depth to max, widen Q, increment re-trigger count → lock in when stable."""
+        """Slam depth and Q back to max-aggressive, increment re-trigger count → lock in."""
         state = self._notches[freq]
-        # Widen Q — each re-trigger says "the notch is too narrow"
-        current_q = state[3]
-        new_q = max(self.MIN_Q, current_q * self.Q_WIDEN_FACTOR)
-        if new_q != current_q:
-            state[3] = new_q
-            state[0].set_q(new_q)
+        # Slam Q back to widest — ring escaped, start aggressive again
+        if state[3] != self.MIN_Q:
+            state[3] = self.MIN_Q
+            state[0].set_q(self.MIN_Q)
         # Slam depth
         state[1] = self.max_depth_db
         state[0].set_depth(self.max_depth_db)
@@ -259,6 +261,6 @@ class NotchBank:
             # Evict the shallowest notch (most released, least active)
             shallowest = max(self._notches, key=lambda f: self._notches[f][1])
             del self._notches[shallowest]
-        notch = BiquadNotch(freq, sr=self.sr, q=self.MAX_Q, depth_db=depth_db)
-        self._notches[freq] = [notch, depth_db, self.HOLD_FRAMES_PER_STEP, self.MAX_Q, 0]
+        notch = BiquadNotch(freq, sr=self.sr, q=self.MIN_Q, depth_db=depth_db)
+        self._notches[freq] = [notch, depth_db, self.HOLD_FRAMES_PER_STEP, self.MIN_Q, 0]
         return freq
