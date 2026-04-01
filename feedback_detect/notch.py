@@ -199,7 +199,7 @@ class NotchBank:
     def process(self, audio_block: np.ndarray) -> np.ndarray:
         """Apply all active notches in series."""
         y = audio_block.astype(np.float32)
-        for notch, _ in self._notches.values():
+        for notch, _, __ in self._notches.values():
             y = notch.process(y)
         return y
 
