@@ -117,8 +117,8 @@ def run(threshold=DETECT_THRESH, q=NOTCH_Q, depth_db=NOTCH_DEPTH, checkpoint=Non
             outdata[:, 1] = processed
 
         if notch_bank.active_notches:
-            notch_str = ', '.join(f'{f:.0f}Hz/{d:.0f}dB'
-                                  for f, d in notch_bank.active_notches)
+            notch_str = ', '.join(f'{f:.0f}Hz/{d:.0f}dB/Q{q:.0f}'
+                                  for f, d, q in notch_bank.active_notches)
             det_str   = ', '.join(f'{f:.0f}' for f in detected_freqs) or '—'
             print(f'\rDetected: [{det_str}]   Active: [{notch_str}]    ', end='')
 

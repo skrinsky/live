@@ -205,7 +205,9 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4, checkpoint=None, out_dir=
                                 threshold=threshold)
     rms_sup = _rms_db(mic_sup)
     print(f'  mic RMS: {rms_sup:.1f} dB  (Δ {rms_sup - rms_raw:+.1f} dB vs raw)')
-    print(f'  Notches held at end: {notch_bank.active_notches}')
+    notch_str = ', '.join(f'{f:.0f}Hz/{d:.0f}dB/Q{q:.0f}'
+                          for f, d, q in notch_bank.active_notches)
+    print(f'  Notches held at end: [{notch_str}]')
 
     # ── Save audio ────────────────────────────────────────────────────────
     sf.write(str(out_dir / 'clean_reference.wav'), clean_np, SR, subtype='PCM_16')

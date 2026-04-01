@@ -4,14 +4,22 @@ feedback_detect/notch.py — Parametric biquad notch filter bank with attack/rel
 Pure signal processing — no learning. The neural detector decides WHICH
 frequencies to notch; this module does the actual notching.
 
-Notch depth is dynamic, not fixed:
-  - Detection fires → attack: depth slams toward max_depth in ~3 frames (30ms)
-  - No detection    → release: depth creeps back toward 0 over ~2.5s
-  - Re-triggered during release → re-attack → settles at minimum stable depth
+Both depth and Q are dynamic:
 
-This mirrors what a live engineer does: cut hard to break the loop, then
-slowly raise the fader back until it just starts to ring, then back off —
-finding the minimum cut that keeps the system stable.
+  Depth (how deep to cut):
+    Detection fires → slam to max_depth_db immediately
+    No detection    → step back 6 dB every ~1 s until 0 dB (pass-through)
+    Re-triggered    → slam back to max; re-probe from full depth
+    Convergence     → minimum stable cut found dynamically, not hardcoded
+
+  Q (how wide to cut):
+    Cold attack     → start at MAX_Q (30) — surgical, minimal collateral
+    Re-triggered    → widen by Q_WIDEN_FACTOR each time (30→22→17→13→10→8→5)
+    Stabilises      → minimum Q that stops re-triggering IS the mode width
+    New cold        → back to MAX_Q
+
+  This mirrors what a live engineer does: cut hard and narrow first, widen
+  if the ring escapes the notch, then back off depth until it just holds.
 
 Biquad coefficients from the Audio EQ Cookbook (R. Bristow-Johnson).
 Depth is implemented as a wet/dry blend so it is always finite (no perfect
@@ -24,11 +32,11 @@ from scipy.signal import lfilter
 
 class BiquadNotch:
     """
-    Single stateful parametric biquad notch filter with variable depth.
+    Single stateful parametric biquad notch filter with variable depth and Q.
 
-    Filter coefficients (freq, Q) are fixed at construction.
-    Depth (dry_mix) is updated dynamically via set_depth() — no recomputation
-    of coefficients needed, just changes the wet/dry blend ratio.
+    Coefficients are recomputed on set_q(); filter state (zi) is preserved
+    across the recomputation so there is no audible click.
+    Depth (dry_mix) is updated via set_depth() — no coefficient recomputation.
     """
 
     def __init__(self, freq_hz, sr=48000, q=30.0, depth_db=0.0):
@@ -36,12 +44,12 @@ class BiquadNotch:
         self.freq_hz  = freq_hz
         self.q        = q
         self.depth_db = depth_db
-        self._set_coeffs(freq_hz)
+        self._set_coeffs()
         self.zi = np.zeros(2)
 
-    def _set_coeffs(self, freq_hz):
+    def _set_coeffs(self):
         """Biquad notch coefficients (Audio EQ Cookbook)."""
-        w0    = 2.0 * np.pi * freq_hz / self.sr
+        w0    = 2.0 * np.pi * self.freq_hz / self.sr
         alpha = np.sin(w0) / (2.0 * self.q)
         cosw  = np.cos(w0)
 
@@ -53,13 +61,18 @@ class BiquadNotch:
         self._update_dry_mix()
 
     def _update_dry_mix(self):
-        # depth_db=0 → dry_mix=1.0 (pass-through), depth_db=-24 → dry_mix≈0.063 (deep cut)
+        # depth_db=0 → dry_mix=1.0 (pass-through), depth_db=-48 → very deep cut
         self.dry_mix = 10.0 ** (self.depth_db / 20.0)
 
     def set_depth(self, depth_db: float):
         """Update notch depth without recomputing filter coefficients."""
         self.depth_db = depth_db
         self._update_dry_mix()
+
+    def set_q(self, q: float):
+        """Widen or narrow the notch. Recomputes coefficients; zi preserved — no click."""
+        self.q = q
+        self._set_coeffs()
 
     def process(self, x: np.ndarray) -> np.ndarray:
         """
@@ -75,44 +88,29 @@ class BiquadNotch:
 
 class NotchBank:
     """
-    Bank of up to MAX_NOTCHES biquad notch filters with attack/release envelopes.
+    Bank of up to MAX_NOTCHES biquad notch filters with adaptive depth and Q.
 
-    Each notch has a dynamic depth_db that:
-      - Attacks toward max_depth_db when its frequency is detected (fast, ~3 frames)
-      - Releases back toward 0 when not detected (slow, ~2.5 s)
-      - Is removed once it releases past EXPIRE_THRESH_DB
+    Per-notch state: [BiquadNotch, current_depth_db, hold_counter, current_q]
 
-    Attack/release design:
+    Depth behaviour:
+      - Any detection (cold or re-trigger) → slam to max_depth_db immediately
+      - Release: hold HOLD_FRAMES_PER_STEP (~1s), give back RELEASE_STEP_DB (6dB)
+      - At 0dB: sit silently for IDLE_FRAMES_TO_EXPIRE (~60s), then remove
+      - Re-trigger at any depth → slam back to max, re-probe from full depth
 
-    Any detection (new OR re-triggered):
-        Slam to max_depth_db immediately — fully kill the ring first.
-        "Warm" just means the filter already exists and is running (no click);
-        the depth is the same as a cold attack. You must break the ring
-        completely before probing for the minimum.
-
-    Release (stepped probe):
-        Hold HOLD_FRAMES_PER_STEP (~1s), then give back RELEASE_STEP_DB (6dB).
-        Repeat until depth reaches 0dB (pass-through). The notch stays in the
-        bank silently at 0dB — filter still running, no audible effect.
-
-    Re-triggered at any depth including 0dB:
-        Slam back to max_depth_db. Re-probe upward from full depth.
+    Q behaviour (adaptive):
+      - Cold attack: Q = MAX_Q (30) — start surgical
+      - Re-trigger:  Q = max(MIN_Q, current_q × Q_WIDEN_FACTOR) — widen each time
+      - Stabilises at the minimum Q that stops the re-trigger = actual mode width
+      - Cold add always starts at MAX_Q
 
     Convergence:
-        Over multiple speech events, every probe cycle restarts from max_depth
-        and gets re-triggered at approximately the same point. That point IS
-        the minimum stable cut for this room and frequency — found dynamically,
-        not hardcoded.
-
-    Expiry:
-        After IDLE_FRAMES_TO_EXPIRE (~60s) at 0dB with no detection, remove.
-        Frequency may genuinely no longer be problematic (mic moved, gain
-        changed). During a show, problematic frequencies typically persist.
+      Over multiple speech events, depth and Q both settle at their minimums
+      for this room mode — found dynamically, not hardcoded.
 
     Harmonic pre-emption:
-        When update() receives bin_freqs + prob_np, scans 2F–5F harmonics of
-        each confirmed fundamental. Sub-threshold activity → light notch placed
-        preemptively at HARMONIC_DEPTH_DB, same attack/release rules apply.
+      Scans 2F–5F harmonics of each confirmed fundamental. Sub-threshold
+      activity → light notch placed preemptively at HARMONIC_DEPTH_DB.
 
     Workflow each audio frame:
       1. notch_bank.update(detected_freqs, bin_freqs, prob_np)
@@ -127,13 +125,15 @@ class NotchBank:
     HARMONIC_PROB_THRESH  = 0.15    # sub-threshold prob to trigger harmonic pre-emption
     HARMONIC_DEPTH_DB     = -12.0   # initial depth for harmonic notches
     HARMONIC_MULTIPLES    = (2, 3, 4, 5)
+    MAX_Q                 = 30.0    # starting Q for every new notch (surgical)
+    MIN_Q                 = 5.0     # widest allowed notch (~200 Hz BW at 1 kHz)
+    Q_WIDEN_FACTOR        = 0.75    # multiply Q by this on each re-trigger
 
     def __init__(self, sr=48000, q=30.0, depth_db=-48.0):
         self.sr            = sr
-        self.q             = q
+        self.q             = q          # kept for external callers; internal uses MAX_Q
         self.max_depth_db  = depth_db
-        # {freq_hz: [BiquadNotch, current_depth_db, hold_counter]}
-        # hold_counter: frames until next probe step; when at 0dB counts idle frames
+        # {freq_hz: [BiquadNotch, current_depth_db, hold_counter, current_q]}
         self._notches: dict[float, list] = {}
 
     # ── public ────────────────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ class NotchBank:
                bin_freqs: 'np.ndarray | None' = None,
                prob_np:   'np.ndarray | None' = None):
         """
-        Drive cold/warm attack, stepped release, and harmonic pre-emption.
+        Drive cold/warm attack, adaptive Q, stepped release, harmonic pre-emption.
         Call once per audio frame, before process().
 
         detected_freqs : confirmed ringing frequencies (prob > primary threshold)
@@ -151,14 +151,12 @@ class NotchBank:
         """
         triggered: set[float] = set()
 
-        # ── Primary detections: any detection → slam to max depth ─────────
+        # ── Primary detections ────────────────────────────────────────────
         for freq in detected_freqs:
             existing = self._find_close(freq)
             if existing is not None:
                 triggered.add(existing)
-                self._notches[existing][1] = self.max_depth_db
-                self._notches[existing][2] = self.HOLD_FRAMES_PER_STEP
-                self._notches[existing][0].set_depth(self.max_depth_db)
+                self._retrigger(existing)
             else:
                 key = self._add(freq, self.max_depth_db)
                 triggered.add(key)
@@ -176,10 +174,7 @@ class NotchBank:
                     existing = self._find_close(h_freq)
                     if existing is not None:
                         triggered.add(existing)
-                        # Harmonic re-trigger also slams to max
-                        self._notches[existing][1] = self.max_depth_db
-                        self._notches[existing][2] = self.HOLD_FRAMES_PER_STEP
-                        self._notches[existing][0].set_depth(self.max_depth_db)
+                        self._retrigger(existing)
                     else:
                         key = self._add(h_freq, self.HARMONIC_DEPTH_DB)
                         triggered.add(key)
@@ -195,13 +190,12 @@ class NotchBank:
                 current_depth = self._notches[freq][1]
 
                 if current_depth >= 0.0:
-                    # Already at 0dB (pass-through) — counting idle time
-                    # hold_counter expired means idle period is over → remove
+                    # Already at 0dB — idle countdown expired → remove
                     del self._notches[freq]
                 else:
                     new_depth = current_depth + self.RELEASE_STEP_DB
                     if new_depth >= 0.0:
-                        # Reached 0dB — sit here silently, start idle countdown
+                        # Reached 0dB — sit silently, start idle countdown
                         self._notches[freq][1] = 0.0
                         self._notches[freq][2] = self.IDLE_FRAMES_TO_EXPIRE
                         self._notches[freq][0].set_depth(0.0)
@@ -214,7 +208,7 @@ class NotchBank:
     def process(self, audio_block: np.ndarray) -> np.ndarray:
         """Apply all active notches in series."""
         y = audio_block.astype(np.float32)
-        for notch, _, __ in self._notches.values():
+        for notch, _, __, ___ in self._notches.values():
             y = notch.process(y)
         return y
 
@@ -223,14 +217,28 @@ class NotchBank:
         return list(self._notches.keys())
 
     @property
-    def active_notches(self) -> list[tuple[float, float]]:
-        """(freq_hz, current_depth_db) for each active notch."""
-        return [(f, v[1]) for f, v in self._notches.items()]
+    def active_notches(self) -> list[tuple[float, float, float]]:
+        """(freq_hz, current_depth_db, current_q) for each active notch."""
+        return [(f, v[1], v[3]) for f, v in self._notches.items()]
 
     def reset(self):
         self._notches.clear()
 
     # ── private ───────────────────────────────────────────────────────────────
+
+    def _retrigger(self, freq: float):
+        """Slam depth to max and widen Q on a re-trigger."""
+        state = self._notches[freq]
+        # Widen Q — each re-trigger says "the notch is too narrow"
+        current_q = state[3]
+        new_q = max(self.MIN_Q, current_q * self.Q_WIDEN_FACTOR)
+        if new_q != current_q:
+            state[3] = new_q
+            state[0].set_q(new_q)
+        # Slam depth
+        state[1] = self.max_depth_db
+        state[2] = self.HOLD_FRAMES_PER_STEP
+        state[0].set_depth(self.max_depth_db)
 
     def _find_close(self, freq: float) -> float | None:
         """Return the existing notch frequency closest to freq, if within FREQ_TOL_HZ."""
@@ -240,11 +248,11 @@ class NotchBank:
         return None
 
     def _add(self, freq: float, depth_db: float) -> float:
-        """Add a new notch at depth_db. Returns its key."""
+        """Add a new notch at MAX_Q and depth_db. Returns its key."""
         if len(self._notches) >= self.MAX_NOTCHES:
             # Evict the shallowest notch (most released, least active)
             shallowest = max(self._notches, key=lambda f: self._notches[f][1])
             del self._notches[shallowest]
-        notch = BiquadNotch(freq, sr=self.sr, q=self.q, depth_db=depth_db)
-        self._notches[freq] = [notch, depth_db, self.HOLD_FRAMES_PER_STEP]
+        notch = BiquadNotch(freq, sr=self.sr, q=self.MAX_Q, depth_db=depth_db)
+        self._notches[freq] = [notch, depth_db, self.HOLD_FRAMES_PER_STEP, self.MAX_Q]
         return freq
