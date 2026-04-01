@@ -8,13 +8,12 @@ restore each STFT bin based on:
   - A harmonic template derived from the current F0 (CREPE pitch estimate)
   - Pitch trajectory features (F0, confidence, ΔF0, Δ²F0)
 
-The output is a per-bin gain in [0, 1], where:
-  0 = leave the notch as-is
-  1 = restore fully up to the pre-notch level
-
-Hard constraint: the model can never boost a bin above its pre-notch level.
-This preserves feedback suppression unconditionally — the restorer can only
-give back energy that the notch bank removed, not add new energy.
+The output is a per-bin gain in [0, 1], where gain drives a boost of up to
+MAX_COMP_DB dB at safe (un-notched) bins only.  Notched bins are hard-zeroed
+— the model never touches a ringing frequency.  Instead it learns spectral
+compensation: "1 kHz is ringing → boost 900 Hz / 1.1 kHz / 2 kHz so the
+voice still sounds balanced."  The mel-scale training loss makes gradient
+flow from the notched bin across to the neighbouring safe bins.
 
 Predictive behaviour comes from the GRU: it carries pitch trajectory state
 across frames, allowing it to anticipate where harmonic peaks are heading
@@ -159,23 +158,25 @@ class VoiceRestorer(nn.Module):
 
 # ── Inference helper ──────────────────────────────────────────────────────────
 
-def apply_restoration(notched_mag:   torch.Tensor,
-                      notch_mask_db: torch.Tensor,
-                      gain:          torch.Tensor) -> torch.Tensor:
+MAX_COMP_DB = 6.0   # maximum boost at safe neighbouring bins
+
+def apply_compensation(notched_mag:   torch.Tensor,
+                       notch_mask_db: torch.Tensor,
+                       gain:          torch.Tensor) -> torch.Tensor:
     """
-    Apply the model's gain prediction to the notched magnitude.
+    Apply spectral compensation at safe (un-notched) bins only.
 
-    restored_mag = notched_mag * 10^( gain * (-notch_mask_db) / 20 )
-
-    The exponent is always ≥ 0 (since notch_mask_db ≤ 0), so we can only
-    ever boost — and only up to the pre-notch level. No feedback energy added.
+    Ringing frequencies are never touched — gain is hard-zeroed there.
+    Neighbouring un-notched bins can be boosted up to MAX_COMP_DB dB so
+    the model learns to redistribute voice energy away from the danger zone:
+    e.g. "1 kHz is ringing → boost 900 Hz / 1.1 kHz / 2 kHz to compensate."
 
     notched_mag   : (B, N_FREQ, T) linear magnitude
-    notch_mask_db : (B, N_FREQ, T) ≤ 0  — how much each bin was attenuated
+    notch_mask_db : (B, N_FREQ, T) ≤ 0  (0 = unnotched, < 0 = notched)
     gain          : (B, N_FREQ, T) ∈ [0, 1]
 
-    Returns restored_mag : (B, N_FREQ, T)
+    Returns compensated_mag : (B, N_FREQ, T)
     """
-    recovery_db  = gain * (-notch_mask_db)          # ∈ [0, abs(notch_depth)]
-    scale        = 10.0 ** (recovery_db / 20.0)
-    return notched_mag * scale
+    not_notched = (notch_mask_db > -3.0).float()          # 1 = safe, 0 = notched
+    boost_db    = gain * MAX_COMP_DB * not_notched         # ∈ [0, MAX_COMP_DB] at safe bins
+    return notched_mag * (10.0 ** (boost_db / 20.0))

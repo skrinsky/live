@@ -42,9 +42,10 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import torchaudio
 from voice_restore.model import (SR, N_FFT, HOP, N_FREQ,
                                   VoiceRestorer, harmonic_template,
-                                  normalise_f0, apply_restoration)
+                                  normalise_f0, apply_compensation)
 
 # Stub resampy before importing torchcrepe — resampy→numba breaks on Python 3.13.
 # torchcrepe only calls resampy.resample; replace with torchaudio (already required).
@@ -369,40 +370,51 @@ def make_training_pair(vocal_path: Path,
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 
-def weighted_log_mag_loss(restored_mag: torch.Tensor,
-                           clean_mag:    torch.Tensor,
-                           notch_mask_db: torch.Tensor,
-                           harm_template: torch.Tensor) -> torch.Tensor:
+N_MELS = 80
+
+def make_mel_fb(device: torch.device) -> torch.Tensor:
+    """Mel filterbank matrix (N_MELS, N_FREQ) on device."""
+    fb = torchaudio.functional.melscale_fbanks(
+        n_freqs=N_FREQ, f_min=80.0, f_max=float(SR // 2),
+        n_mels=N_MELS, sample_rate=SR,
+    )  # (N_FREQ, N_MELS)
+    return fb.T.to(device)  # (N_MELS, N_FREQ)
+
+
+def mel_compensation_loss(compensated_mag: torch.Tensor,
+                           clean_mag:       torch.Tensor,
+                           mel_fb:          torch.Tensor,
+                           harm_template:   torch.Tensor) -> torch.Tensor:
     """
-    Loss focused on notched harmonic bins — the only bins where the model
-    must use pitch to decide whether to restore.
+    Log mel-energy MSE between compensated and clean signals.
 
-    gain=0 at a notched voiced bin incurs full penalty.
-    gain=0 at an un-notched bin incurs zero penalty (correct behaviour).
-    This makes the trivial gain=0 solution expensive and forces pitch use.
+    Using mel-scale bands instead of per-bin MSE means gradient from a
+    notched bin flows to all un-notched bins in the same mel band — the
+    mechanism that teaches "1 kHz cut → boost 900 Hz / 1.1 kHz."
 
-    Weights:
-      - 1 only where the notch is actively cutting (> 3 dB attenuation)
-      - 2x at strong voice harmonic bins within the notched region
-      - 0 at near-silence bins (don't restore into noise floor)
+    compensated_mag : (B, N_FREQ, T)
+    clean_mag       : (B, N_FREQ, T)
+    mel_fb          : (N_MELS, N_FREQ)
+    harm_template   : (N_FREQ, T)  — for voiced-frame weighting
     """
-    log_restored = torch.log(restored_mag + 1e-8)
-    log_clean    = torch.log(clean_mag    + 1e-8)
+    # Per-band energy  (B, N_MELS, T)
+    c_mel = torch.einsum('mf,bft->bmt', mel_fb, compensated_mag ** 2).clamp(1e-8)
+    k_mel = torch.einsum('mf,bft->bmt', mel_fb, clean_mag       ** 2).clamp(1e-8)
 
-    # Only penalise bins where a notch is actually cutting
-    notch_active = (notch_mask_db < -3.0).float()
+    log_c = torch.log(c_mel)
+    log_k = torch.log(k_mel)
 
-    # 2x at strong harmonic bins (where pitch prediction matters most)
-    harm_weight  = 1.0 + harm_template.clamp(0, 1)
+    # Weight voiced frames more (harmonic template active)
+    voiced = (harm_template.mean(0) > 0.1).float()       # (T,)
+    voiced = voiced.unsqueeze(0).unsqueeze(0)              # (1, 1, T)
 
-    # Zero weight at silence (don't try to restore noise floor)
-    silence_mask = (log_clean > -10.0).float()
+    # Silence gate: drop frames where clean is very quiet
+    silence = (torch.log(clean_mag + 1e-8) > -10.0).float().mean(1, keepdim=True)
+    # → (B, 1, T)
 
-    w = notch_active * harm_weight * silence_mask
-
-    # Avoid NaN if no notched+voiced bins in this batch element
-    denom = w.sum().clamp(min=1.0)
-    return (w * (log_restored - log_clean) ** 2).sum() / denom
+    w     = (1.0 + voiced) * silence                      # (B, 1, T) broadcast over mels
+    denom = (w.expand_as(log_c)).sum().clamp(1.0)
+    return (w * (log_c - log_k) ** 2).sum() / denom
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
@@ -441,6 +453,7 @@ def train():
     if not CREPE_AVAILABLE:
         print('NOTE: CREPE unavailable — training without pitch features.')
 
+    mel_fb    = make_mel_fb(device)   # (N_MELS, N_FREQ)
     best_loss = float('inf')
     f0_cache: dict = {}
 
@@ -480,13 +493,11 @@ def train():
             # ── Forward ────────────────────────────────────────────────────────
             gain, _ = model(spectral, pitch_t)   # (1, N_FREQ, T)
 
-            restored_mag = apply_restoration(notched_mag, mask_db_t, gain)
+            comp_mag = apply_compensation(notched_mag, mask_db_t, gain)
 
-            # Build harmonic template tensor for loss weighting
             harm_t = spectral[0, 1]   # (N_FREQ, T) — channel 1 is harmonic_template
 
-            loss = weighted_log_mag_loss(restored_mag, clean_mag,
-                                          mask_db_t[0], harm_t)
+            loss = mel_compensation_loss(comp_mag, clean_mag, mel_fb, harm_t)
 
             if not torch.isfinite(loss):
                 continue

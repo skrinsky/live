@@ -29,7 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from voice_restore.model import (SR, N_FFT, HOP, N_FREQ,
                                   VoiceRestorer, harmonic_template,
-                                  normalise_f0, apply_restoration)
+                                  normalise_f0, apply_compensation)
 from voice_restore.train import (notch_frequency_response,
                                   build_pitch_features, build_harmonic_features,
                                   make_depth_envelope, ATTACK_SAMPS, RELEASE_SAMPS)
@@ -148,7 +148,7 @@ def run_eval(input_path: str, notch_specs: list[tuple], ckpt_path: Path, out_dir
     with torch.no_grad():
         gain, _ = model(spectral, pitch_t)   # (1, N_FREQ, T)
 
-    restored_mag = apply_restoration(notched_mag.unsqueeze(0), mask_db_t, gain)[0]
+    comp_mag = apply_compensation(notched_mag.unsqueeze(0), mask_db_t, gain)[0]
     # → (N_FREQ, T)
 
     print(f'Gain stats: min={gain.min():.3f}  max={gain.max():.3f}  '
@@ -157,7 +157,7 @@ def run_eval(input_path: str, notch_specs: list[tuple], ckpt_path: Path, out_dir
     # ── Reconstruct time-domain via Griffin-Lim ───────────────────────────────
     # Use notched phase (best available — avoids phase hallucination)
     notched_phase = notched_stft / (notched_mag + 1e-8)
-    restored_stft = restored_mag * notched_phase
+    restored_stft = comp_mag * notched_phase
 
     def _istft(stft_c):
         return torch.istft(stft_c.unsqueeze(0), N_FFT, HOP, N_FFT, window)[0].cpu().numpy()
