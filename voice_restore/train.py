@@ -86,13 +86,16 @@ def extract_f0(audio_path: Path, device='cpu') -> tuple[np.ndarray, np.ndarray]:
         d = np.load(str(cache))
         return d['f0'], d['confidence']
 
-    if not CREPE_AVAILABLE:
-        info   = sf.info(str(audio_path))
-        n_frames = int(info.frames // HOP)
-        zeros  = np.zeros(n_frames, dtype=np.float32)
+    try:
+        audio_np, sr = sf.read(str(audio_path), dtype='float32')
+    except Exception:
+        zeros = np.zeros(4, dtype=np.float32)
         return zeros, zeros
 
-    audio_np, sr = sf.read(str(audio_path), dtype='float32')
+    if not CREPE_AVAILABLE:
+        n_frames = int(len(audio_np) // HOP)
+        zeros  = np.zeros(n_frames, dtype=np.float32)
+        return zeros, zeros
     if audio_np.ndim > 1:
         audio_np = audio_np.mean(1)
     if sr != SR:
