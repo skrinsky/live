@@ -46,7 +46,13 @@ from voice_restore.model import (SR, N_FFT, HOP, N_FREQ,
                                   VoiceRestorer, harmonic_template,
                                   normalise_f0, apply_restoration)
 
-import librosa
+try:
+    import torchcrepe
+    CREPE_AVAILABLE = True
+except Exception as _crepe_err:
+    CREPE_AVAILABLE = False
+    print(f'WARNING: torchcrepe unavailable ({type(_crepe_err).__name__}: {_crepe_err})')
+    print('         F0 will be zero-initialised (no pitch information).')
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 SEQ_SECS    = 2.0
@@ -70,10 +76,10 @@ _hpf_sos = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
 
 def extract_f0(audio_path: Path, device='cpu') -> tuple[np.ndarray, np.ndarray]:
     """
-    Extract F0 with librosa.yin, caching result as <audio_path>.f0.npz.
+    Extract F0 with CREPE-tiny, caching result as <audio_path>.f0.npz.
 
     Returns (f0_hz, confidence) both shape (n_frames,) aligned to HOP.
-    confidence is a voiced/unvoiced flag (1.0 = voiced, 0.0 = unvoiced).
+    If CREPE unavailable, returns zeros.
     """
     cache = audio_path.with_suffix('.f0.npz')
     if cache.exists():
@@ -86,16 +92,28 @@ def extract_f0(audio_path: Path, device='cpu') -> tuple[np.ndarray, np.ndarray]:
         zeros = np.zeros(4, dtype=np.float32)
         return zeros, zeros
 
+    if not CREPE_AVAILABLE:
+        n_frames = int(len(audio_np) // HOP)
+        zeros = np.zeros(n_frames, dtype=np.float32)
+        return zeros, zeros
+
     if audio_np.ndim > 1:
         audio_np = audio_np.mean(1)
     if sr != SR:
         return np.zeros(4, dtype=np.float32), np.zeros(4, dtype=np.float32)
 
-    f0_np = librosa.yin(audio_np, fmin=50, fmax=2000,
-                         sr=SR, hop_length=HOP).astype(np.float32)
-
-    # voiced = F0 is in a plausible range (yin returns fmin when unvoiced)
-    conf_np = ((f0_np > 60.0) & (f0_np < 1900.0)).astype(np.float32)
+    audio_t = torch.from_numpy(audio_np).unsqueeze(0).to(device)
+    with torch.no_grad():
+        f0, confidence = torchcrepe.predict(
+            audio_t, SR,
+            hop_length=HOP,
+            fmin=50, fmax=2000,
+            model='tiny',
+            return_periodicity=True,
+            device=device,
+        )
+    f0_np   = f0[0].cpu().numpy().astype(np.float32)
+    conf_np = confidence[0].cpu().numpy().astype(np.float32)
     f0_np[conf_np < 0.5] = 0.0
 
     np.savez(str(cache), f0=f0_np, confidence=conf_np)
