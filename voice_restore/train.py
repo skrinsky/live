@@ -374,28 +374,35 @@ def weighted_log_mag_loss(restored_mag: torch.Tensor,
                            notch_mask_db: torch.Tensor,
                            harm_template: torch.Tensor) -> torch.Tensor:
     """
-    Weighted MSE on log-magnitude.
+    Loss focused on notched harmonic bins — the only bins where the model
+    must use pitch to decide whether to restore.
+
+    gain=0 at a notched voiced bin incurs full penalty.
+    gain=0 at an un-notched bin incurs zero penalty (correct behaviour).
+    This makes the trivial gain=0 solution expensive and forces pitch use.
 
     Weights:
-      - Higher at voice harmonic bins (harm_template > 0.3)
-      - Lower at deeply notched bins (model can't recover through -48 dB)
-      - Lower at near-silence bins (avoid fitting noise floor)
+      - 1 only where the notch is actively cutting (> 3 dB attenuation)
+      - 2x at strong voice harmonic bins within the notched region
+      - 0 at near-silence bins (don't restore into noise floor)
     """
     log_restored = torch.log(restored_mag + 1e-8)
     log_clean    = torch.log(clean_mag    + 1e-8)
 
-    # Harmonic weight: 2x at strong harmonic bins
+    # Only penalise bins where a notch is actually cutting
+    notch_active = (notch_mask_db < -3.0).float()
+
+    # 2x at strong harmonic bins (where pitch prediction matters most)
     harm_weight  = 1.0 + harm_template.clamp(0, 1)
 
-    # Notch weight: down-weight at deep cuts (hard to restore, don't penalise)
-    notch_weight = 1.0 - (-notch_mask_db / 96.0).clamp(0, 1) * 0.7
-    # At 0 dB cut: weight=1.0  |  At -48 dB: weight≈0.65  |  At -96 dB: weight=0.3
-
-    # Silence weight: down-weight very quiet bins
+    # Zero weight at silence (don't try to restore noise floor)
     silence_mask = (log_clean > -10.0).float()
 
-    w = harm_weight * notch_weight * silence_mask
-    return (w * (log_restored - log_clean) ** 2).mean()
+    w = notch_active * harm_weight * silence_mask
+
+    # Avoid NaN if no notched+voiced bins in this batch element
+    denom = w.sum().clamp(min=1.0)
+    return (w * (log_restored - log_clean) ** 2).sum() / denom
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
