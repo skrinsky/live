@@ -194,6 +194,12 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
     notched_stft = torch.stft(notched_t, 1024, 480, 1024, window_res, return_complex=True)
     notched_mag = notched_stft.abs()
 
+    # Align time dimension between notch mask and STFT
+    T_final = min(notched_mag.shape[-1], mask_db_t.shape[-1])
+    mask_db_t = mask_db_t[..., :T_final]
+    notched_mag = notched_mag[..., :T_final]
+    notched_stft = notched_stft[..., :T_final]
+
     # F0 for conditioning (fallback zeros on failure)
     try:
         f0_np, conf_np = vr_train.extract_f0(Path('temp.wav'), device=str(device))
