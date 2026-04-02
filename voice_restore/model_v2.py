@@ -29,7 +29,7 @@ N_IN       = N_SPECTRAL + N_COND
 F0_MIN_HZ    = 50.0
 F0_MAX_HZ    = 2000.0
 MAX_NOTCH_DB = 48.0
-MAX_COMP_DB  = 4.0
+MAX_COMP_DB  = 6.0
 
 _bin_freqs = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
 

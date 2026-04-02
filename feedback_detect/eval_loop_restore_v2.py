@@ -223,6 +223,8 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
     gain = gain.clamp(0.0, 1.0)
     comp_mag = apply_compensation(notched_mag, mask_db_t, gain)[0]
     comp_mag = torch.where(torch.isfinite(comp_mag), comp_mag, torch.zeros_like(comp_mag))
+    gain_boost_mask = (comp_mag > notched_mag + 1e-6).float()
+    avg_boost = float((gain_boost_mask.sum() / gain_boost_mask.numel()).cpu())
 
     notched_phase = notched_stft / (notched_mag + 1e-8)
     restored_stft = comp_mag * notched_phase            # (1, F, T)
@@ -249,7 +251,7 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
     print(f'RMS dB — clean { _rms_db(clean_np):.1f} | suppressed_out { _rms_db(box_sup[:L]):.1f} '
           f'| restored { rms_restored:.1f}')
     print(f'Gain stats: min={float(gain_raw.min()):.3f} max={float(gain_raw.max()):.3f} mean={float(gain_raw.mean()):.3f} '
-          f'| nan_count={nan_count}')
+          f'| nan_count={nan_count} | pct_bins_boosted={avg_boost*100:.2f}%')
     print(f'\nAudio saved to {out_dir}/')
     print('  clean_reference.wav          — voice with no loop (target)')
     print('  suppressed_mic.wav           — loop closed, detector+notch in loop')
