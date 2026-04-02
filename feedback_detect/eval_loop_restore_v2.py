@@ -149,8 +149,10 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
 
     vocal_files = [f for f in (PROJECT_ROOT / 'data' / 'clean_vocals').rglob('*.wav')
                    if not f.name.startswith('._')]
+    vocal_path_used = None
     if vocal_files:
-        v, vsr = sf.read(str(vocal_files[0]), dtype='float32')
+        vocal_path_used = vocal_files[0]
+        v, vsr = sf.read(str(vocal_path_used), dtype='float32')
         if v.ndim > 1: v = v.mean(1)
         if vsr != SR:
             raise ValueError(f'Vocal SR={vsr}, expected {SR}')
@@ -203,7 +205,10 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
 
     # F0 for conditioning (fallback zeros on failure)
     try:
-        f0_np, conf_np = vr_train.extract_f0(Path('temp.wav'), device='cpu')
+        if vocal_path_used is not None:
+            f0_np, conf_np = vr_train.extract_f0(vocal_path_used, device='cpu')
+        else:
+            raise RuntimeError("no vocal path")
     except Exception:
         T = mask_db.shape[1]
         f0_np = np.zeros(T, dtype=np.float32)
