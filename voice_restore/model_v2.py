@@ -157,5 +157,6 @@ def apply_compensation(notched_mag:   torch.Tensor,
     """
     safe_bins      = (notch_mask_db > -3.0).float()
     repair_region  = repair_region_from_mask(notch_mask_db)
-    boost_db       = gain * MAX_COMP_DB * safe_bins * repair_region
+    strength       = notch_strength_from_mask(notch_mask_db)  # scale boost by cut depth
+    boost_db       = gain * MAX_COMP_DB * safe_bins * repair_region * strength
     return notched_mag * (10.0 ** (boost_db / 20.0))
