@@ -12,7 +12,12 @@ import numpy as np
 import torch
 import soundfile as sf
 from pathlib import Path
+import sys
 from scipy.signal import lfilter
+
+# Ensure repo root on sys.path for direct script execution
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from voice_restore.model_v2 import (
     SR, N_FFT, HOP,
@@ -21,9 +26,6 @@ from voice_restore.model_v2 import (
 )
 from voice_restore.features_v2 import make_v2_inputs
 from voice_restore import train as v1_train
-
-
-PROJECT_ROOT = Path(__file__).parent.parent
 CKPT = PROJECT_ROOT / 'checkpoints' / 'voice_restore_v2' / 'best.pt'
 
 

@@ -18,11 +18,16 @@ import torch
 import torch.nn.functional as F
 import soundfile as sf
 from pathlib import Path
+import sys
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import torchaudio
+
+# Ensure repo root is on sys.path for direct script execution
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from voice_restore.model_v2 import (
     SR, N_FFT, HOP, N_FREQ,
@@ -32,9 +37,6 @@ from voice_restore.model_v2 import (
 )
 from voice_restore.features_v2 import make_v2_inputs
 from voice_restore import train as v1_train
-
-
-PROJECT_ROOT = Path(__file__).parent.parent
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 SEQ_SECS    = 2.0
