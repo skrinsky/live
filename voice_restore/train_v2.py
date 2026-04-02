@@ -254,6 +254,14 @@ def train():
         avg_loss = epoch_loss / max(valid_steps // BATCH_SIZE, 1)
         scheduler.step(avg_loss)
         writer.add_scalar('loss/train', avg_loss, epoch)
+        writer.add_scalar('loss/mel', mel_loss.item(), epoch)
+        writer.add_scalar('loss/identity', id_loss.item(), epoch)
+        writer.add_scalar('loss/smooth', smooth_loss.item(), epoch)
+
+        # Track restoration gain stats to detect collapse or saturation
+        writer.add_scalar('gain/min', float(gain.min().item()), epoch)
+        writer.add_scalar('gain/max', float(gain.max().item()), epoch)
+        writer.add_scalar('gain/mean', float(gain.mean().item()), epoch)
         best_str = f'{best_loss:.4f}' if best_loss < float('inf') else 'none'
         print(f'Epoch {epoch:3d} | loss {avg_loss:.4f} | best {best_str} | valid {valid_steps}/{N_STEPS}')
 
