@@ -122,8 +122,9 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
     ckpt_det  = torch.load(str(det_path), map_location=device)
     model_det.load_state_dict(ckpt_det['model'] if isinstance(ckpt_det, dict) and 'model' in ckpt_det else ckpt_det)
 
-    model_res = VoiceRestorerV2().to(device).eval()
-    ckpt_res  = torch.load(str(res_path), map_location=device)
+    # Run restorer on CPU to avoid GPU istft NaNs in this eval script
+    model_res = VoiceRestorerV2().cpu().eval()
+    ckpt_res  = torch.load(str(res_path), map_location='cpu')
     model_res.load_state_dict(ckpt_res['model'] if isinstance(ckpt_res, dict) and 'model' in ckpt_res else ckpt_res)
 
     out_dir = Path(out_dir or PROJECT_ROOT / 'data' / 'eval_loop_restore_v2')
@@ -187,10 +188,10 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
     # Build notch mask for restorer from logs
     n_frames = len(mic_sup) // HOP
     mask_db = build_notch_mask_from_logs(notch_logs, n_frames)
-    mask_db_t = torch.from_numpy(mask_db).to(device).unsqueeze(0)
+    mask_db_t = torch.from_numpy(mask_db).unsqueeze(0)  # CPU
 
-    window_res = torch.hann_window(1024).sqrt().to(device)
-    notched_t = torch.from_numpy(box_sup).unsqueeze(0).to(device)
+    window_res = torch.hann_window(1024).sqrt()
+    notched_t = torch.from_numpy(box_sup).unsqueeze(0)
     notched_stft = torch.stft(notched_t, 1024, 480, 1024, window_res, return_complex=True)
     notched_mag = notched_stft.abs()
 
@@ -202,7 +203,7 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
 
     # F0 for conditioning (fallback zeros on failure)
     try:
-        f0_np, conf_np = vr_train.extract_f0(Path('temp.wav'), device=str(device))
+        f0_np, conf_np = vr_train.extract_f0(Path('temp.wav'), device='cpu')
     except Exception:
         T = mask_db.shape[1]
         f0_np = np.zeros(T, dtype=np.float32)
@@ -215,8 +216,7 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
 
     notched_phase = notched_stft / (notched_mag + 1e-8)
     restored_stft = comp_mag * notched_phase            # (1, F, T)
-    # istft expects (batch, freq, time) or (freq, time); comp_mag is (1,F,T)
-    restored_wav = torch.istft(restored_stft, 1024, 480, 1024, window_res)[0].cpu().numpy()
+    restored_wav = torch.istft(restored_stft, 1024, 480, 1024, window_res)[0].numpy()
     L = min(len(box_sup), len(restored_wav))
     out_restored = restored_wav[:L]
 
