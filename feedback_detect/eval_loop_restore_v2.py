@@ -212,6 +212,9 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
     spectral, cond = make_v2_inputs(notched_mag, mask_db_t, f0_np, conf_np)
     with torch.no_grad():
         gain, _ = model_res(spectral, cond)
+    # Guard NaN/Inf and clamp to [0,1]
+    gain = torch.where(torch.isfinite(gain), gain, torch.zeros_like(gain))
+    gain = gain.clamp(0.0, 1.0)
     comp_mag = apply_compensation(notched_mag, mask_db_t, gain)[0]
     comp_mag = torch.where(torch.isfinite(comp_mag), comp_mag, torch.zeros_like(comp_mag))
 
