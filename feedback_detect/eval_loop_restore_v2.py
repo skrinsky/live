@@ -226,6 +226,9 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
     sf.write(str(out_dir / 'suppressed_mic.wav'), mic_sup, SR, subtype='PCM_16')
     sf.write(str(out_dir / 'suppressed_out.wav'), box_sup[:L], SR, subtype='PCM_16')
     sf.write(str(out_dir / 'suppressed_out_restored.wav'), out_restored, SR, subtype='PCM_16')
+
+    print(f'RMS dB — clean { _rms_db(clean_np):.1f} | suppressed_out { _rms_db(box_sup[:L]):.1f} '
+          f'| restored { _rms_db(out_restored):.1f}')
     print(f'\nAudio saved to {out_dir}/')
     print('  clean_reference.wav          — voice with no loop (target)')
     print('  suppressed_mic.wav           — loop closed, detector+notch in loop')
