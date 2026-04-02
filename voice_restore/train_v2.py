@@ -48,8 +48,12 @@ GRAD_CLIP   = 1.0
 N_STEPS     = 800
 N_MELS      = 80
 
+# Default loss weights (override via CLI)
 IDENTITY_W  = 0.25
 SMOOTH_W    = 0.05
+# Notch difficulty controls (override via CLI)
+DEPTH_SCALE = 1.0   # >1.0 makes cuts deeper
+Q_SCALE     = 1.0   # <1.0 widens notches
 
 
 def make_mel_fb(device: torch.device) -> torch.Tensor:
@@ -108,7 +112,9 @@ def make_training_pair_v2(vocal_path: Path,
                           noise_np: np.ndarray,
                           device: torch.device,
                           window: torch.Tensor,
-                          f0_cache: dict) -> tuple[torch.Tensor, ...] | None:
+                          f0_cache: dict,
+                          depth_scale: float = 1.0,
+                          q_scale: float = 1.0) -> tuple[torch.Tensor, ...] | None:
     """
     Returns (spectral, cond, mask_db_t, clean_mag, notched_mag) on device.
     """
@@ -137,6 +143,9 @@ def make_training_pair_v2(vocal_path: Path,
     T = clean_mag.shape[1]
 
     notches = v1_train.simulate_notch_bank(random.randint(1, v1_train.MAX_NOTCHES_SIM))
+    for n in notches:
+        n['depth_db'] = np.clip(n['depth_db'] * depth_scale, -72.0, -1.0)
+        n['q'] = max(1.0, n['q'] * q_scale)
     notched_np, mask_db = v1_train.apply_notch_bank_to_audio(noisy, notches, T)
     notched_mag = _stft_mag(notched_np)
 
@@ -163,6 +172,12 @@ def train():
     ap = argparse.ArgumentParser()
     ap.add_argument('--resume', type=str, default=None)
     ap.add_argument('--lr',     type=float, default=None)
+    ap.add_argument('--identity-w', type=float, default=IDENTITY_W)
+    ap.add_argument('--smooth-w',   type=float, default=SMOOTH_W)
+    ap.add_argument('--depth-scale', type=float, default=DEPTH_SCALE,
+                    help='Multiply simulated notch depth ( >1 deeper cuts )')
+    ap.add_argument('--q-scale', type=float, default=Q_SCALE,
+                    help='Multiply notch Q ( <1 wider cuts )')
     args, _ = ap.parse_known_args()
 
     device   = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -218,7 +233,8 @@ def train():
             noise_np = noise_np[n0:n0 + SEQ_LEN]
 
             result = make_training_pair_v2(
-                random.choice(vocal_files), noise_np, device, window, f0_cache
+                random.choice(vocal_files), noise_np, device, window, f0_cache,
+                depth_scale=args.depth_scale, q_scale=args.q_scale
             )
             if result is None:
                 continue
@@ -232,7 +248,9 @@ def train():
             mel_loss = mel_compensation_loss(comp_mag, clean_mag, mel_fb, harm_t)
             id_loss = identity_preservation_loss(comp_mag, notched_mag, mask_db_t)
             smooth_loss = temporal_smoothness_loss(gain, mask_db_t)
-            loss = mel_loss + IDENTITY_W * id_loss + SMOOTH_W * smooth_loss
+            loss = (mel_loss
+                    + args.identity_w * id_loss
+                    + args.smooth_w   * smooth_loss)
 
             if not torch.isfinite(loss):
                 continue
