@@ -167,7 +167,7 @@ def main():
             (random.uniform(2000, 6000), random.uniform(-36, -18), random.uniform(10, 25)),
         ]
 
-    run_eval(args.input, notch_specs, Path(args.checkpoint), Path(args.out-dir))
+    run_eval(args.input, notch_specs, Path(args.checkpoint), Path(args.out_dir))
 
 
 if __name__ == '__main__':
