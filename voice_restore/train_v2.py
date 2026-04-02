@@ -209,6 +209,8 @@ def train():
     ap.add_argument('--smooth-w',   type=float, default=SMOOTH_W)
     ap.add_argument('--gain-reg-w', type=float, default=GAIN_REG_W,
                     help='Weight for gain L2 regularizer to prevent saturation')
+    ap.add_argument('--perceptual-w', type=float, default=PERCEPTUAL_W,
+                    help='Weight for MR-STFT perceptual loss')
     ap.add_argument('--depth-scale', type=float, default=DEPTH_SCALE,
                     help='Multiply simulated notch depth ( >1 deeper cuts )')
     ap.add_argument('--q-scale', type=float, default=Q_SCALE,
@@ -297,7 +299,7 @@ def train():
                     + args.identity_w * id_loss
                     + args.smooth_w   * smooth_loss
                     + args.gain_reg_w * gain_reg
-                    + PERCEPTUAL_W * perceptual_loss)
+                    + args.perceptual_w * perceptual_loss)
 
             if not torch.isfinite(loss):
                 continue
