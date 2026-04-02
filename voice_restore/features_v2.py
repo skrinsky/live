@@ -86,9 +86,23 @@ def make_v2_inputs(notched_mag: torch.Tensor,
       cond     : (1, 7, T)
     """
     log_notched   = torch.log(notched_mag + 1e-8)
-    harm_np       = build_harmonic_features(f0_np, int(notched_mag.shape[-1]))
+    T = int(notched_mag.shape[-1])
+    harm_np       = build_harmonic_features(f0_np, T)
     harm_t        = torch.from_numpy(harm_np).to(notched_mag.device).unsqueeze(0)
     notch_strength = notch_strength_from_mask(notch_mask_db)
+    notch_strength = notch_strength[..., :T]
+
+    # Align lengths by trimming to the shortest T across inputs
+    T_final = min(log_notched.shape[-1],
+                  harm_t.shape[-1],
+                  notch_strength.shape[-1],
+                  notch_mask_db.shape[-1])
+
+    log_notched   = log_notched[..., :T_final]
+    harm_t        = harm_t[..., :T_final]
+    notch_strength = notch_strength[..., :T_final]
+    notch_mask_db = notch_mask_db[..., :T_final]
+
     aperiodic     = make_aperiodic_residual(log_notched)
 
     spectral = torch.stack([
@@ -98,5 +112,5 @@ def make_v2_inputs(notched_mag: torch.Tensor,
         aperiodic[:, :N_FREQ, :],
     ], dim=1)
 
-    cond = build_condition_features(f0_np, conf_np, notched_mag[0]).to(notched_mag.device).unsqueeze(0)
+    cond = build_condition_features(f0_np, conf_np, log_notched[0]).to(notched_mag.device).unsqueeze(0)
     return spectral, cond
