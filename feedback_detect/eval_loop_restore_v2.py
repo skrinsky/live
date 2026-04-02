@@ -217,7 +217,8 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
     spectral, cond = make_v2_inputs(notched_mag, mask_db_t, f0_np, conf_np)
     with torch.no_grad():
         gain, _ = model_res(spectral, cond)
-    # Guard NaN/Inf and clamp to [0,1]
+    gain_raw = gain.clone()
+    nan_count = torch.count_nonzero(~torch.isfinite(gain_raw)).item()
     gain = torch.where(torch.isfinite(gain), gain, torch.zeros_like(gain))
     gain = gain.clamp(0.0, 1.0)
     comp_mag = apply_compensation(notched_mag, mask_db_t, gain)[0]
@@ -247,7 +248,8 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
 
     print(f'RMS dB — clean { _rms_db(clean_np):.1f} | suppressed_out { _rms_db(box_sup[:L]):.1f} '
           f'| restored { rms_restored:.1f}')
-    print(f'Gain stats: min={float(gain.min()):.3f} max={float(gain.max()):.3f} mean={float(gain.mean()):.3f}')
+    print(f'Gain stats: min={float(gain_raw.min()):.3f} max={float(gain_raw.max()):.3f} mean={float(gain_raw.mean()):.3f} '
+          f'| nan_count={nan_count}')
     print(f'\nAudio saved to {out_dir}/')
     print('  clean_reference.wav          — voice with no loop (target)')
     print('  suppressed_mic.wav           — loop closed, detector+notch in loop')
