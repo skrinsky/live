@@ -214,8 +214,9 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
     comp_mag = apply_compensation(notched_mag, mask_db_t, gain)[0]
 
     notched_phase = notched_stft / (notched_mag + 1e-8)
-    restored_stft = comp_mag * notched_phase
-    restored_wav = torch.istft(restored_stft.unsqueeze(0), 1024, 480, 1024, window_res)[0].cpu().numpy()
+    restored_stft = comp_mag * notched_phase            # (1, F, T)
+    # istft expects (batch, freq, time) or (freq, time); comp_mag is (1,F,T)
+    restored_wav = torch.istft(restored_stft, 1024, 480, 1024, window_res)[0].cpu().numpy()
     L = min(len(box_sup), len(restored_wav))
     out_restored = restored_wav[:L]
 
