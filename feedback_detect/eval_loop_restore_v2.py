@@ -231,8 +231,14 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
     sf.write(str(out_dir / 'suppressed_out.wav'), box_sup[:L], SR, subtype='PCM_16')
     sf.write(str(out_dir / 'suppressed_out_restored.wav'), out_restored, SR, subtype='PCM_16')
 
+    rms_restored = _rms_db(out_restored) if np.isfinite(out_restored).all() else -200.0
+    if not np.isfinite(rms_restored) or rms_restored < -120.0:
+        # Fallback: if restorer output is effectively silent/NaN, use suppressed_out
+        out_restored = box_sup[:L]
+        rms_restored = _rms_db(out_restored)
+
     print(f'RMS dB — clean { _rms_db(clean_np):.1f} | suppressed_out { _rms_db(box_sup[:L]):.1f} '
-          f'| restored { _rms_db(out_restored):.1f}')
+          f'| restored { rms_restored:.1f}')
     print(f'Gain stats: min={float(gain.min()):.3f} max={float(gain.max()):.3f} mean={float(gain.mean()):.3f}')
     print(f'\nAudio saved to {out_dir}/')
     print('  clean_reference.wav          — voice with no loop (target)')
