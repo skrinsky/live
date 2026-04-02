@@ -213,9 +213,13 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
     with torch.no_grad():
         gain, _ = model_res(spectral, cond)
     comp_mag = apply_compensation(notched_mag, mask_db_t, gain)[0]
+    comp_mag = torch.where(torch.isfinite(comp_mag), comp_mag, torch.zeros_like(comp_mag))
 
     notched_phase = notched_stft / (notched_mag + 1e-8)
     restored_stft = comp_mag * notched_phase            # (1, F, T)
+    restored_stft = torch.where(torch.isfinite(restored_stft),
+                                restored_stft,
+                                torch.zeros_like(restored_stft))
     restored_wav = torch.istft(restored_stft, 1024, 480, 1024, window_res)[0].numpy()
     L = min(len(box_sup), len(restored_wav))
     out_restored = restored_wav[:L]
