@@ -51,6 +51,7 @@ N_MELS      = 80
 # Default loss weights (override via CLI)
 IDENTITY_W  = 0.25
 SMOOTH_W    = 0.05
+GAIN_REG_W  = 0.01
 # Notch difficulty controls (override via CLI)
 DEPTH_SCALE = 1.0   # >1.0 makes cuts deeper
 Q_SCALE     = 1.0   # <1.0 widens notches
@@ -174,6 +175,8 @@ def train():
     ap.add_argument('--lr',     type=float, default=None)
     ap.add_argument('--identity-w', type=float, default=IDENTITY_W)
     ap.add_argument('--smooth-w',   type=float, default=SMOOTH_W)
+    ap.add_argument('--gain-reg-w', type=float, default=GAIN_REG_W,
+                    help='Weight for gain L2 regularizer to prevent saturation')
     ap.add_argument('--depth-scale', type=float, default=DEPTH_SCALE,
                     help='Multiply simulated notch depth ( >1 deeper cuts )')
     ap.add_argument('--q-scale', type=float, default=Q_SCALE,
@@ -248,9 +251,12 @@ def train():
             mel_loss = mel_compensation_loss(comp_mag, clean_mag, mel_fb, harm_t)
             id_loss = identity_preservation_loss(comp_mag, notched_mag, mask_db_t)
             smooth_loss = temporal_smoothness_loss(gain, mask_db_t)
+            gain_reg = (gain ** 2 * repair_region_from_mask(mask_db_t)).mean()
+
             loss = (mel_loss
                     + args.identity_w * id_loss
-                    + args.smooth_w   * smooth_loss)
+                    + args.smooth_w   * smooth_loss
+                    + args.gain_reg_w * gain_reg)
 
             if not torch.isfinite(loss):
                 continue
@@ -275,6 +281,7 @@ def train():
         writer.add_scalar('loss/mel', mel_loss.item(), epoch)
         writer.add_scalar('loss/identity', id_loss.item(), epoch)
         writer.add_scalar('loss/smooth', smooth_loss.item(), epoch)
+        writer.add_scalar('loss/gain_reg', gain_reg.item(), epoch)
 
         # Track restoration gain stats to detect collapse or saturation
         writer.add_scalar('gain/min', float(gain.min().item()), epoch)
