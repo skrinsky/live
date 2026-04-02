@@ -233,6 +233,7 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
 
     print(f'RMS dB — clean { _rms_db(clean_np):.1f} | suppressed_out { _rms_db(box_sup[:L]):.1f} '
           f'| restored { _rms_db(out_restored):.1f}')
+    print(f'Gain stats: min={float(gain.min()):.3f} max={float(gain.max()):.3f} mean={float(gain.mean()):.3f}')
     print(f'\nAudio saved to {out_dir}/')
     print('  clean_reference.wav          — voice with no loop (target)')
     print('  suppressed_mic.wav           — loop closed, detector+notch in loop')
