@@ -52,6 +52,7 @@ N_MELS      = 80
 IDENTITY_W  = 0.25
 SMOOTH_W    = 0.05
 GAIN_REG_W  = 0.01
+PERCEPTUAL_W = 0.5
 # Notch difficulty controls (override via CLI)
 DEPTH_SCALE = 1.0   # >1.0 makes cuts deeper
 Q_SCALE     = 1.0   # <1.0 widens notches
@@ -96,6 +97,31 @@ def identity_preservation_loss(comp_mag: torch.Tensor,
     return ((log_comp - log_notched) ** 2 * preserve).sum() / denom
 
 
+def multires_stft_loss(est_wav: torch.Tensor,
+                       tgt_wav: torch.Tensor,
+                       fft_sizes=(256, 512, 1024),
+                       hop_sizes=(64, 128, 240),
+                       win_lengths=(256, 512, 1024)) -> torch.Tensor:
+    """
+    Multi-resolution STFT magnitude + log-magnitude loss.
+    """
+    loss = est_wav.new_zeros(())
+    for fft, hop, win in zip(fft_sizes, hop_sizes, win_lengths):
+        window = torch.hann_window(win, device=est_wav.device)
+        est_stft = torch.stft(est_wav, n_fft=fft, hop_length=hop,
+                              win_length=win, window=window,
+                              return_complex=True)
+        tgt_stft = torch.stft(tgt_wav, n_fft=fft, hop_length=hop,
+                              win_length=win, window=window,
+                              return_complex=True)
+        est_mag = est_stft.abs()
+        tgt_mag = tgt_stft.abs()
+        loss = loss + F.l1_loss(est_mag, tgt_mag)
+        loss = loss + F.l1_loss(torch.log(est_mag + 1e-8),
+                                torch.log(tgt_mag + 1e-8))
+    return loss / len(fft_sizes)
+
+
 def temporal_smoothness_loss(gain: torch.Tensor,
                              mask_db_t: torch.Tensor) -> torch.Tensor:
     """
@@ -117,7 +143,7 @@ def make_training_pair_v2(vocal_path: Path,
                           depth_scale: float = 1.0,
                           q_scale: float = 1.0) -> tuple[torch.Tensor, ...] | None:
     """
-    Returns (spectral, cond, mask_db_t, clean_mag, notched_mag) on device.
+    Returns (spectral, cond, mask_db_t, clean_mag, notched_mag, notched_stft, clean_wav) on device.
     """
     audio_np, sr = sf.read(str(vocal_path), dtype='float32')
     if audio_np.ndim > 1:
@@ -135,12 +161,13 @@ def make_training_pair_v2(vocal_path: Path,
     noisy = (vocal_np + noise_np[:SEQ_LEN] * (v_rms / n_rms * 10 ** (-snr_db / 20))
              ).astype(np.float32)
 
-    def _stft_mag(x):
+    def _stft(x):
         t = torch.from_numpy(x).unsqueeze(0).to(device)
         st = torch.stft(t, N_FFT, HOP, N_FFT, window, return_complex=True)
-        return st.abs()[0]
+        return st
 
-    clean_mag = _stft_mag(noisy)
+    clean_stft = _stft(noisy)
+    clean_mag = clean_stft.abs()[0]
     T = clean_mag.shape[1]
 
     notches = v1_train.simulate_notch_bank(random.randint(1, v1_train.MAX_NOTCHES_SIM))
@@ -148,7 +175,8 @@ def make_training_pair_v2(vocal_path: Path,
         n['depth_db'] = np.clip(n['depth_db'] * depth_scale, -72.0, -1.0)
         n['q'] = max(1.0, n['q'] * q_scale)
     notched_np, mask_db = v1_train.apply_notch_bank_to_audio(noisy, notches, T)
-    notched_mag = _stft_mag(notched_np)
+    notched_stft = _stft(notched_np)
+    notched_mag = notched_stft.abs()[0]
 
     key = str(vocal_path)
     if key not in f0_cache:
@@ -166,7 +194,11 @@ def make_training_pair_v2(vocal_path: Path,
         conf_slice,
     )
 
-    return spectral, cond, mask_db_t, clean_mag.unsqueeze(0), notched_mag.unsqueeze(0)
+    clean_wav_t = torch.from_numpy(noisy).to(device).unsqueeze(0)
+
+    return (spectral, cond, mask_db_t,
+            clean_mag.unsqueeze(0), notched_mag.unsqueeze(0),
+            notched_stft[0].unsqueeze(0), clean_wav_t)
 
 
 def train():
@@ -242,21 +274,30 @@ def train():
             if result is None:
                 continue
 
-            spectral, cond, mask_db_t, clean_mag, notched_mag = result
+            (spectral, cond, mask_db_t,
+             clean_mag, notched_mag,
+             notched_stft, clean_wav_t) = result
 
             gain, _ = model(spectral, cond)
             comp_mag = apply_compensation(notched_mag, mask_db_t, gain)
+
+            # Reconstruct time-domain with notched phase for perceptual loss
+            notched_phase = notched_stft / (notched_mag + 1e-8)
+            comp_complex = comp_mag * notched_phase
+            restored_wav = torch.istft(comp_complex, N_FFT, HOP, N_FFT, window)
 
             harm_t = spectral[0, 1]
             mel_loss = mel_compensation_loss(comp_mag, clean_mag, mel_fb, harm_t)
             id_loss = identity_preservation_loss(comp_mag, notched_mag, mask_db_t)
             smooth_loss = temporal_smoothness_loss(gain, mask_db_t)
             gain_reg = (gain ** 2 * repair_region_from_mask(mask_db_t)).mean()
+            perceptual_loss = multires_stft_loss(restored_wav, clean_wav_t)
 
             loss = (mel_loss
                     + args.identity_w * id_loss
                     + args.smooth_w   * smooth_loss
-                    + args.gain_reg_w * gain_reg)
+                    + args.gain_reg_w * gain_reg
+                    + PERCEPTUAL_W * perceptual_loss)
 
             if not torch.isfinite(loss):
                 continue
