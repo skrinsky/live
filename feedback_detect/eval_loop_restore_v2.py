@@ -215,14 +215,15 @@ def run_eval(gain=1.3, duration_s=30.0, threshold=0.4,
         conf_np = np.zeros(T, dtype=np.float32)
 
     spectral, cond = make_v2_inputs(notched_mag, mask_db_t, f0_np, conf_np)
+    spectral = torch.nan_to_num(spectral, nan=0.0, posinf=0.0, neginf=0.0)
+    cond = torch.nan_to_num(cond, nan=0.0, posinf=0.0, neginf=0.0)
     with torch.no_grad():
         gain, _ = model_res(spectral, cond)
     gain_raw = gain.clone()
     nan_count = torch.count_nonzero(~torch.isfinite(gain_raw)).item()
-    gain = torch.where(torch.isfinite(gain), gain, torch.zeros_like(gain))
-    gain = gain.clamp(0.0, 1.0)
+    gain = torch.nan_to_num(gain, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
     comp_mag = apply_compensation(notched_mag, mask_db_t, gain)[0]
-    comp_mag = torch.where(torch.isfinite(comp_mag), comp_mag, torch.zeros_like(comp_mag))
+    comp_mag = torch.nan_to_num(comp_mag, nan=0.0, posinf=0.0, neginf=0.0)
     gain_boost_mask = (comp_mag > notched_mag + 1e-6).float()
     avg_boost = float((gain_boost_mask.sum() / gain_boost_mask.numel()).cpu())
 
