@@ -53,6 +53,7 @@ IDENTITY_W  = 0.25
 SMOOTH_W    = 0.05
 GAIN_REG_W  = 0.01
 PERCEPTUAL_W = 0.5
+PERCEPTUAL_TARGET = 'clean'  # 'clean' or 'mic'
 # Notch difficulty controls (override via CLI)
 DEPTH_SCALE = 1.0   # >1.0 makes cuts deeper
 Q_SCALE     = 1.0   # <1.0 widens notches
@@ -211,6 +212,9 @@ def train():
                     help='Weight for gain L2 regularizer to prevent saturation')
     ap.add_argument('--perceptual-w', type=float, default=PERCEPTUAL_W,
                     help='Weight for MR-STFT perceptual loss')
+    ap.add_argument('--perceptual-target', type=str, choices=['clean', 'mic'],
+                    default=PERCEPTUAL_TARGET,
+                    help='Perceptual loss target: clean reference or suppressed mic')
     ap.add_argument('--depth-scale', type=float, default=DEPTH_SCALE,
                     help='Multiply simulated notch depth ( >1 deeper cuts )')
     ap.add_argument('--q-scale', type=float, default=Q_SCALE,
@@ -289,11 +293,15 @@ def train():
             restored_wav = torch.istft(comp_complex, N_FFT, HOP, N_FFT, window)
 
             harm_t = spectral[0, 1]
-            mel_loss = mel_compensation_loss(comp_mag, clean_mag, mel_fb, harm_t)
+            # Choose target: clean vs mic (notched)
+            target_mag = clean_mag if args.perceptual_target == 'clean' else notched_mag
+            target_wav = clean_wav_t if args.perceptual_target == 'clean' else torch.from_numpy(notched_np).to(device).unsqueeze(0)
+
+            mel_loss = mel_compensation_loss(comp_mag, target_mag, mel_fb, harm_t)
             id_loss = identity_preservation_loss(comp_mag, notched_mag, mask_db_t)
             smooth_loss = temporal_smoothness_loss(gain, mask_db_t)
             gain_reg = (gain ** 2 * repair_region_from_mask(mask_db_t)).mean()
-            perceptual_loss = multires_stft_loss(restored_wav, clean_wav_t)
+            perceptual_loss = multires_stft_loss(restored_wav, target_wav)
 
             loss = (mel_loss
                     + args.identity_w * id_loss
