@@ -80,11 +80,9 @@ def target_gain_from_envelope(clean_mag: torch.Tensor,
 def target_residual_from_gain(target_gain: torch.Tensor,
                               base_gain: torch.Tensor,
                               mask_db_t: torch.Tensor) -> torch.Tensor:
-    denom = (base_gain + 1e-4)
-    target_res = ((target_gain - base_gain).clamp(min=0.0) / denom).clamp(0.0, 1.0)
+    # Additive formula: residual = target_gain - base_gain directly
+    target_res = (target_gain - base_gain).clamp(0.0, 1.0)
     shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
-    # Keep a small prior residual in active shoulder regions so refinement does
-    # not collapse to all-zero when baseline alone already reduces loss.
     target_res = torch.maximum(target_res, RESIDUAL_TARGET_FLOOR * (shoulder > SHOULDER_ACTIVE_T).float())
     return target_res
 

@@ -95,9 +95,14 @@ def compute_base_gain(notch_mask_db: torch.Tensor) -> torch.Tensor:
 def compute_effective_gain(raw_residual: torch.Tensor,
                            notch_mask_db: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     base_gain = compute_base_gain(notch_mask_db)
+    safe_bins = (notch_mask_db > -3.0).float()
+    shoulder = repair_region_from_mask(notch_mask_db) * safe_bins
+    shoulder_gate = (shoulder > 0.02).float()
     residual = raw_residual.clamp(0.0, 1.0)
-    effective_gain = base_gain * (1.0 + RESIDUAL_GAIN_SCALE * residual)
-    return base_gain.clamp(0.0, 1.0), effective_gain.clamp(0.0, 1.0)
+    # Additive: model directly predicts the gain delta on top of the baseline.
+    # Shoulder gate is a hard architectural constraint — no boost outside safe bins.
+    effective_gain = (base_gain + residual * shoulder_gate).clamp(0.0, 1.0)
+    return base_gain.clamp(0.0, 1.0), effective_gain
 
 
 class VoiceRestorerV5(nn.Module):
