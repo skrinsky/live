@@ -113,8 +113,8 @@ class VoiceRestorerV5(nn.Module):
         self.fc_harmonic = nn.Linear(gru_hidden, 1)
         self.fc_aperiodic = nn.Linear(gru_hidden, 1)
 
-        nn.init.constant_(self.fc_harmonic.bias, 0.50)
-        nn.init.constant_(self.fc_aperiodic.bias, 0.50)
+        nn.init.constant_(self.fc_harmonic.bias, 0.0)
+        nn.init.constant_(self.fc_aperiodic.bias, 0.0)
 
     def forward(self, spectral: torch.Tensor, cond: torch.Tensor, h: torch.Tensor | None = None):
         spectral = spectral.float()
