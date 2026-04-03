@@ -50,15 +50,16 @@ N_STEPS = 800
 WARMUP_EPOCHS = 0
 
 ERB_BANDS = 40
-IDENTITY_W = 0.10
+IDENTITY_W = 0.05
 SMOOTH_W = 0.05
-GAIN_REG_W = 0.01
+GAIN_REG_W = 0.001
 ERB_W = 1.0
 MOD_W = 0.30
 SHOULDER_W = 0.75
 GAIN_TARGET_W = 1.0
 MASK_AWARE_W = 1.0
 MASK_FLOOR = 0.25
+TARGET_ONLY_EPOCHS = 3
 
 
 def hz_to_erb(f_hz: torch.Tensor) -> torch.Tensor:
@@ -209,7 +210,11 @@ def gain_target_loss(gain: torch.Tensor,
                      mask_db_t: torch.Tensor) -> torch.Tensor:
     target_gain = target_gain_from_clean(clean_mag, notched_mag, mask_db_t)
     shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
-    return ((gain - target_gain).square() * (0.25 + 0.75 * shoulder)).sum() / shoulder.sum().clamp(min=1.0)
+    active = ((target_gain > 0.02).float() * shoulder).clamp(0.0, 1.0)
+    if float(active.sum()) < 1.0:
+        active = shoulder
+    weight = 0.25 + 0.75 * active
+    return ((gain - target_gain).square() * weight).sum() / weight.sum().clamp(min=1.0)
 
 
 def identity_preservation_loss(comp_mag: torch.Tensor,
@@ -314,6 +319,7 @@ def train() -> None:
     ap.add_argument("--gain-reg-w", type=float, default=GAIN_REG_W)
     ap.add_argument("--mask-aware-w", type=float, default=MASK_AWARE_W)
     ap.add_argument("--mask-floor", type=float, default=MASK_FLOOR)
+    ap.add_argument("--target-only-epochs", type=int, default=TARGET_ONLY_EPOCHS)
     args, _ = ap.parse_known_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -428,15 +434,22 @@ def train() -> None:
             smooth_loss = temporal_smoothness_loss(gain, mask_db_t)
             gain_reg = (gain.square() * repair_region_from_mask(mask_db_t)).mean()
 
-            loss = (
-                args.erb_w * erb_loss
-                + args.mod_w * mod_loss
-                + args.shoulder_w * shoulder_loss
-                + args.gain_target_w * target_loss
-                + args.identity_w * id_loss
-                + args.smooth_w * smooth_loss
-                + args.gain_reg_w * gain_reg
-            )
+            if epoch <= args.target_only_epochs:
+                loss = (
+                    args.shoulder_w * shoulder_loss
+                    + args.gain_target_w * target_loss
+                    + 0.5 * args.smooth_w * smooth_loss
+                )
+            else:
+                loss = (
+                    args.erb_w * erb_loss
+                    + args.mod_w * mod_loss
+                    + args.shoulder_w * shoulder_loss
+                    + args.gain_target_w * target_loss
+                    + args.identity_w * id_loss
+                    + args.smooth_w * smooth_loss
+                    + args.gain_reg_w * gain_reg
+                )
 
             if not torch.isfinite(loss):
                 continue

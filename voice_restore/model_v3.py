@@ -106,6 +106,11 @@ class VoiceRestorerV3(nn.Module):
         self.fc_harmonic  = nn.Linear(gru_hidden, 1)
         self.fc_aperiodic = nn.Linear(gru_hidden, 1)
 
+        # Start slightly positive so the model explores nonzero compensation
+        # before the losses decide how much to pull it back.
+        nn.init.constant_(self.fc_harmonic.bias, 0.5)
+        nn.init.constant_(self.fc_aperiodic.bias, 0.5)
+
     def forward(self,
                 spectral: torch.Tensor,
                 cond:     torch.Tensor,
