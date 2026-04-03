@@ -50,8 +50,10 @@ ENV_TARGET_W = 1.0
 ENV_MATCH_W = 0.75
 IDENTITY_W = 0.05
 SMOOTH_W = 0.05
-GAIN_REG_W = 0.001
+GAIN_REG_W = 0.0
 TARGET_ONLY_EPOCHS = 3
+TARGET_SCALE = 2.0
+TARGET_FLOOR = 0.04
 
 
 def smooth_log_spectrum(mag: torch.Tensor, kernel_size: int = ENV_KERNEL) -> torch.Tensor:
@@ -63,7 +65,9 @@ def smooth_log_spectrum(mag: torch.Tensor, kernel_size: int = ENV_KERNEL) -> tor
 def target_gain_from_envelope(clean_mag: torch.Tensor,
                               notched_mag: torch.Tensor,
                               mask_db_t: torch.Tensor,
-                              kernel_size: int = ENV_KERNEL) -> torch.Tensor:
+                              kernel_size: int = ENV_KERNEL,
+                              target_scale: float = TARGET_SCALE,
+                              target_floor: float = TARGET_FLOOR) -> torch.Tensor:
     """
     Estimate how much shoulder compensation is perceptually useful by comparing
     smoothed spectral envelopes, then projecting that boost onto safe repair
@@ -80,6 +84,14 @@ def target_gain_from_envelope(clean_mag: torch.Tensor,
 
     # Normalize by the allowed max compensation and restrict to the safe shoulder.
     target_gain = (env_boost_db / MAX_COMP_DB) * shoulder
+    target_gain = (target_gain * target_scale).clamp(0.0, 1.0)
+
+    # Keep a small nonzero prior in active shoulder regions so the model
+    # does not collapse to all-zero gains when envelope deltas are tiny.
+    notch_strength = (-mask_db_t / 48.0).clamp(0.0, 1.0)
+    shoulder_active = (shoulder > 0.05).float()
+    prior_gain = target_floor * shoulder_active * notch_strength
+    target_gain = torch.maximum(target_gain, prior_gain)
     return target_gain.clamp(0.0, 1.0)
 
 
@@ -199,6 +211,8 @@ def train() -> None:
     ap.add_argument("--smooth-w", type=float, default=SMOOTH_W)
     ap.add_argument("--gain-reg-w", type=float, default=GAIN_REG_W)
     ap.add_argument("--target-only-epochs", type=int, default=TARGET_ONLY_EPOCHS)
+    ap.add_argument("--target-scale", type=float, default=TARGET_SCALE)
+    ap.add_argument("--target-floor", type=float, default=TARGET_FLOOR)
     args, _ = ap.parse_known_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -255,6 +269,7 @@ def train() -> None:
         last_smooth_loss = torch.tensor(0.0, device=device)
         last_gain_reg = torch.tensor(0.0, device=device)
         last_gain = torch.zeros(1, 1, 1, device=device)
+        last_target_gain = torch.zeros(1, 1, 1, device=device)
         optimizer.zero_grad()
 
         if args.warmup_epochs > 0 and epoch <= args.warmup_epochs:
@@ -296,6 +311,8 @@ def train() -> None:
                 notched_mag,
                 mask_db_t,
                 kernel_size=args.env_kernel,
+                target_scale=args.target_scale,
+                target_floor=args.target_floor,
             )
             env_target_loss = gain_target_loss(gain, target_gain, mask_db_t)
             env_match_loss = envelope_match_loss(
@@ -333,6 +350,7 @@ def train() -> None:
             last_smooth_loss = smooth_loss.detach()
             last_gain_reg = gain_reg.detach()
             last_gain = gain.detach()
+            last_target_gain = target_gain.detach()
 
             if valid_steps % BATCH_SIZE == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -358,6 +376,10 @@ def train() -> None:
         writer.add_scalar("gain/min", float(last_gain.min().item()), epoch)
         writer.add_scalar("gain/max", float(last_gain.max().item()), epoch)
         writer.add_scalar("gain/mean", float(last_gain.mean().item()), epoch)
+        writer.add_scalar("target_gain/min", float(last_target_gain.min().item()), epoch)
+        writer.add_scalar("target_gain/max", float(last_target_gain.max().item()), epoch)
+        writer.add_scalar("target_gain/mean", float(last_target_gain.mean().item()), epoch)
+        writer.add_scalar("target_gain/active_pct", float((last_target_gain > 0.02).float().mean().item()), epoch)
         writer.add_scalar("lr", float(optimizer.param_groups[0]["lr"]), epoch)
 
         best_str = f"{best_loss:.4f}" if best_loss < float("inf") else "none"
