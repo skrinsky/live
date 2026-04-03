@@ -28,6 +28,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from voice_restore.model_v3 import (  # noqa: E402
     HOP,
+    MAX_COMP_DB,
     N_FFT,
     N_FREQ,
     SR,
@@ -55,6 +56,7 @@ GAIN_REG_W = 0.01
 ERB_W = 1.0
 MOD_W = 0.30
 SHOULDER_W = 0.75
+GAIN_TARGET_W = 1.0
 MASK_AWARE_W = 1.0
 MASK_FLOOR = 0.25
 
@@ -186,6 +188,30 @@ def shoulder_spectral_loss(comp_mag: torch.Tensor,
     return ((log_comp - log_clean).square() * shoulder).sum() / shoulder.sum().clamp(min=1.0)
 
 
+def target_gain_from_clean(clean_mag: torch.Tensor,
+                           notched_mag: torch.Tensor,
+                           mask_db_t: torch.Tensor) -> torch.Tensor:
+    """
+    Build a supervised target for gains in the safe shoulder region.
+    Only positive compensation is allowed, and forbidden bins stay zero.
+    """
+    safe_bins = (mask_db_t > -3.0).float()
+    shoulder = repair_region_from_mask(mask_db_t) * safe_bins
+    target_boost_db = 20.0 * torch.log10((clean_mag + 1e-8) / (notched_mag + 1e-8))
+    target_boost_db = target_boost_db.clamp(min=0.0, max=MAX_COMP_DB)
+    target_gain = (target_boost_db / MAX_COMP_DB) * shoulder
+    return target_gain.clamp(0.0, 1.0)
+
+
+def gain_target_loss(gain: torch.Tensor,
+                     clean_mag: torch.Tensor,
+                     notched_mag: torch.Tensor,
+                     mask_db_t: torch.Tensor) -> torch.Tensor:
+    target_gain = target_gain_from_clean(clean_mag, notched_mag, mask_db_t)
+    shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
+    return ((gain - target_gain).square() * (0.25 + 0.75 * shoulder)).sum() / shoulder.sum().clamp(min=1.0)
+
+
 def identity_preservation_loss(comp_mag: torch.Tensor,
                                notched_mag: torch.Tensor,
                                mask_db_t: torch.Tensor) -> torch.Tensor:
@@ -282,6 +308,7 @@ def train() -> None:
     ap.add_argument("--erb-w", type=float, default=ERB_W)
     ap.add_argument("--mod-w", type=float, default=MOD_W)
     ap.add_argument("--shoulder-w", type=float, default=SHOULDER_W)
+    ap.add_argument("--gain-target-w", type=float, default=GAIN_TARGET_W)
     ap.add_argument("--identity-w", type=float, default=IDENTITY_W)
     ap.add_argument("--smooth-w", type=float, default=SMOOTH_W)
     ap.add_argument("--gain-reg-w", type=float, default=GAIN_REG_W)
@@ -343,6 +370,7 @@ def train() -> None:
         last_erb_loss = torch.tensor(0.0, device=device)
         last_mod_loss = torch.tensor(0.0, device=device)
         last_shoulder_loss = torch.tensor(0.0, device=device)
+        last_gain_target_loss = torch.tensor(0.0, device=device)
         last_id_loss = torch.tensor(0.0, device=device)
         last_smooth_loss = torch.tensor(0.0, device=device)
         last_gain_reg = torch.tensor(0.0, device=device)
@@ -395,6 +423,7 @@ def train() -> None:
             erb_loss = psychoacoustic_band_loss(comp_mag, allowed_target_mag, erb_fb, band_weights)
             mod_loss = modulation_envelope_loss(comp_mag, allowed_target_mag, erb_fb, band_weights)
             shoulder_loss = shoulder_spectral_loss(comp_mag, clean_mag, mask_db_t)
+            target_loss = gain_target_loss(gain, clean_mag, notched_mag, mask_db_t)
             id_loss = identity_preservation_loss(comp_mag, notched_mag, mask_db_t)
             smooth_loss = temporal_smoothness_loss(gain, mask_db_t)
             gain_reg = (gain.square() * repair_region_from_mask(mask_db_t)).mean()
@@ -403,6 +432,7 @@ def train() -> None:
                 args.erb_w * erb_loss
                 + args.mod_w * mod_loss
                 + args.shoulder_w * shoulder_loss
+                + args.gain_target_w * target_loss
                 + args.identity_w * id_loss
                 + args.smooth_w * smooth_loss
                 + args.gain_reg_w * gain_reg
@@ -416,6 +446,7 @@ def train() -> None:
             last_erb_loss = erb_loss.detach()
             last_mod_loss = mod_loss.detach()
             last_shoulder_loss = shoulder_loss.detach()
+            last_gain_target_loss = target_loss.detach()
             last_id_loss = id_loss.detach()
             last_smooth_loss = smooth_loss.detach()
             last_gain_reg = gain_reg.detach()
@@ -441,6 +472,7 @@ def train() -> None:
         writer.add_scalar("loss/erb", float(last_erb_loss.item()), epoch)
         writer.add_scalar("loss/modulation", float(last_mod_loss.item()), epoch)
         writer.add_scalar("loss/shoulder", float(last_shoulder_loss.item()), epoch)
+        writer.add_scalar("loss/gain_target", float(last_gain_target_loss.item()), epoch)
         writer.add_scalar("loss/identity", float(last_id_loss.item()), epoch)
         writer.add_scalar("loss/smooth", float(last_smooth_loss.item()), epoch)
         writer.add_scalar("loss/gain_reg", float(last_gain_reg.item()), epoch)
