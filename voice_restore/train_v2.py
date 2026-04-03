@@ -47,6 +47,7 @@ LR          = 3e-4
 GRAD_CLIP   = 1.0
 N_STEPS     = 800
 N_MELS      = 80
+WARMUP_EPOCHS = 0
 
 # Default loss weights (override via CLI)
 IDENTITY_W  = 0.25
@@ -206,6 +207,10 @@ def train():
     ap = argparse.ArgumentParser()
     ap.add_argument('--resume', type=str, default=None)
     ap.add_argument('--lr',     type=float, default=None)
+    ap.add_argument('--epochs', type=int, default=EPOCHS,
+                    help='Total number of epochs to run')
+    ap.add_argument('--warmup-epochs', type=int, default=WARMUP_EPOCHS,
+                    help='Linearly warm learning rate for this many initial epochs')
     ap.add_argument('--identity-w', type=float, default=IDENTITY_W)
     ap.add_argument('--smooth-w',   type=float, default=SMOOTH_W)
     ap.add_argument('--gain-reg-w', type=float, default=GAIN_REG_W,
@@ -228,7 +233,8 @@ def train():
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     writer   = SummaryWriter(str(ckpt_dir / 'tb'))
 
-    optimizer = Adam(model.parameters(), lr=args.lr or LR)
+    base_lr = args.lr or LR
+    optimizer = Adam(model.parameters(), lr=base_lr)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
                                   patience=8, min_lr=1e-6)
 
@@ -244,6 +250,7 @@ def train():
 
     print(f'VoiceRestorerV2: {model.n_params:,} params on {device}')
     print(f'Vocals: {len(vocal_files)}, noise: {len(noise_files)}')
+    print(f'LR: {base_lr:.2e} | epochs: {args.epochs} | warmup: {args.warmup_epochs}')
     if not v1_train.CREPE_AVAILABLE:
         print('NOTE: CREPE unavailable — training without pitch features.')
 
@@ -258,13 +265,21 @@ def train():
         best_loss = state.get('best_loss', float('inf'))
         print(f'Resumed from {args.resume}  (best_loss={best_loss:.4f})')
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
         valid_steps = 0
         optimizer.zero_grad()
 
-        for step in tqdm(range(N_STEPS), desc=f'Epoch {epoch}/{EPOCHS}'):
+        if args.warmup_epochs > 0 and epoch <= args.warmup_epochs:
+            warmup_lr = base_lr * (epoch / args.warmup_epochs)
+            for pg in optimizer.param_groups:
+                pg['lr'] = warmup_lr
+        elif epoch == args.warmup_epochs + 1:
+            for pg in optimizer.param_groups:
+                pg['lr'] = base_lr
+
+        for step in tqdm(range(N_STEPS), desc=f'Epoch {epoch}/{args.epochs}'):
             noise_np, _ = sf.read(str(random.choice(noise_files)), dtype='float32')
             if noise_np.ndim > 1:
                 noise_np = noise_np.mean(1)
@@ -331,7 +346,8 @@ def train():
             optimizer.zero_grad()
 
         avg_loss = epoch_loss / max(valid_steps // BATCH_SIZE, 1)
-        scheduler.step(avg_loss)
+        if epoch > args.warmup_epochs:
+            scheduler.step(avg_loss)
         writer.add_scalar('loss/train', avg_loss, epoch)
         writer.add_scalar('loss/mel', mel_loss.item(), epoch)
         writer.add_scalar('loss/identity', id_loss.item(), epoch)
@@ -342,8 +358,10 @@ def train():
         writer.add_scalar('gain/min', float(gain.min().item()), epoch)
         writer.add_scalar('gain/max', float(gain.max().item()), epoch)
         writer.add_scalar('gain/mean', float(gain.mean().item()), epoch)
+        writer.add_scalar('lr', float(optimizer.param_groups[0]['lr']), epoch)
         best_str = f'{best_loss:.4f}' if best_loss < float('inf') else 'none'
-        print(f'Epoch {epoch:3d} | loss {avg_loss:.4f} | best {best_str} | valid {valid_steps}/{N_STEPS}')
+        print(f'Epoch {epoch:3d} | loss {avg_loss:.4f} | best {best_str} | '
+              f'valid {valid_steps}/{N_STEPS} | lr={optimizer.param_groups[0]["lr"]:.2e}')
 
         if avg_loss < best_loss:
             best_loss = avg_loss
