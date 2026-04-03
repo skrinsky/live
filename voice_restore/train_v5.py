@@ -302,7 +302,7 @@ def train() -> None:
 
             raw_residual, _ = model(spectral, cond)
             raw_residual = torch.nan_to_num(raw_residual, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
-            raw_residual = apply_residual_floor(raw_residual, mask_db_t, args.residual_floor)
+            # No floor during training — floor blocks gradients when output < floor
             comp_mag, base_gain, eff_gain = apply_compensation(notched_mag, mask_db_t, raw_residual)
             comp_mag = torch.nan_to_num(comp_mag, nan=0.0, posinf=0.0, neginf=0.0)
 
