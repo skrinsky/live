@@ -147,9 +147,8 @@ def compute_effective_gain(raw_gain: torch.Tensor,
     """
     safe_bins = (notch_mask_db > -3.0).float()
     repair_region = repair_region_from_mask(notch_mask_db)
-    notch_strength = notch_strength_from_mask(notch_mask_db)
-
-    base_gain = BASE_GAIN_SCALE * safe_bins * repair_region * notch_strength
+    shoulder_activity = safe_bins * repair_region
+    base_gain = BASE_GAIN_SCALE * shoulder_activity
     mod = (raw_gain.clamp(0.0, 1.0) * 2.0) - 1.0
     effective_gain = base_gain * (1.0 + MOD_GAIN_SCALE * mod)
 
