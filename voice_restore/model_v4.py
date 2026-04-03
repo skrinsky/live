@@ -24,6 +24,9 @@ F0_MIN_HZ = 50.0
 F0_MAX_HZ = 2000.0
 MAX_NOTCH_DB = 48.0
 MAX_COMP_DB = 8.0
+BASE_GAIN_SCALE = 0.16
+MOD_GAIN_SCALE = 0.75
+MIN_BASE_KEEP = 0.25
 
 _bin_freqs = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
 
@@ -129,7 +132,27 @@ class VoiceRestorerV4(nn.Module):
 def apply_compensation(notched_mag: torch.Tensor,
                        notch_mask_db: torch.Tensor,
                        gain: torch.Tensor) -> torch.Tensor:
+    effective_gain = compute_effective_gain(gain, notch_mask_db)
+    boost_db = effective_gain * MAX_COMP_DB
+    return notched_mag * (10.0 ** (boost_db / 20.0))
+
+
+def compute_effective_gain(raw_gain: torch.Tensor,
+                           notch_mask_db: torch.Tensor) -> torch.Tensor:
+    """
+    Nonzero notch-based baseline + learned modulation.
+
+    This prevents trivial all-zero collapse while still allowing the model
+    to shape compensation by content.
+    """
     safe_bins = (notch_mask_db > -3.0).float()
     repair_region = repair_region_from_mask(notch_mask_db)
-    boost_db = gain * MAX_COMP_DB * safe_bins * repair_region
-    return notched_mag * (10.0 ** (boost_db / 20.0))
+    notch_strength = notch_strength_from_mask(notch_mask_db)
+
+    base_gain = BASE_GAIN_SCALE * safe_bins * repair_region * notch_strength
+    mod = (raw_gain.clamp(0.0, 1.0) * 2.0) - 1.0
+    effective_gain = base_gain * (1.0 + MOD_GAIN_SCALE * mod)
+
+    min_gain = MIN_BASE_KEEP * base_gain
+    effective_gain = torch.maximum(effective_gain, min_gain)
+    return effective_gain.clamp(0.0, 1.0)

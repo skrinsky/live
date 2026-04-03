@@ -31,6 +31,7 @@ from voice_restore.model_v4 import (  # noqa: E402
     SR,
     VoiceRestorerV4,
     apply_compensation,
+    compute_effective_gain,
     repair_region_from_mask,
 )
 from voice_restore.features_v4 import make_v4_inputs  # noqa: E402
@@ -276,7 +277,8 @@ def train() -> None:
         last_identity_loss = torch.tensor(0.0, device=device)
         last_smooth_loss = torch.tensor(0.0, device=device)
         last_gain_reg = torch.tensor(0.0, device=device)
-        last_gain = torch.zeros(1, 1, 1, device=device)
+        last_raw_gain = torch.zeros(1, 1, 1, device=device)
+        last_eff_gain = torch.zeros(1, 1, 1, device=device)
         last_target_gain = torch.zeros(1, 1, 1, device=device)
         optimizer.zero_grad()
 
@@ -309,9 +311,10 @@ def train() -> None:
 
             spectral, cond, mask_db_t, clean_mag, notched_mag = result
 
-            gain, _ = model(spectral, cond)
-            gain = torch.nan_to_num(gain, nan=0.0, posinf=0.0, neginf=0.0)
-            comp_mag = apply_compensation(notched_mag, mask_db_t, gain)
+            raw_gain, _ = model(spectral, cond)
+            raw_gain = torch.nan_to_num(raw_gain, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+            eff_gain = compute_effective_gain(raw_gain, mask_db_t)
+            comp_mag = apply_compensation(notched_mag, mask_db_t, raw_gain)
             comp_mag = torch.nan_to_num(comp_mag, nan=0.0, posinf=0.0, neginf=0.0)
 
             target_gain = target_gain_from_envelope(
@@ -322,7 +325,7 @@ def train() -> None:
                 target_scale=args.target_scale,
                 target_floor=args.target_floor,
             )
-            env_target_loss = gain_target_loss(gain, target_gain, mask_db_t)
+            env_target_loss = gain_target_loss(eff_gain, target_gain, mask_db_t)
             env_match_loss = envelope_match_loss(
                 comp_mag,
                 clean_mag,
@@ -330,8 +333,8 @@ def train() -> None:
                 kernel_size=args.env_kernel,
             )
             identity_loss = identity_preservation_loss(comp_mag, notched_mag, mask_db_t)
-            smooth_loss = temporal_smoothness_loss(gain, mask_db_t)
-            gain_reg = (gain.square() * repair_region_from_mask(mask_db_t)).mean()
+            smooth_loss = temporal_smoothness_loss(eff_gain, mask_db_t)
+            gain_reg = (eff_gain.square() * repair_region_from_mask(mask_db_t)).mean()
 
             if epoch <= args.target_only_epochs:
                 loss = (
@@ -357,7 +360,8 @@ def train() -> None:
             last_identity_loss = identity_loss.detach()
             last_smooth_loss = smooth_loss.detach()
             last_gain_reg = gain_reg.detach()
-            last_gain = gain.detach()
+            last_raw_gain = raw_gain.detach()
+            last_eff_gain = eff_gain.detach()
             last_target_gain = target_gain.detach()
 
             if valid_steps % BATCH_SIZE == 0:
@@ -381,9 +385,12 @@ def train() -> None:
         writer.add_scalar("loss/identity", float(last_identity_loss.item()), epoch)
         writer.add_scalar("loss/smooth", float(last_smooth_loss.item()), epoch)
         writer.add_scalar("loss/gain_reg", float(last_gain_reg.item()), epoch)
-        writer.add_scalar("gain/min", float(last_gain.min().item()), epoch)
-        writer.add_scalar("gain/max", float(last_gain.max().item()), epoch)
-        writer.add_scalar("gain/mean", float(last_gain.mean().item()), epoch)
+        writer.add_scalar("raw_gain/min", float(last_raw_gain.min().item()), epoch)
+        writer.add_scalar("raw_gain/max", float(last_raw_gain.max().item()), epoch)
+        writer.add_scalar("raw_gain/mean", float(last_raw_gain.mean().item()), epoch)
+        writer.add_scalar("gain/min", float(last_eff_gain.min().item()), epoch)
+        writer.add_scalar("gain/max", float(last_eff_gain.max().item()), epoch)
+        writer.add_scalar("gain/mean", float(last_eff_gain.mean().item()), epoch)
         writer.add_scalar("target_gain/min", float(last_target_gain.min().item()), epoch)
         writer.add_scalar("target_gain/max", float(last_target_gain.max().item()), epoch)
         writer.add_scalar("target_gain/mean", float(last_target_gain.mean().item()), epoch)

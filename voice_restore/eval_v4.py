@@ -14,7 +14,14 @@ from scipy.signal import lfilter
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from voice_restore.model_v4 import HOP, N_FFT, SR, VoiceRestorerV4, apply_compensation  # noqa: E402
+from voice_restore.model_v4 import (  # noqa: E402
+    HOP,
+    N_FFT,
+    SR,
+    VoiceRestorerV4,
+    apply_compensation,
+    compute_effective_gain,
+)
 from voice_restore.features_v4 import make_v4_inputs  # noqa: E402
 from voice_restore import train as v1_train  # noqa: E402
 
@@ -96,15 +103,20 @@ def run_eval(input_path: str, notch_specs: list[tuple], ckpt_path: Path, out_dir
     spectral, cond = make_v4_inputs(notched_mag, mask_db_t, f0_np, conf_np)
 
     with torch.no_grad():
-        gain, _ = model(spectral, cond)
-    gain = torch.nan_to_num(gain, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+        raw_gain, _ = model(spectral, cond)
+    raw_gain = torch.nan_to_num(raw_gain, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+    gain = compute_effective_gain(raw_gain, mask_db_t)
 
-    comp_mag = apply_compensation(notched_mag, mask_db_t, gain)[0]
+    comp_mag = apply_compensation(notched_mag, mask_db_t, raw_gain)[0]
     boost_db = 20.0 * torch.log10((comp_mag + 1e-8) / (notched_mag[0] + 1e-8))
     boosted = boost_db > 0.1
     pct_boosted = float(boosted.float().mean().item()) * 100.0
     print(
-        f"Gain stats: min={float(gain.min()):.3f}  max={float(gain.max()):.3f}  "
+        f"Raw gain: min={float(raw_gain.min()):.3f}  max={float(raw_gain.max()):.3f}  "
+        f"mean={float(raw_gain.mean()):.3f}"
+    )
+    print(
+        f"Effective gain: min={float(gain.min()):.3f}  max={float(gain.max()):.3f}  "
         f"mean={float(gain.mean()):.3f}  | pct_bins_boosted={pct_boosted:.2f}%"
     )
 
