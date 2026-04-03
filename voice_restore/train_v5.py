@@ -1,0 +1,371 @@
+"""
+voice_restore/train_v5.py — Train VoiceRestorer V5.
+
+V5 trains only the residual layer on top of a deterministic shoulder baseline.
+This ensures restoration remains nonzero while learning content-aware shaping.
+"""
+
+import argparse
+import math
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+import torch
+import torch.nn.functional as F
+from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from voice_restore.model_v5 import (  # noqa: E402
+    HOP,
+    N_FFT,
+    SR,
+    VoiceRestorerV5,
+    apply_compensation,
+    compute_base_gain,
+    compute_effective_gain,
+    repair_region_from_mask,
+)
+from voice_restore.features_v5 import make_v5_inputs  # noqa: E402
+from voice_restore import train as v1_train  # noqa: E402
+
+SEQ_SECS = 2.0
+SEQ_LEN = int(SEQ_SECS * SR)
+BATCH_SIZE = 8
+EPOCHS = 200
+LR = 3e-4
+GRAD_CLIP = 1.0
+N_STEPS = 800
+WARMUP_EPOCHS = 0
+
+ENV_KERNEL = 33
+ENV_MATCH_W = 1.0
+RESIDUAL_TARGET_W = 0.75
+IDENTITY_W = 0.05
+SMOOTH_W = 0.05
+RESIDUAL_REG_W = 0.01
+
+
+def smooth_log_spectrum(mag: torch.Tensor, kernel_size: int = ENV_KERNEL) -> torch.Tensor:
+    log_mag = torch.log(mag + 1e-8)
+    pad = kernel_size // 2
+    bsz, n_freq, n_frames = log_mag.shape
+    x = log_mag.permute(0, 2, 1).reshape(bsz * n_frames, 1, n_freq)
+    x = F.avg_pool1d(x, kernel_size=kernel_size, stride=1, padding=pad)
+    return x.reshape(bsz, n_frames, n_freq).permute(0, 2, 1)
+
+
+def target_gain_from_envelope(clean_mag: torch.Tensor,
+                              notched_mag: torch.Tensor,
+                              mask_db_t: torch.Tensor,
+                              kernel_size: int = ENV_KERNEL) -> torch.Tensor:
+    clean_env = smooth_log_spectrum(clean_mag, kernel_size=kernel_size)
+    notched_env = smooth_log_spectrum(notched_mag, kernel_size=kernel_size)
+    env_boost_db = (clean_env - notched_env) * (20.0 / math.log(10.0))
+    env_boost_db = env_boost_db.clamp(min=0.0, max=8.0)
+    target_gain = (env_boost_db / 8.0) * (repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float())
+    return target_gain.clamp(0.0, 1.0)
+
+
+def target_residual_from_gain(target_gain: torch.Tensor,
+                              base_gain: torch.Tensor) -> torch.Tensor:
+    denom = (base_gain + 1e-4)
+    target_res = ((target_gain - base_gain).clamp(min=0.0) / denom).clamp(0.0, 1.0)
+    return target_res
+
+
+def residual_target_loss(raw_residual: torch.Tensor,
+                         target_residual: torch.Tensor,
+                         mask_db_t: torch.Tensor) -> torch.Tensor:
+    shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
+    active = ((target_residual > 0.01).float() * shoulder).clamp(0.0, 1.0)
+    if float(active.sum()) < 1.0:
+        active = (shoulder > 0.05).float()
+    return ((raw_residual - target_residual).square() * active).sum() / active.sum().clamp(min=1.0)
+
+
+def envelope_match_loss(comp_mag: torch.Tensor,
+                        clean_mag: torch.Tensor,
+                        mask_db_t: torch.Tensor,
+                        kernel_size: int = ENV_KERNEL) -> torch.Tensor:
+    shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
+    comp_env = smooth_log_spectrum(comp_mag, kernel_size=kernel_size)
+    clean_env = smooth_log_spectrum(clean_mag, kernel_size=kernel_size)
+    return ((comp_env - clean_env).square() * shoulder).sum() / shoulder.sum().clamp(min=1.0)
+
+
+def identity_preservation_loss(comp_mag: torch.Tensor,
+                               notched_mag: torch.Tensor,
+                               mask_db_t: torch.Tensor) -> torch.Tensor:
+    repair = repair_region_from_mask(mask_db_t)
+    preserve = (mask_db_t > -3.0).float() * (1.0 - repair)
+    log_comp = torch.log(comp_mag + 1e-8)
+    log_notched = torch.log(notched_mag + 1e-8)
+    return ((log_comp - log_notched).square() * preserve).sum() / preserve.sum().clamp(min=1.0)
+
+
+def temporal_smoothness_loss(gain: torch.Tensor,
+                             mask_db_t: torch.Tensor) -> torch.Tensor:
+    if gain.shape[-1] < 2:
+        return gain.new_zeros(())
+    repair = repair_region_from_mask(mask_db_t)
+    delta = gain[:, :, 1:] - gain[:, :, :-1]
+    weight = 0.25 + 0.75 * repair[:, :, 1:]
+    return (delta.square() * weight).mean()
+
+
+def make_training_pair_v5(vocal_path: Path,
+                          noise_np: np.ndarray,
+                          device: torch.device,
+                          window: torch.Tensor,
+                          f0_cache: dict) -> tuple[torch.Tensor, ...] | None:
+    audio_np, sr = sf.read(str(vocal_path), dtype="float32")
+    if audio_np.ndim > 1:
+        audio_np = audio_np.mean(1)
+    if sr != SR or len(audio_np) < SEQ_LEN:
+        return None
+
+    off = random.randint(0, len(audio_np) - SEQ_LEN)
+    vocal_np = audio_np[off:off + SEQ_LEN]
+    vocal_np = v1_train.sosfilt(v1_train._hpf_sos, vocal_np).astype(np.float32)
+
+    snr_db = random.uniform(10, 40)
+    v_rms = float(np.sqrt(np.mean(vocal_np ** 2))) + 1e-8
+    n_rms = float(np.sqrt(np.mean(noise_np[:SEQ_LEN] ** 2))) + 1e-8
+    noisy = (
+        vocal_np
+        + noise_np[:SEQ_LEN] * (v_rms / n_rms * 10 ** (-snr_db / 20.0))
+    ).astype(np.float32)
+
+    def _stft(x_np: np.ndarray) -> torch.Tensor:
+        wav = torch.from_numpy(x_np).unsqueeze(0).to(device)
+        return torch.stft(wav, N_FFT, HOP, N_FFT, window, return_complex=True)
+
+    clean_stft = _stft(noisy)
+    clean_mag = clean_stft.abs()[0]
+    t_frames = int(clean_mag.shape[1])
+
+    notches = v1_train.simulate_notch_bank(random.randint(1, v1_train.MAX_NOTCHES_SIM))
+    notched_np, mask_db = v1_train.apply_notch_bank_to_audio(noisy, notches, t_frames)
+    notched_stft = _stft(notched_np)
+    notched_mag = notched_stft.abs()[0]
+
+    key = str(vocal_path)
+    if key not in f0_cache:
+        f0_cache[key] = v1_train.extract_f0(vocal_path, device=str(device))
+    f0_full, conf_full = f0_cache[key]
+    frame_off = off // HOP
+    f0_slice = f0_full[frame_off:frame_off + t_frames + 10]
+    conf_slice = conf_full[frame_off:frame_off + t_frames + 10]
+
+    mask_db_t = torch.from_numpy(mask_db).to(device).unsqueeze(0)
+    spectral, cond = make_v5_inputs(
+        notched_mag.unsqueeze(0),
+        mask_db_t,
+        f0_slice,
+        conf_slice,
+    )
+
+    return (
+        spectral,
+        cond,
+        mask_db_t,
+        clean_mag.unsqueeze(0),
+        notched_mag.unsqueeze(0),
+    )
+
+
+def train() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--resume", type=str, default=None)
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--epochs", type=int, default=EPOCHS)
+    ap.add_argument("--warmup-epochs", type=int, default=WARMUP_EPOCHS)
+    ap.add_argument("--env-kernel", type=int, default=ENV_KERNEL)
+    ap.add_argument("--env-match-w", type=float, default=ENV_MATCH_W)
+    ap.add_argument("--residual-target-w", type=float, default=RESIDUAL_TARGET_W)
+    ap.add_argument("--identity-w", type=float, default=IDENTITY_W)
+    ap.add_argument("--smooth-w", type=float, default=SMOOTH_W)
+    ap.add_argument("--residual-reg-w", type=float, default=RESIDUAL_REG_W)
+    args, _ = ap.parse_known_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    window = torch.hann_window(N_FFT).sqrt().to(device)
+    model = VoiceRestorerV5().to(device)
+    ckpt_dir = PROJECT_ROOT / "checkpoints" / "voice_restore_v5"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(str(ckpt_dir / "tb"))
+
+    base_lr = args.lr or LR
+    optimizer = Adam(model.parameters(), lr=base_lr)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=8, min_lr=1e-6)
+
+    vocal_files = [
+        f for f in (PROJECT_ROOT / "data" / "clean_vocals").rglob("*.wav")
+        if not f.name.startswith("._") and "__MACOSX" not in str(f)
+    ]
+    noise_files = list((PROJECT_ROOT / "data" / "noise").rglob("*.wav"))
+    assert vocal_files, "No vocal files in data/clean_vocals/"
+    assert noise_files, "No noise files in data/noise/"
+
+    vocal_files = [
+        f for f in vocal_files
+        if (info := sf.info(str(f))).frames / info.samplerate >= SEQ_SECS
+    ]
+    assert vocal_files, f"No vocal files >= {SEQ_SECS}s"
+
+    print(f"VoiceRestorerV5: {model.n_params:,} params on {device}")
+    print(f"Vocals: {len(vocal_files)}, noise: {len(noise_files)}")
+    print(
+        f"LR: {base_lr:.2e} | epochs: {args.epochs} | warmup: {args.warmup_epochs} | "
+        f"env_kernel: {args.env_kernel}"
+    )
+    if not v1_train.CREPE_AVAILABLE:
+        print("NOTE: CREPE unavailable — training without pitch features.")
+
+    best_loss = float("inf")
+    f0_cache: dict = {}
+
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        state = ckpt if isinstance(ckpt, dict) and "model" in ckpt else {"model": ckpt}
+        model.load_state_dict(state["model"])
+        best_loss = state.get("best_loss", float("inf"))
+        print(f"Resumed from {args.resume}  (best_loss={best_loss:.4f})")
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        valid_steps = 0
+        last_env_match = torch.tensor(0.0, device=device)
+        last_res_tgt = torch.tensor(0.0, device=device)
+        last_identity = torch.tensor(0.0, device=device)
+        last_smooth = torch.tensor(0.0, device=device)
+        last_res_reg = torch.tensor(0.0, device=device)
+        last_raw_res = torch.zeros(1, 1, 1, device=device)
+        last_base_gain = torch.zeros(1, 1, 1, device=device)
+        last_eff_gain = torch.zeros(1, 1, 1, device=device)
+        optimizer.zero_grad()
+
+        if args.warmup_epochs > 0 and epoch <= args.warmup_epochs:
+            warmup_lr = base_lr * (epoch / args.warmup_epochs)
+            for group in optimizer.param_groups:
+                group["lr"] = warmup_lr
+        elif epoch == args.warmup_epochs + 1:
+            for group in optimizer.param_groups:
+                group["lr"] = base_lr
+
+        for _ in tqdm(range(N_STEPS), desc=f"Epoch {epoch}/{args.epochs}"):
+            noise_np, _ = sf.read(str(random.choice(noise_files)), dtype="float32")
+            if noise_np.ndim > 1:
+                noise_np = noise_np.mean(1)
+            if len(noise_np) < SEQ_LEN:
+                noise_np = np.tile(noise_np, math.ceil(SEQ_LEN / len(noise_np)))
+            start = random.randint(0, len(noise_np) - SEQ_LEN)
+            noise_np = noise_np[start:start + SEQ_LEN]
+
+            result = make_training_pair_v5(
+                random.choice(vocal_files),
+                noise_np,
+                device,
+                window,
+                f0_cache,
+            )
+            if result is None:
+                continue
+
+            spectral, cond, mask_db_t, clean_mag, notched_mag = result
+
+            raw_residual, _ = model(spectral, cond)
+            raw_residual = torch.nan_to_num(raw_residual, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+            comp_mag, base_gain, eff_gain = apply_compensation(notched_mag, mask_db_t, raw_residual)
+            comp_mag = torch.nan_to_num(comp_mag, nan=0.0, posinf=0.0, neginf=0.0)
+
+            target_gain = target_gain_from_envelope(clean_mag, notched_mag, mask_db_t, kernel_size=args.env_kernel)
+            target_res = target_residual_from_gain(target_gain, compute_base_gain(mask_db_t))
+
+            env_match = envelope_match_loss(comp_mag, clean_mag, mask_db_t, kernel_size=args.env_kernel)
+            res_tgt = residual_target_loss(raw_residual, target_res, mask_db_t)
+            identity = identity_preservation_loss(comp_mag, notched_mag, mask_db_t)
+            smooth = temporal_smoothness_loss(eff_gain, mask_db_t)
+            res_reg = raw_residual.mean()
+
+            loss = (
+                args.env_match_w * env_match
+                + args.residual_target_w * res_tgt
+                + args.identity_w * identity
+                + args.smooth_w * smooth
+                + args.residual_reg_w * res_reg
+            )
+
+            if not torch.isfinite(loss):
+                continue
+
+            (loss / BATCH_SIZE).backward()
+            valid_steps += 1
+            last_env_match = env_match.detach()
+            last_res_tgt = res_tgt.detach()
+            last_identity = identity.detach()
+            last_smooth = smooth.detach()
+            last_res_reg = res_reg.detach()
+            last_raw_res = raw_residual.detach()
+            last_base_gain = base_gain.detach()
+            last_eff_gain = eff_gain.detach()
+
+            if valid_steps % BATCH_SIZE == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                optimizer.step()
+                optimizer.zero_grad()
+                epoch_loss += float(loss.item())
+
+        if valid_steps % BATCH_SIZE != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        avg_loss = epoch_loss / max(valid_steps // BATCH_SIZE, 1)
+        if epoch > args.warmup_epochs:
+            scheduler.step(avg_loss)
+
+        writer.add_scalar("loss/train", avg_loss, epoch)
+        writer.add_scalar("loss/env_match", float(last_env_match.item()), epoch)
+        writer.add_scalar("loss/residual_target", float(last_res_tgt.item()), epoch)
+        writer.add_scalar("loss/identity", float(last_identity.item()), epoch)
+        writer.add_scalar("loss/smooth", float(last_smooth.item()), epoch)
+        writer.add_scalar("loss/residual_reg", float(last_res_reg.item()), epoch)
+        writer.add_scalar("raw_residual/min", float(last_raw_res.min().item()), epoch)
+        writer.add_scalar("raw_residual/max", float(last_raw_res.max().item()), epoch)
+        writer.add_scalar("raw_residual/mean", float(last_raw_res.mean().item()), epoch)
+        writer.add_scalar("base_gain/min", float(last_base_gain.min().item()), epoch)
+        writer.add_scalar("base_gain/max", float(last_base_gain.max().item()), epoch)
+        writer.add_scalar("base_gain/mean", float(last_base_gain.mean().item()), epoch)
+        writer.add_scalar("gain/min", float(last_eff_gain.min().item()), epoch)
+        writer.add_scalar("gain/max", float(last_eff_gain.max().item()), epoch)
+        writer.add_scalar("gain/mean", float(last_eff_gain.mean().item()), epoch)
+        writer.add_scalar("lr", float(optimizer.param_groups[0]["lr"]), epoch)
+
+        best_str = f"{best_loss:.4f}" if best_loss < float("inf") else "none"
+        print(
+            f"Epoch {epoch:3d} | loss {avg_loss:.4f} | best {best_str} | "
+            f"valid {valid_steps}/{N_STEPS} | lr={optimizer.param_groups[0]['lr']:.2e}"
+        )
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(
+                {"epoch": epoch, "model": model.state_dict(), "best_loss": best_loss},
+                str(ckpt_dir / "best.pt"),
+            )
+            print("  ✓ New best")
+
+
+if __name__ == "__main__":
+    train()
+
