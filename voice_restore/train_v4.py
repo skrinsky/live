@@ -101,9 +101,10 @@ def gain_target_loss(gain: torch.Tensor,
     shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
     active = ((target_gain > 0.02).float() * shoulder).clamp(0.0, 1.0)
     if float(active.sum()) < 1.0:
-        active = shoulder
-    weight = 0.25 + 0.75 * active
-    return ((gain - target_gain).square() * weight).sum() / weight.sum().clamp(min=1.0)
+        active = (shoulder > 0.05).float()
+    # Only supervise where compensation is actually expected; otherwise the
+    # dominant zero-target region collapses the whole gain map to zero.
+    return ((gain - target_gain).square() * active).sum() / active.sum().clamp(min=1.0)
 
 
 def envelope_match_loss(comp_mag: torch.Tensor,
