@@ -31,6 +31,7 @@ from voice_restore.model_v5 import (  # noqa: E402
     apply_compensation,
     compute_base_gain,
     compute_effective_gain,
+    notch_strength_from_mask,
     repair_region_from_mask,
 )
 from voice_restore.features_v5 import make_v5_inputs  # noqa: E402
@@ -48,6 +49,7 @@ WARMUP_EPOCHS = 0
 ENV_KERNEL = 33
 ENV_MATCH_W = 0.0
 RESIDUAL_TARGET_W = 1.0
+TARGET_NOTCH_GAIN_SCALE = 0.4   # target shoulder boost when notch is full depth (0.4 → 3.2 dB max)
 IDENTITY_W = 0.0
 SMOOTH_W = 0.0
 RESIDUAL_REG_W = 0.0
@@ -65,15 +67,18 @@ def smooth_log_spectrum(mag: torch.Tensor, kernel_size: int = ENV_KERNEL) -> tor
     return x.reshape(bsz, n_frames, n_freq).permute(0, 2, 1)
 
 
-def target_gain_from_envelope(clean_mag: torch.Tensor,
-                              notched_mag: torch.Tensor,
-                              mask_db_t: torch.Tensor,
-                              kernel_size: int = ENV_KERNEL) -> torch.Tensor:
-    clean_env = smooth_log_spectrum(clean_mag, kernel_size=kernel_size)
-    notched_env = smooth_log_spectrum(notched_mag, kernel_size=kernel_size)
-    env_boost_db = (clean_env - notched_env) * (20.0 / math.log(10.0))
-    env_boost_db = env_boost_db.clamp(min=0.0, max=8.0)
-    target_gain = (env_boost_db / 8.0) * (repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float())
+def target_gain_from_notch(mask_db_t: torch.Tensor) -> torch.Tensor:
+    """Target shoulder boost proportional to nearby notch depth.
+
+    Envelope-based targets don't work: with a narrow notch (Q=15, ~2 bins),
+    shoulder bins have no measurable energy difference vs. clean — their target
+    would always be zero. Instead, derive the target directly from the mask:
+    deeper notch nearby → higher target boost at shoulder bins.
+    """
+    shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
+    # Peak notch strength anywhere in the frame, broadcast to all bins
+    peak_strength = notch_strength_from_mask(mask_db_t).amax(dim=1, keepdim=True).clamp(0.0, 1.0)
+    target_gain = shoulder * peak_strength * TARGET_NOTCH_GAIN_SCALE
     return target_gain.clamp(0.0, 1.0)
 
 
@@ -306,7 +311,7 @@ def train() -> None:
             comp_mag, base_gain, eff_gain = apply_compensation(notched_mag, mask_db_t, raw_residual)
             comp_mag = torch.nan_to_num(comp_mag, nan=0.0, posinf=0.0, neginf=0.0)
 
-            target_gain = target_gain_from_envelope(clean_mag, notched_mag, mask_db_t, kernel_size=args.env_kernel)
+            target_gain = target_gain_from_notch(mask_db_t)
             target_res = target_residual_from_gain(target_gain, compute_base_gain(mask_db_t), mask_db_t)
 
             env_match = envelope_match_loss(comp_mag, clean_mag, mask_db_t, kernel_size=args.env_kernel)
