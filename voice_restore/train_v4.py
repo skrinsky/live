@@ -57,9 +57,16 @@ TARGET_FLOOR = 0.04
 
 
 def smooth_log_spectrum(mag: torch.Tensor, kernel_size: int = ENV_KERNEL) -> torch.Tensor:
+    """
+    Smooth along frequency (not time) to get a coarse spectral envelope.
+    Input/Output shape: (B, F, T)
+    """
     log_mag = torch.log(mag + 1e-8)
     pad = kernel_size // 2
-    return F.avg_pool1d(log_mag, kernel_size=kernel_size, stride=1, padding=pad)
+    bsz, n_freq, n_frames = log_mag.shape
+    x = log_mag.permute(0, 2, 1).reshape(bsz * n_frames, 1, n_freq)
+    x = F.avg_pool1d(x, kernel_size=kernel_size, stride=1, padding=pad)
+    return x.reshape(bsz, n_frames, n_freq).permute(0, 2, 1)
 
 
 def target_gain_from_envelope(clean_mag: torch.Tensor,
