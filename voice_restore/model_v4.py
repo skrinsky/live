@@ -24,9 +24,8 @@ F0_MIN_HZ = 50.0
 F0_MAX_HZ = 2000.0
 MAX_NOTCH_DB = 48.0
 MAX_COMP_DB = 8.0
-BASE_GAIN_SCALE = 0.10
-MOD_GAIN_SCALE = 1.00
-MIN_BASE_KEEP = 0.05
+BASE_GAIN_SCALE = 0.04
+MOD_GAIN_SCALE = 1.50
 
 _bin_freqs = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
 
@@ -154,9 +153,9 @@ def compute_effective_gain(raw_gain: torch.Tensor,
     shoulder_norm = (shoulder_activity / shoulder_peak).clamp(0.0, 1.0)
     shoulder_gate = (shoulder_activity > 0.02).float()
     base_gain = BASE_GAIN_SCALE * shoulder_norm * shoulder_gate
-    mod = (raw_gain.clamp(0.0, 1.0) * 2.0) - 1.0
-    effective_gain = base_gain * (1.0 + MOD_GAIN_SCALE * mod)
-
-    min_gain = MIN_BASE_KEEP * base_gain
-    effective_gain = torch.maximum(effective_gain, min_gain)
+    # Deterministic nonzero baseline + learned positive residual.
+    # This avoids the repeated collapse where optimization drives effective gain
+    # to tiny floor values.
+    residual = raw_gain.clamp(0.0, 1.0)
+    effective_gain = base_gain * (1.0 + MOD_GAIN_SCALE * residual)
     return effective_gain.clamp(0.0, 1.0)

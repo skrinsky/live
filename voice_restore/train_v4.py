@@ -96,9 +96,8 @@ def target_gain_from_envelope(clean_mag: torch.Tensor,
 
     # Keep a small nonzero prior in active shoulder regions so the model
     # does not collapse to all-zero gains when envelope deltas are tiny.
-    notch_strength = (-mask_db_t / 48.0).clamp(0.0, 1.0)
     shoulder_active = (shoulder > 0.05).float()
-    prior_gain = target_floor * shoulder_active * notch_strength
+    prior_gain = target_floor * shoulder_active
     target_gain = torch.maximum(target_gain, prior_gain)
     return target_gain.clamp(0.0, 1.0)
 
@@ -107,7 +106,7 @@ def gain_target_loss(gain: torch.Tensor,
                      target_gain: torch.Tensor,
                      mask_db_t: torch.Tensor) -> torch.Tensor:
     shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
-    active = ((target_gain > 0.02).float() * shoulder).clamp(0.0, 1.0)
+    active = ((target_gain > 0.01).float() * shoulder).clamp(0.0, 1.0)
     if float(active.sum()) < 1.0:
         active = (shoulder > 0.05).float()
     # Only supervise where compensation is actually expected; otherwise the
