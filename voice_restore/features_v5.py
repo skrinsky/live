@@ -92,6 +92,6 @@ def make_v5_inputs(
         aperiodic[:, :N_FREQ, :],
     ], dim=1)
 
-    cond = build_condition_features(f0_np, conf_np, log_notched[0]).to(notched_mag.device).unsqueeze(0)
+    cond = build_condition_features(f0_np, conf_np, notched_mag[0]).to(notched_mag.device).unsqueeze(0)
     return spectral, cond
 

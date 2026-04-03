@@ -300,6 +300,8 @@ def train() -> None:
 
             spectral, cond, mask_db_t, clean_mag, notched_mag = result
 
+            spectral = torch.nan_to_num(spectral, nan=0.0, posinf=0.0, neginf=0.0)
+            cond     = torch.nan_to_num(cond,     nan=0.0, posinf=0.0, neginf=0.0)
             raw_residual, _ = model(spectral, cond)
             raw_residual = torch.nan_to_num(raw_residual, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
             # No floor during training — floor blocks gradients when output < floor
