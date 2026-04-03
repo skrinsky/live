@@ -54,6 +54,7 @@ SMOOTH_W = 0.05
 GAIN_REG_W = 0.01
 ERB_W = 1.0
 MOD_W = 0.30
+SHOULDER_W = 0.75
 MASK_AWARE_W = 1.0
 MASK_FLOOR = 0.25
 
@@ -145,7 +146,8 @@ def psychoacoustic_band_loss(comp_mag: torch.Tensor,
                              band_weights: torch.Tensor) -> torch.Tensor:
     comp_erb = erb_log_energies(comp_mag, erb_fb)
     tgt_erb = erb_log_energies(allowed_target_mag, erb_fb)
-    return ((comp_erb - tgt_erb).square() * band_weights).mean()
+    diff = (comp_erb - tgt_erb).square()
+    return (diff * band_weights).sum() / band_weights.sum().clamp(min=1e-8)
 
 
 def modulation_envelope_loss(comp_mag: torch.Tensor,
@@ -159,14 +161,29 @@ def modulation_envelope_loss(comp_mag: torch.Tensor,
     comp_env = F.avg_pool1d(comp_erb, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
     tgt_env = F.avg_pool1d(tgt_erb, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
 
-    env_loss = ((comp_env - tgt_env).abs() * band_weights).mean()
+    env_loss = ((comp_env - tgt_env).abs() * band_weights).sum() / band_weights.sum().clamp(min=1e-8)
     if comp_env.shape[-1] < 2:
         return env_loss
 
     comp_delta = comp_env[:, :, 1:] - comp_env[:, :, :-1]
     tgt_delta = tgt_env[:, :, 1:] - tgt_env[:, :, :-1]
-    delta_loss = ((comp_delta - tgt_delta).abs() * band_weights[:, :, 1:]).mean()
+    delta_w = band_weights[:, :, 1:]
+    delta_loss = ((comp_delta - tgt_delta).abs() * delta_w).sum() / delta_w.sum().clamp(min=1e-8)
     return env_loss + 0.5 * delta_loss
+
+
+def shoulder_spectral_loss(comp_mag: torch.Tensor,
+                           clean_mag: torch.Tensor,
+                           mask_db_t: torch.Tensor) -> torch.Tensor:
+    """
+    Give the model a direct signal in the safe shoulder region around the notch.
+    This stays outside forbidden bins, but avoids ERB bands washing the target out.
+    """
+    safe_bins = (mask_db_t > -3.0).float()
+    shoulder = repair_region_from_mask(mask_db_t) * safe_bins
+    log_comp = torch.log(comp_mag + 1e-8)
+    log_clean = torch.log(clean_mag + 1e-8)
+    return ((log_comp - log_clean).square() * shoulder).sum() / shoulder.sum().clamp(min=1.0)
 
 
 def identity_preservation_loss(comp_mag: torch.Tensor,
@@ -264,6 +281,7 @@ def train() -> None:
     ap.add_argument("--erb-bands", type=int, default=ERB_BANDS)
     ap.add_argument("--erb-w", type=float, default=ERB_W)
     ap.add_argument("--mod-w", type=float, default=MOD_W)
+    ap.add_argument("--shoulder-w", type=float, default=SHOULDER_W)
     ap.add_argument("--identity-w", type=float, default=IDENTITY_W)
     ap.add_argument("--smooth-w", type=float, default=SMOOTH_W)
     ap.add_argument("--gain-reg-w", type=float, default=GAIN_REG_W)
@@ -324,6 +342,7 @@ def train() -> None:
         valid_steps = 0
         last_erb_loss = torch.tensor(0.0, device=device)
         last_mod_loss = torch.tensor(0.0, device=device)
+        last_shoulder_loss = torch.tensor(0.0, device=device)
         last_id_loss = torch.tensor(0.0, device=device)
         last_smooth_loss = torch.tensor(0.0, device=device)
         last_gain_reg = torch.tensor(0.0, device=device)
@@ -375,6 +394,7 @@ def train() -> None:
             )
             erb_loss = psychoacoustic_band_loss(comp_mag, allowed_target_mag, erb_fb, band_weights)
             mod_loss = modulation_envelope_loss(comp_mag, allowed_target_mag, erb_fb, band_weights)
+            shoulder_loss = shoulder_spectral_loss(comp_mag, clean_mag, mask_db_t)
             id_loss = identity_preservation_loss(comp_mag, notched_mag, mask_db_t)
             smooth_loss = temporal_smoothness_loss(gain, mask_db_t)
             gain_reg = (gain.square() * repair_region_from_mask(mask_db_t)).mean()
@@ -382,6 +402,7 @@ def train() -> None:
             loss = (
                 args.erb_w * erb_loss
                 + args.mod_w * mod_loss
+                + args.shoulder_w * shoulder_loss
                 + args.identity_w * id_loss
                 + args.smooth_w * smooth_loss
                 + args.gain_reg_w * gain_reg
@@ -394,6 +415,7 @@ def train() -> None:
             valid_steps += 1
             last_erb_loss = erb_loss.detach()
             last_mod_loss = mod_loss.detach()
+            last_shoulder_loss = shoulder_loss.detach()
             last_id_loss = id_loss.detach()
             last_smooth_loss = smooth_loss.detach()
             last_gain_reg = gain_reg.detach()
@@ -418,6 +440,7 @@ def train() -> None:
         writer.add_scalar("loss/train", avg_loss, epoch)
         writer.add_scalar("loss/erb", float(last_erb_loss.item()), epoch)
         writer.add_scalar("loss/modulation", float(last_mod_loss.item()), epoch)
+        writer.add_scalar("loss/shoulder", float(last_shoulder_loss.item()), epoch)
         writer.add_scalar("loss/identity", float(last_id_loss.item()), epoch)
         writer.add_scalar("loss/smooth", float(last_smooth_loss.item()), epoch)
         writer.add_scalar("loss/gain_reg", float(last_gain_reg.item()), epoch)
