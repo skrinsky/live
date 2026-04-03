@@ -29,6 +29,7 @@ from feedback_detect.live import _cluster_bins
 from feedback_detect.eval_loop import _rms_db
 
 from voice_restore.model_v5 import VoiceRestorerV5, apply_compensation
+from voice_restore.model_v5 import N_FREQ as VR_N_FREQ
 from voice_restore.features_v5 import make_v5_inputs
 from voice_restore import train as vr_train
 
@@ -97,9 +98,9 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
 
 
 def build_notch_mask_from_logs(notch_logs, n_frames):
-    mask = np.zeros((N_FREQ, n_frames), dtype=np.float32)
+    mask = np.zeros((VR_N_FREQ, n_frames), dtype=np.float32)
     for t, notches in enumerate(notch_logs[:n_frames]):
-        cur = np.zeros(N_FREQ, dtype=np.float32)
+        cur = np.zeros(VR_N_FREQ, dtype=np.float32)
         for f, d, q in notches:
             cur += vr_train.notch_frequency_response(f, d, q)
         mask[:, t] = np.clip(cur, -96.0, 0.0)
