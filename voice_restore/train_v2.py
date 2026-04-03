@@ -285,7 +285,9 @@ def train():
              notched_stft, clean_wav_t) = result
 
             gain, _ = model(spectral, cond)
+            gain = torch.nan_to_num(gain, nan=0.0, posinf=0.0, neginf=0.0)
             comp_mag = apply_compensation(notched_mag, mask_db_t, gain)
+            comp_mag = torch.nan_to_num(comp_mag, nan=0.0, posinf=0.0, neginf=0.0)
 
             # Reconstruct time-domain with notched phase for perceptual loss
             notched_phase = notched_stft / (notched_mag + 1e-8)
@@ -296,12 +298,14 @@ def train():
             # Choose target: clean vs mic (notched)
             target_mag = clean_mag if args.perceptual_target == 'clean' else notched_mag
             target_wav = clean_wav_t if args.perceptual_target == 'clean' else torch.istft(notched_stft, N_FFT, HOP, N_FFT, window)
+            target_wav = torch.nan_to_num(target_wav, nan=0.0, posinf=0.0, neginf=0.0)
 
             mel_loss = mel_compensation_loss(comp_mag, target_mag, mel_fb, harm_t)
             id_loss = identity_preservation_loss(comp_mag, notched_mag, mask_db_t)
             smooth_loss = temporal_smoothness_loss(gain, mask_db_t)
             gain_reg = (gain ** 2 * repair_region_from_mask(mask_db_t)).mean()
-            perceptual_loss = multires_stft_loss(restored_wav, target_wav)
+            perceptual_loss = multires_stft_loss(torch.nan_to_num(restored_wav, nan=0.0, posinf=0.0, neginf=0.0),
+                                                 target_wav)
 
             loss = (mel_loss
                     + args.identity_w * id_loss
