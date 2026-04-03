@@ -295,7 +295,7 @@ def train():
             harm_t = spectral[0, 1]
             # Choose target: clean vs mic (notched)
             target_mag = clean_mag if args.perceptual_target == 'clean' else notched_mag
-            target_wav = clean_wav_t if args.perceptual_target == 'clean' else torch.from_numpy(notched_np).to(device).unsqueeze(0)
+            target_wav = clean_wav_t if args.perceptual_target == 'clean' else torch.istft(notched_stft, N_FFT, HOP, N_FFT, window)
 
             mel_loss = mel_compensation_loss(comp_mag, target_mag, mel_fb, harm_t)
             id_loss = identity_preservation_loss(comp_mag, notched_mag, mask_db_t)
