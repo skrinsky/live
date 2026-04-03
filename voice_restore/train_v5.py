@@ -53,6 +53,7 @@ SMOOTH_W = 0.05
 RESIDUAL_REG_W = 0.0
 RESIDUAL_TARGET_FLOOR = 0.05
 RESIDUAL_FLOOR = 0.05
+SHOULDER_ACTIVE_T = 0.02
 
 
 def smooth_log_spectrum(mag: torch.Tensor, kernel_size: int = ENV_KERNEL) -> torch.Tensor:
@@ -84,7 +85,7 @@ def target_residual_from_gain(target_gain: torch.Tensor,
     shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
     # Keep a small prior residual in active shoulder regions so refinement does
     # not collapse to all-zero when baseline alone already reduces loss.
-    target_res = torch.maximum(target_res, RESIDUAL_TARGET_FLOOR * (shoulder > 0.05).float())
+    target_res = torch.maximum(target_res, RESIDUAL_TARGET_FLOOR * (shoulder > SHOULDER_ACTIVE_T).float())
     return target_res
 
 
@@ -92,7 +93,7 @@ def apply_residual_floor(raw_residual: torch.Tensor,
                          mask_db_t: torch.Tensor,
                          residual_floor: float) -> torch.Tensor:
     shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
-    floor_mask = (shoulder > 0.05).float() * residual_floor
+    floor_mask = (shoulder > SHOULDER_ACTIVE_T).float() * residual_floor
     return torch.maximum(raw_residual, floor_mask)
 
 

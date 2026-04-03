@@ -20,13 +20,14 @@ from voice_restore import train as v1_train  # noqa: E402
 
 CKPT = PROJECT_ROOT / "checkpoints" / "voice_restore_v5" / "best.pt"
 RESIDUAL_FLOOR = 0.05
+SHOULDER_ACTIVE_T = 0.02
 
 
 def apply_residual_floor(raw_residual: torch.Tensor,
                          mask_db_t: torch.Tensor,
                          residual_floor: float) -> torch.Tensor:
     shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
-    floor_mask = (shoulder > 0.05).float() * residual_floor
+    floor_mask = (shoulder > SHOULDER_ACTIVE_T).float() * residual_floor
     return torch.maximum(raw_residual, floor_mask)
 
 
