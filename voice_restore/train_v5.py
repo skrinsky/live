@@ -52,6 +52,7 @@ IDENTITY_W = 0.05
 SMOOTH_W = 0.05
 RESIDUAL_REG_W = 0.0
 RESIDUAL_TARGET_FLOOR = 0.05
+RESIDUAL_FLOOR = 0.05
 
 
 def smooth_log_spectrum(mag: torch.Tensor, kernel_size: int = ENV_KERNEL) -> torch.Tensor:
@@ -85,6 +86,14 @@ def target_residual_from_gain(target_gain: torch.Tensor,
     # not collapse to all-zero when baseline alone already reduces loss.
     target_res = torch.maximum(target_res, RESIDUAL_TARGET_FLOOR * (shoulder > 0.05).float())
     return target_res
+
+
+def apply_residual_floor(raw_residual: torch.Tensor,
+                         mask_db_t: torch.Tensor,
+                         residual_floor: float) -> torch.Tensor:
+    shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
+    floor_mask = (shoulder > 0.05).float() * residual_floor
+    return torch.maximum(raw_residual, floor_mask)
 
 
 def residual_target_loss(raw_residual: torch.Tensor,
@@ -200,6 +209,7 @@ def train() -> None:
     ap.add_argument("--identity-w", type=float, default=IDENTITY_W)
     ap.add_argument("--smooth-w", type=float, default=SMOOTH_W)
     ap.add_argument("--residual-reg-w", type=float, default=RESIDUAL_REG_W)
+    ap.add_argument("--residual-floor", type=float, default=RESIDUAL_FLOOR)
     args, _ = ap.parse_known_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -291,6 +301,7 @@ def train() -> None:
 
             raw_residual, _ = model(spectral, cond)
             raw_residual = torch.nan_to_num(raw_residual, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+            raw_residual = apply_residual_floor(raw_residual, mask_db_t, args.residual_floor)
             comp_mag, base_gain, eff_gain = apply_compensation(notched_mag, mask_db_t, raw_residual)
             comp_mag = torch.nan_to_num(comp_mag, nan=0.0, posinf=0.0, neginf=0.0)
 

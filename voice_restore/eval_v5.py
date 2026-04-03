@@ -14,11 +14,20 @@ from scipy.signal import lfilter
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from voice_restore.model_v5 import HOP, N_FFT, SR, VoiceRestorerV5, apply_compensation  # noqa: E402
+from voice_restore.model_v5 import HOP, N_FFT, SR, VoiceRestorerV5, apply_compensation, repair_region_from_mask  # noqa: E402
 from voice_restore.features_v5 import make_v5_inputs  # noqa: E402
 from voice_restore import train as v1_train  # noqa: E402
 
 CKPT = PROJECT_ROOT / "checkpoints" / "voice_restore_v5" / "best.pt"
+RESIDUAL_FLOOR = 0.05
+
+
+def apply_residual_floor(raw_residual: torch.Tensor,
+                         mask_db_t: torch.Tensor,
+                         residual_floor: float) -> torch.Tensor:
+    shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
+    floor_mask = (shoulder > 0.05).float() * residual_floor
+    return torch.maximum(raw_residual, floor_mask)
 
 
 def apply_static_notch(audio_np: np.ndarray, freq: float,
@@ -51,7 +60,7 @@ def extract_f0_direct(audio_np: np.ndarray, device: str = "cpu"):
     return f0_np, conf_np
 
 
-def run_eval(input_path: str, notch_specs: list[tuple], ckpt_path: Path, out_dir: Path):
+def run_eval(input_path: str, notch_specs: list[tuple], ckpt_path: Path, out_dir: Path, residual_floor: float):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     window = torch.hann_window(N_FFT).sqrt().to(device)
 
@@ -98,6 +107,7 @@ def run_eval(input_path: str, notch_specs: list[tuple], ckpt_path: Path, out_dir
     with torch.no_grad():
         raw_residual, _ = model(spectral, cond)
     raw_residual = torch.nan_to_num(raw_residual, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+    raw_residual = apply_residual_floor(raw_residual, mask_db_t, residual_floor)
 
     comp_mag, base_gain, eff_gain = apply_compensation(notched_mag, mask_db_t, raw_residual)
     comp_mag = comp_mag[0]
@@ -156,6 +166,7 @@ def main():
     ap.add_argument("--notch", action="append", metavar="FREQ:DEPTH:Q")
     ap.add_argument("--checkpoint", default=str(CKPT))
     ap.add_argument("--out-dir", default=str(PROJECT_ROOT / "data" / "eval_restore_v5"))
+    ap.add_argument("--residual-floor", type=float, default=RESIDUAL_FLOOR)
     args = ap.parse_args()
 
     if args.notch:
@@ -172,9 +183,8 @@ def main():
             (random.uniform(2000, 6000), random.uniform(-36, -18), random.uniform(10, 25)),
         ]
 
-    run_eval(args.input, notch_specs, Path(args.checkpoint), Path(args.out_dir))
+    run_eval(args.input, notch_specs, Path(args.checkpoint), Path(args.out_dir), args.residual_floor)
 
 
 if __name__ == "__main__":
     main()
-
