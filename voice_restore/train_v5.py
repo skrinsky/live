@@ -50,7 +50,8 @@ ENV_MATCH_W = 1.0
 RESIDUAL_TARGET_W = 0.75
 IDENTITY_W = 0.05
 SMOOTH_W = 0.05
-RESIDUAL_REG_W = 0.01
+RESIDUAL_REG_W = 0.0
+RESIDUAL_TARGET_FLOOR = 0.05
 
 
 def smooth_log_spectrum(mag: torch.Tensor, kernel_size: int = ENV_KERNEL) -> torch.Tensor:
@@ -75,9 +76,14 @@ def target_gain_from_envelope(clean_mag: torch.Tensor,
 
 
 def target_residual_from_gain(target_gain: torch.Tensor,
-                              base_gain: torch.Tensor) -> torch.Tensor:
+                              base_gain: torch.Tensor,
+                              mask_db_t: torch.Tensor) -> torch.Tensor:
     denom = (base_gain + 1e-4)
     target_res = ((target_gain - base_gain).clamp(min=0.0) / denom).clamp(0.0, 1.0)
+    shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
+    # Keep a small prior residual in active shoulder regions so refinement does
+    # not collapse to all-zero when baseline alone already reduces loss.
+    target_res = torch.maximum(target_res, RESIDUAL_TARGET_FLOOR * (shoulder > 0.05).float())
     return target_res
 
 
@@ -289,7 +295,7 @@ def train() -> None:
             comp_mag = torch.nan_to_num(comp_mag, nan=0.0, posinf=0.0, neginf=0.0)
 
             target_gain = target_gain_from_envelope(clean_mag, notched_mag, mask_db_t, kernel_size=args.env_kernel)
-            target_res = target_residual_from_gain(target_gain, compute_base_gain(mask_db_t))
+            target_res = target_residual_from_gain(target_gain, compute_base_gain(mask_db_t), mask_db_t)
 
             env_match = envelope_match_loss(comp_mag, clean_mag, mask_db_t, kernel_size=args.env_kernel)
             res_tgt = residual_target_loss(raw_residual, target_res, mask_db_t)
@@ -368,4 +374,3 @@ def train() -> None:
 
 if __name__ == "__main__":
     train()
-
