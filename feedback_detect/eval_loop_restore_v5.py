@@ -60,7 +60,7 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
         mic_block = (voice_np[s:s+HOP].astype(np.float64) +
                      noise_np[s:s+HOP].astype(np.float64) +
                      acc[s:s+HOP])
-        mic_block = np.tanh(mic_block).astype(np.float32)
+        mic_block = np.clip(mic_block, -1.0, 1.0).astype(np.float32)
         mic_out[s:s+HOP] = mic_block
 
         analysis_buf = np.roll(analysis_buf, -HOP)
