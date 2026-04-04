@@ -248,8 +248,9 @@ class NotchBank:
     # ── private ───────────────────────────────────────────────────────────────
 
     def _initial_q(self, freq_hz: float) -> float:
-        """Narrow starting Q — proportional to frequency, floored at 2."""
-        return max(2.0, freq_hz / self.INITIAL_BW_HZ)
+        """Starting Q — proportional to frequency, floored at 2, capped at 30.
+        Below ~3 kHz: wider than old fixed Q=30. Above ~3 kHz: same as old Q=30."""
+        return max(2.0, min(30.0, freq_hz / self.INITIAL_BW_HZ))
 
     def _min_q(self, freq_hz: float) -> float:
         """Widest allowed Q — same absolute floor as before (MIN_Q_ABS=5)."""
