@@ -100,6 +100,47 @@ class FeedbackPredictor:
 
     # ── public API ────────────────────────────────────────────────────────────
 
+    def seed_from_ir(self, ir: np.ndarray, gain: float,
+                     n_fft: int = 4096, top_n: int = 16,
+                     peak_db_above_mean: float = 3.0):
+        """
+        Seed the risk table from the loop IR before any ring has been observed.
+
+        Finds the top-N spectral peaks in the loop's frequency response (IR × gain)
+        that stand above the mean by at least peak_db_above_mean dB, and assigns
+        each a risk value of RISK_THRESHOLD - 0.5 across all voice states so they
+        fire pre-emption on the very first sub-threshold detector hint.
+
+        In real-world use the equivalent is a brief soundcheck sweep measurement.
+        """
+        spectrum = np.abs(np.fft.rfft(ir, n=n_fft)) * gain
+        freqs    = np.fft.rfftfreq(n_fft, d=1.0 / self.sr)
+        db       = 20.0 * np.log10(spectrum + 1e-8)
+        mean_db  = float(db[(freqs >= 80.0)].mean())
+
+        # Find local peaks above threshold, ignore DC and Nyquist edges
+        candidates = []
+        for i in range(1, len(db) - 1):
+            if freqs[i] < 80.0:
+                continue
+            if db[i] > db[i-1] and db[i] > db[i+1] and db[i] > mean_db + peak_db_above_mean:
+                candidates.append((db[i], float(freqs[i])))
+        candidates.sort(reverse=True)
+
+        seeded = 0
+        for _, freq in candidates[:top_n]:
+            existing = self._find_close(freq)
+            key = existing if existing is not None else freq
+            if key not in self._risk:
+                self._risk[key] = np.zeros(self.N_STATES, dtype=np.float32)
+            # Set just below threshold — one real ring event pushes it over
+            self._risk[key][:] = np.maximum(
+                self._risk[key], self.RISK_THRESHOLD - 0.5)
+            seeded += 1
+
+        print(f'[FeedbackPredictor] seeded {seeded} IR-derived risk entries '
+              f'(mean loop gain {mean_db:.1f} dB, threshold +{peak_db_above_mean} dB)')
+
     def update(self,
                stft_mag_np:    np.ndarray,
                prob_np:        np.ndarray,

@@ -189,6 +189,7 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     print('Running detector + NotchBank loop…')
     profile_path = PROJECT_ROOT / 'data' / 'feedback_risk_profile.json'
     predictor  = FeedbackPredictor(_bin_freqs, sr=SR, profile_path=profile_path)
+    predictor.seed_from_ir(ir, gain=gain)
     notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
     mic_sup, box_sup, notch_logs = simulate_notch(
         voice_np, noise_np, ir, gain=gain,
