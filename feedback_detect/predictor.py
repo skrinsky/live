@@ -130,8 +130,15 @@ class FeedbackPredictor:
         try:
             with open(self.profile_path) as fh:
                 data = json.load(fh)
-            self._risk = {float(k): np.array(v, dtype=np.float32)
-                          for k, v in data.items()}
+            self._risk = {}
+            for k, v in data.items():
+                arr = np.array(v, dtype=np.float32)
+                if arr.ndim == 0:
+                    # old scalar format — discard, start fresh for this entry
+                    continue
+                if arr.shape != (self.N_STATES,):
+                    continue
+                self._risk[float(k)] = arr
             print(f'[FeedbackPredictor] loaded {len(self._risk)} voice-conditioned '
                   f'risk entries from {self.profile_path}')
         except (json.JSONDecodeError, ValueError):
