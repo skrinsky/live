@@ -102,10 +102,10 @@ def main():
     print(f'\n{"t":>5}  {"peakiness":>9}  {"freq":>7}   ring?\n' + '-' * 50)
     for t, pk, freq in results:
         bl  = baseline.get(int(t), 1.0)
-        adj = pk / max(bl, 1.0)   # subtract baseline voice peakiness
-        flag = '  ← RING' if pk >= args.threshold else ''
-        b    = bar(pk, threshold=args.threshold)
-        print(f'{t:5.1f}s  {pk:9.1f}  {freq:6.0f}Hz  {b}{flag}')
+        adj = pk / max(bl, 1.0)   # ratio vs clean reference — >1 means suppressor left extra peakiness
+        flag = '  ← RING' if adj >= args.threshold else ''
+        b    = bar(adj, threshold=args.threshold)
+        print(f'{t:5.1f}s  {adj:9.2f}x  {freq:6.0f}Hz  {b}{flag}')
 
 
 if __name__ == '__main__':
