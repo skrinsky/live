@@ -120,9 +120,9 @@ class NotchBank:
     MAX_NOTCHES           = 24
     FREQ_TOL_HZ           = 150     # Hz — bins within this are the same resonance
     RELEASE_STEP_DB       = 6.0     # give back this many dB per probe step
-    HOLD_FRAMES_PER_STEP  = 2       # frames between probe steps (~20ms at 100fps)
+    HOLD_FRAMES_PER_STEP  = 1       # frames between probe steps (~10ms at 100fps)
     LOCKED_HOLD_FRAMES    = 500     # frames between probes once locked (~5s at 100fps)
-    LOCK_THRESHOLD        = 3       # re-triggers to declare minimum found → lock in
+    LOCK_THRESHOLD        = 2       # re-triggers to declare minimum found → lock in
     IDLE_FRAMES_TO_EXPIRE = 6000    # frames at 0dB with no detection before removal (~60s)
     HARMONIC_PROB_THRESH  = 0.15    # sub-threshold prob to trigger harmonic pre-emption
     HARMONIC_DEPTH_DB     = -12.0   # initial depth for harmonic notches
@@ -133,7 +133,7 @@ class NotchBank:
     # Floors prevent Q from going below 2 (useless notch) or above 200 (inaudible BW).
     INITIAL_BW_HZ         = 50.0
     MIN_Q_ABS             = 5.0     # absolute floor — matches old MIN_Q, ensures rings are caught
-    Q_WIDEN_FACTOR        = 0.75    # multiply Q by this when re-triggered at full depth
+    Q_WIDEN_FACTOR        = 0.65    # multiply Q by this when re-triggered at full depth
 
     def __init__(self, sr=48000, q=30.0, depth_db=-48.0):
         self.sr            = sr
