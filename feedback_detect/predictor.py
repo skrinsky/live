@@ -93,6 +93,7 @@ class FeedbackPredictor:
         # risk[freq_hz] = np.array of shape (N_STATES,)
         self._risk: dict[float, np.ndarray] = {}
         self._decay_acc = 0
+        self._prev_slammed: set[float] = set()   # notches that were at full depth last frame
 
         if self.profile_path:
             self.load()
@@ -183,9 +184,12 @@ class FeedbackPredictor:
     def _accumulate(self,
                     active_notches: 'list[tuple[float, float, float]]',
                     state: int):
-        for freq, depth_db, _ in active_notches:
-            if depth_db > -40.0:   # only fully-slammed notches
-                continue
+        # Only credit the voice state at ONSET (first frame the notch slams to full depth).
+        # Counting every frame produces equal scores across all voice states regardless
+        # of which state actually caused the ring.
+        currently_slammed = {freq for freq, depth, _ in active_notches if depth <= -40.0}
+        new_onsets = currently_slammed - self._prev_slammed
+        for freq in new_onsets:
             existing = self._find_close(freq)
             if existing is not None:
                 self._risk[existing][state] = min(
@@ -194,6 +198,7 @@ class FeedbackPredictor:
                 r = np.zeros(self.N_STATES, dtype=np.float32)
                 r[state] = self.RISK_INCREMENT
                 self._risk[freq] = r
+        self._prev_slammed = currently_slammed
 
     def _get_preemptive(self, prob_np: np.ndarray, state: int) -> list[float]:
         preemptive = []
