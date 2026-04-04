@@ -127,8 +127,12 @@ class NotchBank:
     HARMONIC_PROB_THRESH  = 0.15    # sub-threshold prob to trigger harmonic pre-emption
     HARMONIC_DEPTH_DB     = -12.0   # initial depth for harmonic notches
     HARMONIC_MULTIPLES    = (2, 3, 4, 5)
-    MAX_Q                 = 30.0    # starting Q (surgical) — widen only if provably needed
-    MIN_Q                 = 5.0     # widest allowed Q — last resort, ~200Hz BW at 1kHz
+    # Q is frequency-proportional so bandwidth stays perceptually consistent.
+    # INITIAL_BW_HZ: surgical starting cut (~50 Hz at 1 kHz → Q=20)
+    # MAX_BW_HZ:     widest allowed cut  (~200 Hz at 1 kHz → Q=5)
+    # Floors prevent Q from going below 2 (useless notch) or above 200 (inaudible BW).
+    INITIAL_BW_HZ         = 50.0
+    MAX_BW_HZ             = 200.0
     Q_WIDEN_FACTOR        = 0.75    # multiply Q by this when re-triggered at full depth
 
     def __init__(self, sr=48000, q=30.0, depth_db=-48.0):
@@ -229,6 +233,14 @@ class NotchBank:
 
     # ── private ───────────────────────────────────────────────────────────────
 
+    def _initial_q(self, freq_hz: float) -> float:
+        """Narrow starting Q — proportional to frequency, floored at 2."""
+        return max(2.0, freq_hz / self.INITIAL_BW_HZ)
+
+    def _min_q(self, freq_hz: float) -> float:
+        """Widest allowed Q — proportional to frequency, floored at 1.5."""
+        return max(1.5, freq_hz / self.MAX_BW_HZ)
+
     def _retrigger(self, freq: float):
         """
         Slam depth to max. Widen Q only if already at max depth — width is the problem.
@@ -238,7 +250,7 @@ class NotchBank:
         at_max_depth = state[1] <= self.max_depth_db + 0.1   # already fully slammed
         # Only widen Q when depth alone isn't enough
         if at_max_depth:
-            new_q = max(self.MIN_Q, state[3] * self.Q_WIDEN_FACTOR)
+            new_q = max(self._min_q(freq), state[3] * self.Q_WIDEN_FACTOR)
             if new_q != state[3]:
                 state[3] = new_q
                 state[0].set_q(new_q)
@@ -263,6 +275,7 @@ class NotchBank:
             # Evict the shallowest notch (most released, least active)
             shallowest = max(self._notches, key=lambda f: self._notches[f][1])
             del self._notches[shallowest]
-        notch = BiquadNotch(freq, sr=self.sr, q=self.MAX_Q, depth_db=depth_db)
-        self._notches[freq] = [notch, depth_db, self.HOLD_FRAMES_PER_STEP, self.MAX_Q, 0]
+        q0 = self._initial_q(freq)
+        notch = BiquadNotch(freq, sr=self.sr, q=q0, depth_db=depth_db)
+        self._notches[freq] = [notch, depth_db, self.HOLD_FRAMES_PER_STEP, q0, 0]
         return freq
