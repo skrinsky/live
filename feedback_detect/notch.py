@@ -119,7 +119,7 @@ class NotchBank:
 
     MAX_NOTCHES           = 24
     FREQ_TOL_HZ           = 150     # Hz — bins within this are the same resonance
-    RELEASE_STEP_DB       = 6.0     # give back this many dB per probe step
+    RELEASE_STEP_DB       = 3.0     # give back this many dB per probe step
     HOLD_FRAMES_PER_STEP  = 50      # frames between probe steps (~500ms at 100fps)
     LOCKED_HOLD_FRAMES    = 500     # frames between probes once locked (~5s at 100fps)
     LOCK_THRESHOLD        = 2       # re-triggers to declare minimum found → lock in
