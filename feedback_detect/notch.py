@@ -126,6 +126,7 @@ class NotchBank:
     IDLE_FRAMES_TO_EXPIRE = 6000    # frames at 0dB with no detection before removal (~60s)
     HARMONIC_PROB_THRESH  = 0.15    # sub-threshold prob to trigger harmonic pre-emption
     HARMONIC_DEPTH_DB     = -12.0   # initial depth for harmonic notches
+    PREEMPTIVE_DEPTH_DB   = -24.0   # initial depth for risk-based pre-emptive notches
     HARMONIC_MULTIPLES    = (2, 3, 4, 5)
     # Q is frequency-proportional so bandwidth stays perceptually consistent.
     # INITIAL_BW_HZ: surgical starting cut (~50 Hz at 1 kHz → Q=20)
@@ -145,8 +146,9 @@ class NotchBank:
     # ── public ────────────────────────────────────────────────────────────────
 
     def update(self, detected_freqs: list[float],
-               bin_freqs: 'np.ndarray | None' = None,
-               prob_np:   'np.ndarray | None' = None):
+               bin_freqs:        'np.ndarray | None' = None,
+               prob_np:          'np.ndarray | None' = None,
+               preemptive_freqs: 'list[float] | None' = None):
         """
         Drive cold/warm attack, adaptive Q, stepped release, harmonic pre-emption.
         Call once per audio frame, before process().
@@ -184,6 +186,18 @@ class NotchBank:
                     else:
                         key = self._add(h_freq, self.HARMONIC_DEPTH_DB)
                         triggered.add(key)
+
+        # ── Risk-based pre-emptive notches ───────────────────────────────
+        if preemptive_freqs:
+            for freq in preemptive_freqs:
+                existing = self._find_close(freq)
+                if existing is not None:
+                    triggered.add(existing)
+                    # Don't slam to max depth — just hold at current depth
+                    self._notches[existing][2] = self.HOLD_FRAMES_PER_STEP
+                else:
+                    key = self._add(freq, self.PREEMPTIVE_DEPTH_DB)
+                    triggered.add(key)
 
         # ── Stepped release / idle expiry for untriggered notches ─────────
         for freq in list(self._notches):
