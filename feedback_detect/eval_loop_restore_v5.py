@@ -167,8 +167,14 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
         if vsr != SR:
             raise ValueError(f'Vocal SR={vsr}, expected {SR}')
         v = sosfilt(_hpf_sos, v).astype(np.float32)
+        print(f'  vocal file: {vocal_path_used.name}  ({len(v)/SR:.1f}s)')
         if len(v) < n:
-            v = np.tile(v, n // len(v) + 1)
+            # Crossfade tile boundaries to avoid phase discontinuities
+            fade = min(int(0.05 * SR), len(v) // 8)   # 50ms fade
+            v_fade = v.copy()
+            v_fade[:fade]  *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            v_fade[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+            v = np.tile(v_fade, n // len(v) + 1)
         voice_np = v[:n]
     else:
         t = np.linspace(0, duration_s, n, dtype=np.float32)
