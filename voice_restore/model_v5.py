@@ -58,7 +58,7 @@ def notch_strength_from_mask(notch_mask_db: torch.Tensor) -> torch.Tensor:
     return (-notch_mask_db / MAX_NOTCH_DB).clamp(0.0, 1.0)
 
 
-def repair_region_from_mask(notch_mask_db: torch.Tensor, kernel_size: int = 25) -> torch.Tensor:
+def repair_region_from_mask(notch_mask_db: torch.Tensor, kernel_size: int = 101) -> torch.Tensor:
     strength = notch_strength_from_mask(notch_mask_db)
     pad = kernel_size // 2
     region = torch.nn.functional.avg_pool1d(
