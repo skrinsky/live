@@ -124,7 +124,7 @@ class NotchBank:
     LOCKED_HOLD_FRAMES    = 500     # frames between probes once locked (~5s at 100fps)
     LOCK_THRESHOLD        = 2       # re-triggers to declare minimum found → lock in
     IDLE_FRAMES_TO_EXPIRE = 6000    # frames at 0dB with no detection before removal (~60s)
-    HARMONIC_PROB_THRESH  = 0.15    # sub-threshold prob to trigger harmonic pre-emption
+    HARMONIC_PROB_THRESH  = 0.50    # prob to trigger harmonic pre-emption — must be clearly ringing
     HARMONIC_DEPTH_DB     = -12.0   # initial depth for harmonic notches
     PREEMPTIVE_DEPTH_DB   = -24.0   # initial depth for risk-based pre-emptive notches
     HARMONIC_MULTIPLES    = (2, 3, 4, 5)
