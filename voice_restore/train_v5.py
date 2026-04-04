@@ -74,11 +74,19 @@ def target_gain_from_notch(mask_db_t: torch.Tensor) -> torch.Tensor:
     shoulder bins have no measurable energy difference vs. clean — their target
     would always be zero. Instead, derive the target directly from the mask:
     deeper notch nearby → higher target boost at shoulder bins.
+
+    Shoulder must be normalised (same as compute_base_gain) so target_gain
+    reaches TARGET_NOTCH_GAIN_SCALE at the best shoulder bin. Without
+    normalisation, raw repair_region values (~0.02–0.05) are smaller than
+    base_gain (0.10), so (target_gain - base_gain).clamp(0) = 0 and only
+    the floor survives.
     """
-    shoulder = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
-    # Peak notch strength anywhere in the frame, broadcast to all bins
+    shoulder_raw = repair_region_from_mask(mask_db_t) * (mask_db_t > -3.0).float()
+    shoulder_peak = shoulder_raw.amax(dim=1, keepdim=True).clamp(min=1e-6)
+    shoulder_norm = (shoulder_raw / shoulder_peak).clamp(0.0, 1.0)
+    shoulder_gate = (shoulder_raw > SHOULDER_ACTIVE_T).float()
     peak_strength = notch_strength_from_mask(mask_db_t).amax(dim=1, keepdim=True).clamp(0.0, 1.0)
-    target_gain = shoulder * peak_strength * TARGET_NOTCH_GAIN_SCALE
+    target_gain = shoulder_norm * shoulder_gate * peak_strength * TARGET_NOTCH_GAIN_SCALE
     return target_gain.clamp(0.0, 1.0)
 
 
