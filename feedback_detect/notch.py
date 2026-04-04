@@ -120,7 +120,7 @@ class NotchBank:
     MAX_NOTCHES           = 24
     FREQ_TOL_HZ           = 150     # Hz — bins within this are the same resonance
     RELEASE_STEP_DB       = 6.0     # give back this many dB per probe step
-    HOLD_FRAMES_PER_STEP  = 1       # frames between probe steps (~10ms at 100fps)
+    HOLD_FRAMES_PER_STEP  = 50      # frames between probe steps (~500ms at 100fps)
     LOCKED_HOLD_FRAMES    = 500     # frames between probes once locked (~5s at 100fps)
     LOCK_THRESHOLD        = 2       # re-triggers to declare minimum found → lock in
     IDLE_FRAMES_TO_EXPIRE = 6000    # frames at 0dB with no detection before removal (~60s)
@@ -222,7 +222,6 @@ class NotchBank:
                     else:
                         # Normal probe step — release depth only, Q stays where it is
                         self._notches[freq][1] = new_depth
-                        self._notches[freq][4] = 0
                         self._notches[freq][2] = self.HOLD_FRAMES_PER_STEP
                         self._notches[freq][0].set_depth(new_depth)
 
