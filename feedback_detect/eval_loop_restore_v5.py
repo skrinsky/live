@@ -29,7 +29,8 @@ from feedback_detect.live import _cluster_bins
 from feedback_detect.eval_loop import _rms_db
 
 from voice_restore.model_v5 import VoiceRestorerV5, apply_compensation
-from voice_restore.model_v5 import N_FREQ as VR_N_FREQ, N_FFT as VR_N_FFT, HOP as VR_HOP
+from voice_restore.model_v5 import N_FREQ as VR_N_FREQ, N_FFT as VR_N_FFT
+VR_HOP = VR_N_FFT // 2   # 512 — 50% overlap required for perfect OLA with sqrt-Hann window
 from voice_restore.features_v5 import make_v5_inputs
 from voice_restore import train as vr_train
 
