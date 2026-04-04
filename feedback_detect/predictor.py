@@ -79,7 +79,7 @@ class FeedbackPredictor:
     PREEMPTIVE_DEPTH_DB = -36.0
 
     # ── Matching ──────────────────────────────────────────────────────────────
-    FREQ_TOL_HZ = 150
+    FREQ_TOL_RATIO = 0.18   # ±18% (~3 semitones) — log-scale mode matching
 
     def __init__(self,
                  bin_freqs:    np.ndarray,
@@ -212,6 +212,6 @@ class FeedbackPredictor:
 
     def _find_close(self, freq: float) -> 'float | None':
         for existing in self._risk:
-            if abs(existing - freq) < self.FREQ_TOL_HZ:
+            if abs(existing - freq) / freq < self.FREQ_TOL_RATIO:
                 return existing
         return None

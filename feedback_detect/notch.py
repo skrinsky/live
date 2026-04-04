@@ -118,7 +118,7 @@ class NotchBank:
     """
 
     MAX_NOTCHES           = 24
-    FREQ_TOL_HZ           = 150     # Hz — bins within this are the same resonance
+    FREQ_TOL_RATIO        = 0.18    # ±18% (~3 semitones) — log-scale mode matching
     RELEASE_STEP_DB       = 3.0     # give back this many dB per probe step
     HOLD_FRAMES_PER_STEP  = 50      # frames between probe steps (~500ms at 100fps)
     LOCKED_HOLD_FRAMES    = 500     # frames between probes once locked (~5s at 100fps)
@@ -277,9 +277,9 @@ class NotchBank:
                     else self.HOLD_FRAMES_PER_STEP)
 
     def _find_close(self, freq: float) -> float | None:
-        """Return the existing notch frequency closest to freq, if within FREQ_TOL_HZ."""
+        """Return the existing notch frequency closest to freq, if within FREQ_TOL_RATIO."""
         for existing in self._notches:
-            if abs(existing - freq) < self.FREQ_TOL_HZ:
+            if abs(existing - freq) / freq < self.FREQ_TOL_RATIO:
                 return existing
         return None
 
