@@ -132,7 +132,7 @@ class NotchBank:
     # INITIAL_BW_HZ: surgical starting cut (~50 Hz at 1 kHz → Q=20)
     # MAX_BW_HZ:     widest allowed cut  (~200 Hz at 1 kHz → Q=5)
     # Floors prevent Q from going below 2 (useless notch) or above 200 (inaudible BW).
-    INITIAL_BW_HZ         = 50.0
+    INITIAL_BW_HZ         = 100.0
     MIN_Q_ABS             = 5.0     # absolute floor — matches old MIN_Q, ensures rings are caught
     Q_WIDEN_FACTOR        = 0.65    # multiply Q by this when re-triggered at full depth
 

@@ -67,7 +67,7 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
         analysis_buf[-HOP:] = mic_block
 
         buf_t = torch.from_numpy(analysis_buf).unsqueeze(0).to(device)
-        stft  = torch.stft(buf_t, N_FFT, N_FFT, N_FFT, window, return_complex=True)
+        stft  = torch.stft(buf_t, N_FFT, N_FFT, N_FFT, window, center=False, return_complex=True)
         mag   = stft.abs()
 
         lm_now            = torch.log(mag[0, :, 0] + 1e-8).cpu().numpy()
@@ -197,7 +197,7 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     # Use voice_restore FFT params (N_FFT=1024, HOP=480) — restorer expects 513 bins
     window_res   = torch.hann_window(VR_N_FFT).sqrt()
     notched_t    = torch.from_numpy(box_sup).unsqueeze(0)
-    notched_stft = torch.stft(notched_t, VR_N_FFT, VR_HOP, VR_N_FFT, window_res, return_complex=True)
+    notched_stft = torch.stft(notched_t, VR_N_FFT, VR_HOP, VR_N_FFT, window_res, center=False, return_complex=True)
     notched_mag  = notched_stft.abs()
     T_stft       = int(notched_mag.shape[-1])
 
@@ -248,7 +248,7 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     restored_stft = comp_mag * notched_phase
     restored_stft = torch.where(torch.isfinite(restored_stft),
                                 restored_stft, torch.zeros_like(restored_stft))
-    restored_wav  = torch.istft(restored_stft, VR_N_FFT, VR_HOP, VR_N_FFT, window_res)[0].numpy()
+    restored_wav  = torch.istft(restored_stft, VR_N_FFT, VR_HOP, VR_N_FFT, window_res, center=False)[0].numpy()
 
     L = min(len(box_sup), len(restored_wav))
 
