@@ -74,9 +74,9 @@ class FeedbackPredictor:
     RISK_MIN_KEEP     = 0.05
 
     # ── Pre-trigger ───────────────────────────────────────────────────────────
-    RISK_THRESHOLD      = 3.0    # must ring this many times in a voice state to pre-trigger
-    PRE_TRIGGER_PROB    = 0.15   # sub-threshold detector prob to fire pre-emption
-    PREEMPTIVE_DEPTH_DB = -24.0
+    RISK_THRESHOLD      = 2.0    # must ring this many times in a voice state to pre-trigger
+    PRE_TRIGGER_PROB    = 0.05   # sub-threshold detector prob to fire pre-emption
+    PREEMPTIVE_DEPTH_DB = -36.0
 
     # ── Matching ──────────────────────────────────────────────────────────────
     FREQ_TOL_HZ = 150
