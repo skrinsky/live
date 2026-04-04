@@ -132,7 +132,8 @@ class NotchBank:
     # MAX_BW_HZ:     widest allowed cut  (~200 Hz at 1 kHz → Q=5)
     # Floors prevent Q from going below 2 (useless notch) or above 200 (inaudible BW).
     INITIAL_BW_HZ         = 50.0
-    MAX_BW_HZ             = 200.0
+    MAX_BW_HZ             = 400.0
+    MIN_Q_ABS             = 3.0     # absolute floor — allows ~400 Hz BW at 1kHz if needed
     Q_WIDEN_FACTOR        = 0.75    # multiply Q by this when re-triggered at full depth
 
     def __init__(self, sr=48000, q=30.0, depth_db=-48.0):
@@ -238,8 +239,8 @@ class NotchBank:
         return max(2.0, freq_hz / self.INITIAL_BW_HZ)
 
     def _min_q(self, freq_hz: float) -> float:
-        """Widest allowed Q — proportional to frequency, floored at 1.5."""
-        return max(1.5, freq_hz / self.MAX_BW_HZ)
+        """Widest allowed Q — proportional to frequency, floored at MIN_Q_ABS."""
+        return max(self.MIN_Q_ABS, freq_hz / self.MAX_BW_HZ)
 
     def _retrigger(self, freq: float):
         """
