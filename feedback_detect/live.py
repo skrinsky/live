@@ -1,21 +1,21 @@
 """
-feedback_detect/live.py — Real-time feedback suppressor: detector + parametric notch.
+feedback_detect/live.py — Real-time feedback suppressor: detector + notch + predictor.
 
 Signal flow:
   mic input  →  STFT magnitude  →  FeedbackDetector  →  detected frequencies
                                                                ↓
   mic input  ──────────────────────────────────────→  NotchBank.process()  →  output
-
-The neural model runs on the STFT to decide WHAT to notch.
-The notch filters run on the raw time-domain signal — no STFT artifacts,
-no ISTFT, lower latency than the feedback_mask approach.
+                                         ↑
+                              FeedbackPredictor (voice-conditioned pre-emption)
 
 Usage:
     python feedback_detect/live.py
-    python feedback_detect/live.py --threshold 0.4 --q 40
+    python feedback_detect/live.py --threshold 0.25 --device 2
+    python -m sounddevice          # list available audio devices
 """
 
 import sys
+import signal
 import argparse
 import numpy as np
 import torch
@@ -26,89 +26,119 @@ from scipy.signal import butter, sosfilt
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / 'feedback_detect'))
 
-from model import FeedbackDetector, SR, N_FFT, HOP, N_FREQ
-from notch import NotchBank
+from model     import FeedbackDetector, SR, N_FFT, HOP, N_FREQ
+from notch     import NotchBank
+from predictor import FeedbackPredictor
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 CHECKPOINT    = PROJECT_ROOT / 'checkpoints' / 'feedback_detect' / 'best.pt'
-DETECT_THRESH = 0.5      # probability threshold to declare a bin in feedback
-MIN_FREQ_HZ   = 80.0     # ignore feedback detections below this (HPF region)
-NOTCH_Q       = 30.0     # Q for biquad notches
-NOTCH_DEPTH   = -24.0    # dB depth of each notch
-BLOCK_SIZE    = HOP      # samples per sounddevice callback (= one STFT frame)
+PROFILE_PATH  = PROJECT_ROOT / 'data' / 'feedback_risk_profile.json'
+DETECT_THRESH = 0.25
+MIN_FREQ_HZ   = 80.0
+NOTCH_DEPTH   = -48.0
+BLOCK_SIZE    = HOP      # samples per callback = one STFT frame (10 ms at 48 kHz)
+
+# Log-scale cluster tolerance — matches NotchBank.FREQ_TOL_RATIO
+CLUSTER_TOL_RATIO = 0.18
 
 
-def run(threshold=DETECT_THRESH, q=NOTCH_Q, depth_db=NOTCH_DEPTH, checkpoint=None):
-    ckpt_path = Path(checkpoint or CHECKPOINT)
+def _cluster_bins(bin_freqs: np.ndarray, prob: np.ndarray, mask: np.ndarray) -> list[float]:
+    """
+    Group above-threshold bins into clusters using log-scale frequency tolerance
+    and return the peak-probability frequency per cluster.
+    """
+    if not mask.any():
+        return []
+
+    indices = np.where(mask)[0]
+    clusters: list[list[int]] = []
+    current = [indices[0]]
+
+    for idx in indices[1:]:
+        # Merge bins within CLUSTER_TOL_RATIO of the cluster's current peak freq
+        cluster_freq = bin_freqs[current[np.argmax(prob[current])]]
+        if abs(bin_freqs[idx] - cluster_freq) / cluster_freq < CLUSTER_TOL_RATIO:
+            current.append(idx)
+        else:
+            clusters.append(current)
+            current = [idx]
+    clusters.append(current)
+
+    return [float(bin_freqs[c[np.argmax(prob[c])]]) for c in clusters]
+
+
+def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
+        checkpoint=None, profile=None, device=None):
+
+    ckpt_path    = Path(checkpoint or CHECKPOINT)
+    profile_path = Path(profile   or PROFILE_PATH)
     assert ckpt_path.exists(), f'No checkpoint at {ckpt_path} — train first.'
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    window = torch.hann_window(N_FFT).sqrt().to(device)
+    audio_device = device   # None → sounddevice default
 
-    model = FeedbackDetector().to(device).eval()
-    ckpt  = torch.load(str(ckpt_path), map_location=device)
+    torch_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    window = torch.hann_window(N_FFT).sqrt().to(torch_device)
+
+    model = FeedbackDetector().to(torch_device).eval()
+    ckpt  = torch.load(str(ckpt_path), map_location=torch_device)
     model.load_state_dict(ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt)
-    print(f'FeedbackDetector loaded from {ckpt_path}')
+    print(f'FeedbackDetector  loaded from {ckpt_path}')
 
-    notch_bank   = NotchBank(sr=SR, q=q, depth_db=depth_db)
-    hpf_sos      = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
+    bin_freqs  = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
+    predictor  = FeedbackPredictor(bin_freqs, sr=SR, profile_path=profile_path)
+    notch_bank = NotchBank(sr=SR, depth_db=depth_db)
+    hpf_sos    = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
 
-    # Analysis buffer: accumulate BLOCK_SIZE chunks into N_FFT window
+    # Per-session state (mutated inside callback via nonlocal)
     analysis_buf = np.zeros(N_FFT, dtype=np.float32)
-    # HPF state
     hpf_zi       = np.zeros((2, 1))
-    # GRU hidden state — persists across callbacks
     gru_h        = None
-    # Log-magnitude history for delta features (last 10 frames per bin)
     lm_history   = np.zeros((N_FREQ, 11), dtype=np.float32)
-
-    bin_freqs = np.fft.rfftfreq(N_FFT, d=1.0 / SR)   # Hz per bin
 
     def callback(indata, outdata, frames, time, status):
         nonlocal analysis_buf, hpf_zi, gru_h, lm_history
 
         # ── Pre-processing ────────────────────────────────────────────────
-        block = indata[:, 0].copy()                             # mono
+        block = indata[:, 0].copy()
         block_hpf, hpf_zi = sosfilt(hpf_sos, block, zi=hpf_zi)
         block_hpf = block_hpf.astype(np.float32)
 
-        # Shift analysis buffer and add new block
         analysis_buf = np.roll(analysis_buf, -BLOCK_SIZE)
         analysis_buf[-BLOCK_SIZE:] = block_hpf
 
         # ── Detection ─────────────────────────────────────────────────────
-        buf_t   = torch.from_numpy(analysis_buf).unsqueeze(0).to(device)
-        stft    = torch.stft(buf_t, N_FFT, N_FFT, N_FFT, window,
-                             return_complex=True)           # (1, N_FREQ, 1)
-        mag     = stft.abs()                                # (1, N_FREQ, 1)
+        buf_t = torch.from_numpy(analysis_buf).unsqueeze(0).to(torch_device)
+        stft  = torch.stft(buf_t, N_FFT, N_FFT, N_FFT, window,
+                           center=False, return_complex=True)
+        mag   = stft.abs()
 
-        # Build delta features from history buffer.
-        # torch.roll is useless with T=1 (delta=0 always), so we maintain
-        # lm_history manually.  lm_history[:, k] = log_mag from k frames ago.
-        lm_now  = torch.log(mag[0, :, 0] + 1e-8).cpu().numpy()  # (N_FREQ,)
-        lm_history = np.roll(lm_history, 1, axis=1)
-        lm_history[:, 0] = lm_now
+        lm_now             = torch.log(mag[0, :, 0] + 1e-8).cpu().numpy()
+        lm_history         = np.roll(lm_history, 1, axis=1)
+        lm_history[:, 0]   = lm_now
 
-        feat_np = np.stack([
+        feat_np  = np.stack([
             lm_history[:, 0],
             lm_history[:, 0] - lm_history[:, 1],
             lm_history[:, 0] - lm_history[:, 4],
             lm_history[:, 0] - lm_history[:, 10],
-        ], axis=0)                                          # (N_DELTA, N_FREQ)
-        features = torch.from_numpy(feat_np).to(device)
-        features = features.unsqueeze(0).unsqueeze(-1)     # (1, N_DELTA, N_FREQ, 1)
+        ], axis=0)
+        features = torch.from_numpy(feat_np).to(torch_device).unsqueeze(0).unsqueeze(-1)
 
         with torch.no_grad():
-            prob, gru_h = model(features, gru_h)           # (1, N_FREQ, 1)
+            prob, gru_h = model(features, gru_h)
 
-        prob_np = prob[0, :, 0].cpu().numpy()              # (N_FREQ,)
+        prob_np = prob[0, :, 0].cpu().numpy()
 
-        # Feedback bins: probability above threshold, above min frequency
-        above_thresh = (prob_np > threshold) & (bin_freqs >= MIN_FREQ_HZ) & (bin_freqs < SR / 2)
-        detected_freqs = _cluster_bins(bin_freqs, prob_np, above_thresh)
+        above         = (prob_np > threshold) & (bin_freqs >= MIN_FREQ_HZ) & (bin_freqs < SR / 2)
+        detected_freqs = _cluster_bins(bin_freqs, prob_np, above)
+
+        # ── Predictor (voice-conditioned pre-emption) ─────────────────────
+        preemptive = predictor.update(
+            mag[0, :, 0].cpu().numpy(), prob_np, notch_bank.active_notches)
 
         # ── Notch bank ────────────────────────────────────────────────────
-        notch_bank.update(detected_freqs, bin_freqs, prob_np)
+        notch_bank.update(detected_freqs, bin_freqs, prob_np,
+                          preemptive_freqs=preemptive)
         processed = notch_bank.process(block_hpf)
 
         # ── Output ────────────────────────────────────────────────────────
@@ -116,59 +146,48 @@ def run(threshold=DETECT_THRESH, q=NOTCH_Q, depth_db=NOTCH_DEPTH, checkpoint=Non
         if outdata.shape[1] > 1:
             outdata[:, 1] = processed
 
-        if notch_bank.active_notches:
-            notch_str = ', '.join(f'{f:.0f}Hz/{d:.0f}dB/Q{q:.0f}'
-                                  for f, d, q in notch_bank.active_notches)
+        # Status line
+        if notch_bank.active_notches or detected_freqs:
+            notch_str = ', '.join(f'{f:.0f}Hz/{d:.0f}dB'
+                                  for f, d, _ in notch_bank.active_notches)
             det_str   = ', '.join(f'{f:.0f}' for f in detected_freqs) or '—'
-            print(f'\rDetected: [{det_str}]   Active: [{notch_str}]    ', end='')
+            pre_str   = ', '.join(f'{f:.0f}' for f in preemptive)     or '—'
+            print(f'\rDet:[{det_str}]  Pre:[{pre_str}]  Notches:[{notch_str}]    ',
+                  end='', flush=True)
 
-    print(f'Running at {SR} Hz, block={BLOCK_SIZE} samples ({1000*BLOCK_SIZE/SR:.1f} ms)')
-    print(f'Detection threshold={threshold}, Q={q}, depth={depth_db} dB')
-    print('Press Ctrl+C to stop.\n')
+    # ── Graceful shutdown — save profile on Ctrl+C ────────────────────────────
+    def _shutdown(sig, frame):
+        print('\n\nSaving risk profile…')
+        predictor.save()
+        print(predictor.summary())
+        print(f'Profile saved to {profile_path}')
+        sys.exit(0)
 
-    try:
-        with sd.Stream(samplerate=SR, blocksize=BLOCK_SIZE,
-                       dtype='float32', channels=1,
-                       callback=callback):
-            sd.sleep(10 * 3600 * 1000)
-    except KeyboardInterrupt:
-        print('\nStopped.')
+    signal.signal(signal.SIGINT, _shutdown)
 
+    print(f'FeedbackPredictor profile: {profile_path}')
+    print(f'Running at {SR} Hz  block={BLOCK_SIZE} samples ({1000*BLOCK_SIZE/SR:.1f} ms)')
+    print(f'threshold={threshold}  depth={depth_db} dB')
+    print('Ctrl+C to stop and save profile.\n')
 
-def _cluster_bins(bin_freqs, prob, mask):
-    """
-    Find feedback frequencies from a per-bin probability mask.
-    Groups adjacent positive bins and returns the peak-probability bin's
-    frequency for each cluster.
-    """
-    if not mask.any():
-        return []
-
-    indices    = np.where(mask)[0]
-    clusters   = []
-    current    = [indices[0]]
-
-    for idx in indices[1:]:
-        if idx - current[-1] <= 3:   # bins within 3 = ~150 Hz gap → same cluster
-            current.append(idx)
-        else:
-            clusters.append(current)
-            current = [idx]
-    clusters.append(current)
-
-    freqs = []
-    for cluster in clusters:
-        peak_idx = cluster[np.argmax(prob[cluster])]
-        freqs.append(float(bin_freqs[peak_idx]))
-    return freqs
+    with sd.Stream(samplerate=SR, blocksize=BLOCK_SIZE,
+                   dtype='float32', channels=1,
+                   device=audio_device,
+                   callback=callback):
+        sd.sleep(10 * 3600 * 1000)
 
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('--threshold',  type=float, default=DETECT_THRESH)
-    ap.add_argument('--q',          type=float, default=NOTCH_Q)
-    ap.add_argument('--depth',      type=float, default=NOTCH_DEPTH)
+    ap.add_argument('--threshold',  type=float, default=DETECT_THRESH,
+                    help='detection probability threshold (default 0.25)')
+    ap.add_argument('--depth',      type=float, default=NOTCH_DEPTH,
+                    help='max notch depth dB (default -48)')
     ap.add_argument('--checkpoint', type=str,   default=None)
+    ap.add_argument('--profile',    type=str,   default=None,
+                    help='path to risk profile JSON (default data/feedback_risk_profile.json)')
+    ap.add_argument('--device',     type=int,   default=None,
+                    help='sounddevice device index (default: system default)')
     args = ap.parse_args()
-    run(threshold=args.threshold, q=args.q, depth_db=args.depth,
-        checkpoint=args.checkpoint)
+    run(threshold=args.threshold, depth_db=args.depth,
+        checkpoint=args.checkpoint, profile=args.profile, device=args.device)
