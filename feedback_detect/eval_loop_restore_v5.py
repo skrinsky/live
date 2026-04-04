@@ -89,11 +89,10 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
         above   = (prob_np > threshold) & (_bin_freqs >= 80.0) & (_bin_freqs < SR / 2)
         freqs   = _cluster_bins(_bin_freqs, prob_np, above)
 
-        preemptive = predictor.get_preemptive(_bin_freqs, prob_np) if predictor else []
+        preemptive = predictor.update(
+            mag[0, :, 0].cpu().numpy(), prob_np, notch_bank.active_notches
+        ) if predictor else []
         notch_bank.update(freqs, _bin_freqs, prob_np, preemptive_freqs=preemptive)
-        if predictor:
-            predictor.on_notch_events(notch_bank.active_notches)
-            predictor.decay()
         out_block = notch_bank.process(mic_block)
         box_out[s:s+HOP] = out_block
         notch_logs.append(list(notch_bank.active_notches))
@@ -183,7 +182,7 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     # ── Run detector + notch loop ──────────────────────────────────────────────
     print('Running detector + NotchBank loop…')
     profile_path = PROJECT_ROOT / 'data' / 'feedback_risk_profile.json'
-    predictor  = FeedbackPredictor(sr=SR, profile_path=profile_path)
+    predictor  = FeedbackPredictor(_bin_freqs, sr=SR, profile_path=profile_path)
     notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
     mic_sup, box_sup, notch_logs = simulate_notch(
         voice_np, noise_np, ir, gain=gain,
@@ -191,7 +190,7 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
         device=device, window=window, threshold=threshold,
         predictor=predictor)
     predictor.save()
-    print(f'  Risk profile: {len(predictor.risk_profile)} frequencies learned')
+    print(predictor.summary())
     print(f'  mic RMS: {_rms_db(mic_sup):.1f} dB')
 
     # ── Build notch mask from logs ─────────────────────────────────────────────
