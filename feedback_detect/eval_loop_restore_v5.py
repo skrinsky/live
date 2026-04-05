@@ -228,10 +228,6 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     predictor.seed_from_ir(ir, gain=gain)
     notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
     flattener  = SpectralFlattener(_bin_freqs, sr=SR)
-    print('Pre-warming SpectralFlattener from clean voice (3s)…')
-    _warmup_flattener(voice_np, noise_np, flattener, device, window, warmup_s=3.0)
-    print(f'  long_norm range after warmup: '
-          f'[{flattener._long_norm.min():.4f}, {flattener._long_norm.max():.4f}]')
     mic_sup, box_sup, flat_sup, notch_logs = simulate_notch(
         voice_np, noise_np, ir, gain=gain,
         model_det=model_det, notch_bank=notch_bank,

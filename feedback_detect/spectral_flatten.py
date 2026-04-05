@@ -1,30 +1,30 @@
 """
 feedback_detect/spectral_flatten.py — Adaptive spectral coloration correction.
 
-After the NotchBank cuts at ring frequencies, neighboring bands can stand
-out perceptually by contrast — the notch changes the spectral balance even
-though it doesn't touch those frequencies directly.
+After the NotchBank cuts at ring frequencies, neighboring bands stand out by
+contrast — the notch creates a spectral gap, making the untouched bands on
+either side sound perceptually prominent.
 
-This module corrects that by tracking the voice's spectral balance over
-time and applying gentle wide-Q cuts to bands that become over-prominent
-relative to their own history.
+Example: notches at ~680 Hz and ~987 Hz leave the 800 Hz region elevated
+by ~2.5 dB relative to its neighbors.  The historical-reference approach
+can't detect this because the effect is caused by the CURRENT spectral shape,
+not by a change over time.
 
 Design
 ------
-24 log-spaced bands from 100 Hz to 12 kHz.
-Per-band energy is NORMALISED by total power so the comparison is about
-spectral SHAPE (balance), not absolute level. When a notch cuts energy
-at 492 Hz, the total power drops, and any band that is now a larger-than-
-usual fraction of total power is flagged.
+Compare each band's current smoothed energy to the average of its non-adjacent
+neighbors (skip ±1, average ±2–4).  Bands that are locally elevated because
+the notches dipped their neighbors get cut.  Only fires when deep notches are
+active — during clean speech the local spectral shape is not distorted by
+notches so false cuts are prevented by the notch-active gate.
 
-Two guard conditions prevent false cuts:
-  1. Bands within NOTCH_GUARD (25%) of an active notch are excluded — the
+Guard conditions:
+  1. Only when any notch is deeper than NOTCH_ACTIVE_THRESHOLD_DB — no cuts
+     during clean speech so natural voice formants are untouched.
+  2. Bands within NOTCH_GUARD (25%) of an active notch are excluded — the
      notch itself is handled by NotchBank, not here.
-  2. The long-term reference freezes entirely when any deep notch is active,
-     preserving the pre-ring natural voice spectral shape as the reference
-     across ALL bands — not just the bands adjacent to the notch.
 
-Only cuts — never boosts. Cuts cannot cause feedback.
+Only cuts — never boosts.  Cuts cannot cause feedback.
 """
 
 import numpy as np
@@ -79,36 +79,39 @@ class SpectralFlattener:
     F_MIN         = 100.0
     F_MAX         = 12000.0
 
-    # Time constants (frames at ~100 fps)
-    SHORT_ALPHA   = 0.10    # ~10 frames = 100 ms
-    LONG_ALPHA    = 0.001   # ~1000 frames = 10 s half-life (post-warmup)
-    WARMUP_FRAMES = 150     # ~1.5 s: fast-adapt long-term before notches begin
-    WARMUP_ALPHA  = 0.05    # fast convergence during warmup
+    # Short-term smoothing (frames at ~100 fps)
+    SHORT_ALPHA   = 0.05    # ~20 frames = 200 ms — smooth enough to survive
+                            # phoneme transitions without chasing transients
 
-    # Cut trigger
-    PROMINENCE_DB = 1.5     # normalised band must exceed reference by this much
+    # Local-neighbor comparison window
+    # For band i, skip ±N_SKIP immediate neighbors, then average ±N_COMPARE bands.
+    # Example: N_SKIP=1, N_COMPARE=3 → compares band i to [i-4,i-3,i-2,i+2,i+3,i+4].
+    N_SKIP        = 1
+    N_COMPARE     = 3
+
+    # Cut trigger: band must be this many dB above its local neighbor average
+    PROMINENCE_DB = 2.0
     MAX_CUT_DB    = -6.0
-    CUT_Q         = 3.0     # wide, musical cut
+    CUT_Q         = 2.5     # wide, musical cut — 1/3-oct bandwidth at this Q
     CUT_SMOOTHING = 0.05    # slow attack (~20 frames) to avoid modulation
 
-    # Only watch low-mid bands: above ~2 kHz phoneme variation (sibilants etc.)
-    # swamps notch-induced coloration, causing false cuts.  Notch coloration
-    # complaints (e.g. 830 Hz prominence after 492 Hz notch) are always low-mid.
-    F_ACTIVE_MAX  = 2000.0
+    # Gate: only compare / cut when deep notches are active.
+    # During clean speech the spectral shape is not distorted by notches,
+    # so this prevents cutting natural voice formants.
+    NOTCH_ACTIVE_DB   = -10.0   # notch must be deeper than this to count
+    NOTCH_GUARD       = 0.25    # ±25% log-scale around active notch → no cut
 
-    # Guard zones
-    VOICE_FLOOR   = 1e-5    # RMS below this = silence, freeze reference
-    NOTCH_GUARD   = 0.25    # ±25% around active notch freq = don't cut there
-    BAND_FLOOR    = 0.25 / 24  # skip bands where voice reference is near-zero
+    # Silence gate
+    VOICE_FLOOR   = 1e-5
 
     def __init__(self, bin_freqs: np.ndarray, sr: int = 48000):
-        self.bin_freqs = bin_freqs
-        self.sr        = sr
+        self.bin_freqs  = bin_freqs
+        self.sr         = sr
 
         self.band_freqs = np.logspace(
             np.log10(self.F_MIN), np.log10(self.F_MAX), self.N_BANDS)
 
-        # Bin-to-band mapping: log-equal-width edges
+        # Bin-to-band mapping
         edges = np.logspace(
             np.log10(self.F_MIN * 2 ** (-1.0 / self.N_BANDS)),
             np.log10(self.F_MAX * 2 ** ( 1.0 / self.N_BANDS)),
@@ -118,11 +121,16 @@ class SpectralFlattener:
             for i in range(self.N_BANDS)
         ]
 
-        self._short_norm  = np.ones(self.N_BANDS, dtype=np.float64) / self.N_BANDS
-        self._long_norm   = np.ones(self.N_BANDS, dtype=np.float64) / self.N_BANDS
-        self._cut_db      = np.zeros(self.N_BANDS, dtype=np.float64)
-        self._warmup_left = self.WARMUP_FRAMES
-        self._max_prom_db = np.zeros(self.N_BANDS, dtype=np.float64)  # peak prominence seen
+        # Pre-compute neighbor index sets for local comparison
+        self._neighbor_idx = []
+        for i in range(self.N_BANDS):
+            nbrs = [j for j in range(self.N_BANDS)
+                    if (self.N_SKIP < abs(j - i) <= self.N_SKIP + self.N_COMPARE)]
+            self._neighbor_idx.append(nbrs)
+
+        self._short_norm = np.ones(self.N_BANDS, dtype=np.float64) / self.N_BANDS
+        self._cut_db     = np.zeros(self.N_BANDS, dtype=np.float64)
+        self._max_prom   = np.zeros(self.N_BANDS, dtype=np.float64)  # diagnostics
 
         self._filters = [
             PeakingEQ(f, sr=sr, q=self.CUT_Q, gain_db=0.0)
@@ -134,74 +142,55 @@ class SpectralFlattener:
     def update(self, stft_mag: np.ndarray, rms: float,
                active_notches: 'list[tuple[float,float,float]]'):
         """
-        Update envelope estimates and target cut depths.
-
         stft_mag       : (N_FREQ,) linear magnitude from current STFT frame
-        rms            : RMS of current audio block (for voice-activity gate)
+        rms            : RMS of current audio block (silence gate)
         active_notches : notch_bank.active_notches → [(freq, depth_db, q), ...]
         """
-        # Per-band power, normalised to spectral SHAPE
+        # Per-band power, normalised to spectral shape
         band_power = np.array([
             float((stft_mag[m] ** 2).sum()) + 1e-20
             for m in self._band_masks
         ])
-        total = band_power.sum() + 1e-20
-        band_norm = band_power / total
+        total      = band_power.sum() + 1e-20
+        band_norm  = band_power / total
 
-        # Guard zone: bands within NOTCH_GUARD of a deep active notch
-        guard = np.zeros(self.N_BANDS, dtype=bool)
-        for nf, nd, _ in active_notches:
-            if nd < -10.0:
-                for i, bf in enumerate(self.band_freqs):
-                    if abs(bf - nf) / bf < self.NOTCH_GUARD:
-                        guard[i] = True
-
-        # Short-term: always update
+        # Short-term smoothing — 200 ms, survives phoneme transitions
         self._short_norm = (self.SHORT_ALPHA * band_norm +
                             (1.0 - self.SHORT_ALPHA) * self._short_norm)
 
-        # Long-term reference: captures the natural voice spectral shape.
-        # Warmup phase (first WARMUP_FRAMES frames): fast-adapt so the reference
-        # reflects the real voice shape before the first ring occurs.
-        # After warmup: freeze entirely when any deep notch is active so the
-        # reference holds the pre-ring natural voice shape for comparison.
-        any_deep_notch = any(nd < -10.0 for _, nd, _ in active_notches)
-        if self._warmup_left > 0:
-            if rms > self.VOICE_FLOOR:
-                self._long_norm = (
-                    self.WARMUP_ALPHA * band_norm +
-                    (1.0 - self.WARMUP_ALPHA) * self._long_norm)
-                self._warmup_left -= 1
-        elif rms > self.VOICE_FLOOR and not any_deep_notch:
-            self._long_norm = (
-                self.LONG_ALPHA * band_norm +
-                (1.0 - self.LONG_ALPHA) * self._long_norm)
-
-        # Don't compare or cut during warmup — long_norm is still adapting
-        # and transient mismatches would cause spurious cuts.
-        if self._warmup_left > 0:
-            for filt in self._filters:
-                filt.set_gain(0.0)
+        # ── Gate: only act when deep notches are present ───────────────────
+        deep_notches = [(nf, nd, nq) for nf, nd, nq in active_notches
+                        if nd < self.NOTCH_ACTIVE_DB]
+        if not deep_notches or rms <= self.VOICE_FLOOR:
+            # Release cuts toward 0 while no notches are active
+            self._cut_db *= (1.0 - self.CUT_SMOOTHING)
+            for i, filt in enumerate(self._filters):
+                filt.set_gain(float(self._cut_db[i]))
             return
 
-        # Prominence in dB (normalised shape comparison)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            prom_db = 10.0 * np.log10(
-                self._short_norm / (self._long_norm + 1e-20))
-        prom_db = np.nan_to_num(prom_db, nan=0.0, posinf=0.0, neginf=0.0)
+        # Guard zone: bands within NOTCH_GUARD of an active notch
+        guard = np.zeros(self.N_BANDS, dtype=bool)
+        for nf, _, _ in deep_notches:
+            for i, bf in enumerate(self.band_freqs):
+                if abs(bf - nf) / bf < self.NOTCH_GUARD:
+                    guard[i] = True
 
-        # Track post-warmup peak prominence for diagnostics
-        self._max_prom_db = np.maximum(self._max_prom_db, prom_db)
+        # Local-neighbor prominence: how much is each band above its neighbors?
+        prom_db = np.zeros(self.N_BANDS, dtype=np.float64)
+        for i, nbrs in enumerate(self._neighbor_idx):
+            if not nbrs:
+                continue
+            neighbor_avg = self._short_norm[nbrs].mean() + 1e-20
+            with np.errstate(divide='ignore', invalid='ignore'):
+                p = 10.0 * np.log10(self._short_norm[i] / neighbor_avg)
+            prom_db[i] = 0.0 if not np.isfinite(p) else p
 
-        # Target cut: zero in guard zones, high-freq bands, and low-ref bands
-        excess  = np.maximum(prom_db - self.PROMINENCE_DB, 0.0)
-        target  = np.clip(-excess, self.MAX_CUT_DB, 0.0)
+        self._max_prom = np.maximum(self._max_prom, prom_db)
+
+        # Target cut: proportional to excess above threshold
+        excess = np.maximum(prom_db - self.PROMINENCE_DB, 0.0)
+        target = np.clip(-excess, self.MAX_CUT_DB, 0.0)
         target[guard] = 0.0
-        # Only act on low-mid bands — above F_ACTIVE_MAX phoneme variation is too
-        # large relative to notch coloration, causing false cuts on sibilants.
-        target[self.band_freqs > self.F_ACTIVE_MAX] = 0.0
-        # Skip bands where the reference is near-zero (voice barely speaks there)
-        target[self._long_norm < self.BAND_FLOOR] = 0.0
 
         # Smooth toward target
         self._cut_db += self.CUT_SMOOTHING * (target - self._cut_db)
@@ -217,10 +206,8 @@ class SpectralFlattener:
         return y
 
     def summary(self) -> str:
-        active = [
-            (self.band_freqs[i], self._cut_db[i])
-            for i in range(self.N_BANDS) if self._cut_db[i] < -0.5
-        ]
+        active = [(self.band_freqs[i], self._cut_db[i])
+                  for i in range(self.N_BANDS) if self._cut_db[i] < -0.5]
         lines = []
         if not active:
             lines.append('SpectralFlattener: no active cuts')
@@ -228,22 +215,11 @@ class SpectralFlattener:
             lines.append('SpectralFlattener cuts:')
             for f, db in active:
                 lines.append(f'  {f:.0f} Hz: {db:.1f} dB')
-
-        lines.append(f'  warmup_left={self._warmup_left}  threshold={self.PROMINENCE_DB} dB')
-
-        # Show eligible (<2kHz, long_norm >= BAND_FLOOR) bands in detail
-        lines.append(f'  eligible bands (<{self.F_ACTIVE_MAX:.0f}Hz, ref>={self.BAND_FLOOR:.4f}):')
-        found_eligible = False
-        for i, f in enumerate(self.band_freqs):
-            if f > self.F_ACTIVE_MAX:
-                break
-            ln = self._long_norm[i]
-            eligible = ln >= self.BAND_FLOOR
-            lines.append(
-                f'    {f:6.0f} Hz  long={ln:.4f}  peak_prom={self._max_prom_db[i]:.2f}dB'
-                + ('' if eligible else '  [below floor, skipped]'))
-            if eligible:
-                found_eligible = True
-        if not found_eligible:
-            lines.append('    (none — all below BAND_FLOOR)')
+        lines.append(f'  threshold={self.PROMINENCE_DB} dB  '
+                     f'(local-neighbor: skip±{self.N_SKIP}, avg±{self.N_COMPARE})')
+        top = sorted(enumerate(self._max_prom), key=lambda x: -x[1])[:6]
+        lines.append('  peak local-prominence per band (top 6):')
+        for i, pk in top:
+            marker = ' ← cut' if pk >= self.PROMINENCE_DB else ''
+            lines.append(f'    {self.band_freqs[i]:.0f} Hz: {pk:.2f} dB{marker}')
         return '\n'.join(lines)
