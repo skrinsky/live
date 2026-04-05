@@ -28,6 +28,7 @@ from feedback_detect.notch import NotchBank
 from feedback_detect.predictor import FeedbackPredictor
 from feedback_detect.live import _cluster_bins
 from feedback_detect.eval_loop import _rms_db
+from feedback_detect.spectral_flatten import SpectralFlattener
 
 from voice_restore.model_v5 import VoiceRestorerV5, apply_compensation
 from voice_restore.model_v5 import N_FREQ as VR_N_FREQ, N_FFT as VR_N_FFT
@@ -43,13 +44,14 @@ _bin_freqs = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
 
 def simulate_notch(voice_np, noise_np, feedback_ir, gain,
                    model_det, notch_bank, device, window, threshold,
-                   predictor=None):
+                   predictor=None, flattener=None):
     ir  = (feedback_ir * gain).astype(np.float32)
     n   = len(voice_np)
     acc = np.zeros(n + len(ir), dtype=np.float64)
 
     mic_out      = np.zeros(n, dtype=np.float32)
     box_out      = np.zeros(n, dtype=np.float32)
+    flat_out     = np.zeros(n, dtype=np.float32)
     gru_h        = None
     lm_history   = np.zeros((N_FREQ, 11), dtype=np.float32)
     analysis_buf = np.zeros(N_FFT, dtype=np.float32)
@@ -89,18 +91,28 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
         above   = (prob_np > threshold) & (_bin_freqs >= 80.0) & (_bin_freqs < SR / 2)
         freqs   = _cluster_bins(_bin_freqs, prob_np, above)
 
+        stft_mag_np = mag[0, :, 0].cpu().numpy()
         preemptive = predictor.update(
-            mag[0, :, 0].cpu().numpy(), prob_np, notch_bank.active_notches
+            stft_mag_np, prob_np, notch_bank.active_notches
         ) if predictor else []
         notch_bank.update(freqs, _bin_freqs, prob_np, preemptive_freqs=preemptive)
         out_block = notch_bank.process(mic_block)
         box_out[s:s+HOP] = out_block
         notch_logs.append(list(notch_bank.active_notches))
 
-        fb = np.convolve(out_block.astype(np.float64), ir.astype(np.float64))
+        # SpectralFlattener: adaptive wide-Q coloration correction
+        if flattener is not None:
+            rms = float(np.sqrt(np.mean(out_block ** 2) + 1e-20))
+            flattener.update(stft_mag_np, rms, notch_bank.active_notches)
+            flat_block = flattener.process(out_block)
+        else:
+            flat_block = out_block
+        flat_out[s:s+HOP] = flat_block
+
+        fb = np.convolve(flat_block.astype(np.float64), ir.astype(np.float64))
         acc[s:s + len(fb)] += fb
 
-    return mic_out[:n], box_out[:n], notch_logs
+    return mic_out[:n], box_out[:n], flat_out[:n], notch_logs
 
 
 def build_notch_mask_from_logs(notch_logs, n_frames):
@@ -191,11 +203,12 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     predictor  = FeedbackPredictor(_bin_freqs, sr=SR, profile_path=profile_path)
     predictor.seed_from_ir(ir, gain=gain)
     notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
-    mic_sup, box_sup, notch_logs = simulate_notch(
+    flattener  = SpectralFlattener(_bin_freqs, sr=SR)
+    mic_sup, box_sup, flat_sup, notch_logs = simulate_notch(
         voice_np, noise_np, ir, gain=gain,
         model_det=model_det, notch_bank=notch_bank,
         device=device, window=window, threshold=threshold,
-        predictor=predictor)
+        predictor=predictor, flattener=flattener)
     predictor.save()
     print(predictor.summary())
     print(f'  mic RMS: {_rms_db(mic_sup):.1f} dB')
@@ -260,17 +273,22 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     L = min(len(box_sup), len(restored_wav))
 
     # ── Save ───────────────────────────────────────────────────────────────────
-    sf.write(str(out_dir / 'clean_reference.wav'),        clean_np,          SR, subtype='PCM_16')
-    sf.write(str(out_dir / 'suppressed_out.wav'),         box_sup[:L],       SR, subtype='PCM_16')
-    sf.write(str(out_dir / 'suppressed_out_restored.wav'), restored_wav[:L], SR, subtype='PCM_16')
+    L_flat = min(len(flat_sup), len(box_sup))
+    sf.write(str(out_dir / 'clean_reference.wav'),         clean_np,           SR, subtype='PCM_16')
+    sf.write(str(out_dir / 'suppressed_out.wav'),          box_sup[:L],        SR, subtype='PCM_16')
+    sf.write(str(out_dir / 'suppressed_out_flattened.wav'), flat_sup[:L_flat], SR, subtype='PCM_16')
+    sf.write(str(out_dir / 'suppressed_out_restored.wav'),  restored_wav[:L],  SR, subtype='PCM_16')
 
+    print(f'\nSpectralFlattener: {flattener.summary()}')
     print(f'\nRMS dB — clean {_rms_db(clean_np):.1f} | '
           f'suppressed {_rms_db(box_sup[:L]):.1f} | '
+          f'flattened {_rms_db(flat_sup[:L_flat]):.1f} | '
           f'restored {_rms_db(restored_wav[:L]):.1f}')
     print(f'\nSaved to {out_dir}/:')
-    print('  clean_reference.wav          — voice with no loop (target)')
-    print('  suppressed_out.wav           — speaker feed after notch (no restorer)')
-    print('  suppressed_out_restored.wav  — speaker feed after notch + V5 restorer')
+    print('  clean_reference.wav           — voice with no loop (target)')
+    print('  suppressed_out.wav            — speaker feed after notch (no restorer)')
+    print('  suppressed_out_flattened.wav  — notch + SpectralFlattener (coloration fix)')
+    print('  suppressed_out_restored.wav   — notch + V5 restorer')
 
 
 if __name__ == '__main__':

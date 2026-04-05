@@ -26,9 +26,10 @@ from scipy.signal import butter, sosfilt
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / 'feedback_detect'))
 
-from model     import FeedbackDetector, SR, N_FFT, HOP, N_FREQ
-from notch     import NotchBank
-from predictor import FeedbackPredictor
+from model            import FeedbackDetector, SR, N_FFT, HOP, N_FREQ
+from notch            import NotchBank
+from predictor        import FeedbackPredictor
+from spectral_flatten import SpectralFlattener
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 CHECKPOINT    = PROJECT_ROOT / 'checkpoints' / 'feedback_detect' / 'best.pt'
@@ -87,6 +88,7 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
     bin_freqs  = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
     predictor  = FeedbackPredictor(bin_freqs, sr=SR, profile_path=profile_path)
     notch_bank = NotchBank(sr=SR, depth_db=depth_db)
+    flattener  = SpectralFlattener(bin_freqs, sr=SR)
     hpf_sos    = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
 
     # Per-session state (mutated inside callback via nonlocal)
@@ -140,6 +142,12 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
         notch_bank.update(detected_freqs, bin_freqs, prob_np,
                           preemptive_freqs=preemptive)
         processed = notch_bank.process(block_hpf)
+
+        # ── SpectralFlattener (adaptive coloration correction) ─────────────
+        stft_mag_np = mag[0, :, 0].cpu().numpy()
+        rms_val = float(np.sqrt(np.mean(processed ** 2) + 1e-20))
+        flattener.update(stft_mag_np, rms_val, notch_bank.active_notches)
+        processed = flattener.process(processed)
 
         # ── Output ────────────────────────────────────────────────────────
         outdata[:, 0] = processed
