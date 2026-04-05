@@ -20,8 +20,9 @@ usual fraction of total power is flagged.
 Two guard conditions prevent false cuts:
   1. Bands within NOTCH_GUARD (25%) of an active notch are excluded — the
      notch itself is handled by NotchBank, not here.
-  2. The long-term reference stops updating near active notches so it stays
-     at the pre-notch natural voice level.
+  2. The long-term reference freezes entirely when any deep notch is active,
+     preserving the pre-ring natural voice spectral shape as the reference
+     across ALL bands — not just the bands adjacent to the notch.
 
 Only cuts — never boosts. Cuts cannot cause feedback.
 """
@@ -83,7 +84,7 @@ class SpectralFlattener:
     LONG_ALPHA    = 0.001   # ~1000 frames = 10 s half-life
 
     # Cut trigger
-    PROMINENCE_DB = 2.5     # normalised band must exceed reference by this much
+    PROMINENCE_DB = 1.5     # normalised band must exceed reference by this much
     MAX_CUT_DB    = -6.0
     CUT_Q         = 3.0     # wide, musical cut
     CUT_SMOOTHING = 0.05    # slow attack (~20 frames) to avoid modulation
@@ -149,12 +150,15 @@ class SpectralFlattener:
         self._short_norm = (self.SHORT_ALPHA * band_norm +
                             (1.0 - self.SHORT_ALPHA) * self._short_norm)
 
-        # Long-term: update only for unguarded bands during voice activity
-        if rms > self.VOICE_FLOOR:
-            idx = np.where(~guard)[0]
-            self._long_norm[idx] = (
-                self.LONG_ALPHA * band_norm[idx] +
-                (1.0 - self.LONG_ALPHA) * self._long_norm[idx])
+        # Long-term: freeze entirely when any deep notch is active so the
+        # reference preserves the pre-ring natural voice spectral shape.
+        # Any notch at all shifts spectral balance; we want to catch that shift
+        # across all bands, not just the bands adjacent to the notch.
+        any_deep_notch = any(nd < -10.0 for _, nd, _ in active_notches)
+        if rms > self.VOICE_FLOOR and not any_deep_notch:
+            self._long_norm = (
+                self.LONG_ALPHA * band_norm +
+                (1.0 - self.LONG_ALPHA) * self._long_norm)
 
         # Prominence in dB (normalised shape comparison)
         with np.errstate(divide='ignore', invalid='ignore'):
