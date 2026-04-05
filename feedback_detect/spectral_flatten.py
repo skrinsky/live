@@ -171,11 +171,20 @@ class SpectralFlattener:
                 self.LONG_ALPHA * band_norm +
                 (1.0 - self.LONG_ALPHA) * self._long_norm)
 
+        # Don't compare or cut during warmup — long_norm is still adapting
+        # and transient mismatches would cause spurious cuts.
+        if self._warmup_left > 0:
+            for filt in self._filters:
+                filt.set_gain(0.0)
+            return
+
         # Prominence in dB (normalised shape comparison)
         with np.errstate(divide='ignore', invalid='ignore'):
             prom_db = 10.0 * np.log10(
                 self._short_norm / (self._long_norm + 1e-20))
         prom_db = np.nan_to_num(prom_db, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Track post-warmup peak prominence for diagnostics
         self._max_prom_db = np.maximum(self._max_prom_db, prom_db)
 
         # Target cut: zero in guard zones, proportional to excess elsewhere
