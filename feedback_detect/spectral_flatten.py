@@ -91,9 +91,15 @@ class SpectralFlattener:
     CUT_Q         = 3.0     # wide, musical cut
     CUT_SMOOTHING = 0.05    # slow attack (~20 frames) to avoid modulation
 
+    # Only watch low-mid bands: above ~2 kHz phoneme variation (sibilants etc.)
+    # swamps notch-induced coloration, causing false cuts.  Notch coloration
+    # complaints (e.g. 830 Hz prominence after 492 Hz notch) are always low-mid.
+    F_ACTIVE_MAX  = 2000.0
+
     # Guard zones
     VOICE_FLOOR   = 1e-5    # RMS below this = silence, freeze reference
     NOTCH_GUARD   = 0.25    # ±25% around active notch freq = don't cut there
+    BAND_FLOOR    = 0.25 / 24  # skip bands where voice reference is near-zero
 
     def __init__(self, bin_freqs: np.ndarray, sr: int = 48000):
         self.bin_freqs = bin_freqs
@@ -187,10 +193,15 @@ class SpectralFlattener:
         # Track post-warmup peak prominence for diagnostics
         self._max_prom_db = np.maximum(self._max_prom_db, prom_db)
 
-        # Target cut: zero in guard zones, proportional to excess elsewhere
+        # Target cut: zero in guard zones, high-freq bands, and low-ref bands
         excess  = np.maximum(prom_db - self.PROMINENCE_DB, 0.0)
         target  = np.clip(-excess, self.MAX_CUT_DB, 0.0)
         target[guard] = 0.0
+        # Only act on low-mid bands — above F_ACTIVE_MAX phoneme variation is too
+        # large relative to notch coloration, causing false cuts on sibilants.
+        target[self.band_freqs > self.F_ACTIVE_MAX] = 0.0
+        # Skip bands where the reference is near-zero (voice barely speaks there)
+        target[self._long_norm < self.BAND_FLOOR] = 0.0
 
         # Smooth toward target
         self._cut_db += self.CUT_SMOOTHING * (target - self._cut_db)
