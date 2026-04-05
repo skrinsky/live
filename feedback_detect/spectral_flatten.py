@@ -137,6 +137,7 @@ class SpectralFlattener:
         self._short_norm  = np.ones(self.N_BANDS, dtype=np.float64) / self.N_BANDS
         self._cut_db      = np.zeros(self.N_BANDS, dtype=np.float64)
         self._smooth_prom = np.zeros(self.N_BANDS, dtype=np.float64)  # integrated prominence
+        self._peak_cut_db = np.zeros(self.N_BANDS, dtype=np.float64)  # most negative cut seen
 
         self._filters = [
             PeakingEQ(f, sr=sr, q=self.CUT_Q, gain_db=0.0)
@@ -205,6 +206,7 @@ class SpectralFlattener:
 
         # Smooth toward target
         self._cut_db += self.CUT_SMOOTHING * (target - self._cut_db)
+        self._peak_cut_db = np.minimum(self._peak_cut_db, self._cut_db)
 
         for i, filt in enumerate(self._filters):
             filt.set_gain(float(self._cut_db[i]))
@@ -234,4 +236,13 @@ class SpectralFlattener:
         for i, sp in top:
             marker = ' ← cut' if sp >= self.PROMINENCE_DB else ''
             lines.append(f'    {self.band_freqs[i]:.0f} Hz: {sp:.3f} dB{marker}')
+        # Peak cuts show what was actually applied during the run (cuts release at end)
+        peak = [(self.band_freqs[i], self._peak_cut_db[i])
+                for i in range(self.N_BANDS) if self._peak_cut_db[i] < -0.1]
+        if peak:
+            lines.append('  peak cuts applied during run:')
+            for f, db in sorted(peak, key=lambda x: x[1]):
+                lines.append(f'    {f:.0f} Hz: {db:.2f} dB')
+        else:
+            lines.append('  peak cuts applied during run: none')
         return '\n'.join(lines)
