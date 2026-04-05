@@ -116,6 +116,7 @@ class SpectralFlattener:
         self._long_norm   = np.ones(self.N_BANDS, dtype=np.float64) / self.N_BANDS
         self._cut_db      = np.zeros(self.N_BANDS, dtype=np.float64)
         self._warmup_left = self.WARMUP_FRAMES
+        self._max_prom_db = np.zeros(self.N_BANDS, dtype=np.float64)  # peak prominence seen
 
         self._filters = [
             PeakingEQ(f, sr=sr, q=self.CUT_Q, gain_db=0.0)
@@ -175,6 +176,7 @@ class SpectralFlattener:
             prom_db = 10.0 * np.log10(
                 self._short_norm / (self._long_norm + 1e-20))
         prom_db = np.nan_to_num(prom_db, nan=0.0, posinf=0.0, neginf=0.0)
+        self._max_prom_db = np.maximum(self._max_prom_db, prom_db)
 
         # Target cut: zero in guard zones, proportional to excess elsewhere
         excess  = np.maximum(prom_db - self.PROMINENCE_DB, 0.0)
@@ -199,9 +201,21 @@ class SpectralFlattener:
             (self.band_freqs[i], self._cut_db[i])
             for i in range(self.N_BANDS) if self._cut_db[i] < -0.5
         ]
+        lines = []
         if not active:
-            return 'SpectralFlattener: no active cuts'
-        lines = ['SpectralFlattener cuts:']
-        for f, db in active:
-            lines.append(f'  {f:.0f} Hz: {db:.1f} dB')
+            lines.append('SpectralFlattener: no active cuts')
+        else:
+            lines.append('SpectralFlattener cuts:')
+            for f, db in active:
+                lines.append(f'  {f:.0f} Hz: {db:.1f} dB')
+
+        # Always show peak prominence per band so we can tune the threshold
+        lines.append(f'  warmup_left={self._warmup_left}  threshold={self.PROMINENCE_DB} dB')
+        lines.append('  peak prominence seen per band (top 8):')
+        top = sorted(enumerate(self._max_prom_db), key=lambda x: -x[1])[:8]
+        for i, pk in top:
+            marker = ' ← would cut' if pk >= self.PROMINENCE_DB else ''
+            lines.append(f'    {self.band_freqs[i]:.0f} Hz: {pk:.2f} dB{marker}')
+        lines.append(f'  long_norm range: [{self._long_norm.min():.4f}, {self._long_norm.max():.4f}]'
+                     f'  (flat=={1/self.N_BANDS:.4f})')
         return '\n'.join(lines)
