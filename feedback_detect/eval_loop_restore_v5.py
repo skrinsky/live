@@ -307,6 +307,37 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     sf.write(str(out_dir / 'suppressed_out_flattened.wav'), flat_sup[:L_flat], SR, subtype='PCM_16')
     sf.write(str(out_dir / 'suppressed_out_restored.wav'),  restored_wav[:L],  SR, subtype='PCM_16')
 
+    # ── Spectral coloration map: suppressed vs clean ───────────────────────────
+    # Shows exactly where the suppressor adds or removes energy relative to
+    # clean voice — directly measures what the SpectralFlattener is trying to fix.
+    print('\nSpectral coloration (suppressed_out vs clean_reference, 1/3-oct bands):')
+    L_cmp = min(len(box_sup), len(clean_np))
+    hop_a = 512
+    nfft_a = 2048
+    win_a = np.hanning(nfft_a)
+    def _avg_spectrum(x):
+        frames = []
+        for k in range((len(x) - nfft_a) // hop_a):
+            frame = x[k*hop_a : k*hop_a + nfft_a] * win_a
+            frames.append(np.abs(np.fft.rfft(frame)) ** 2)
+        return np.mean(frames, axis=0) if frames else np.ones(nfft_a//2+1)
+    sup_psd   = _avg_spectrum(box_sup[:L_cmp])
+    cln_psd   = _avg_spectrum(clean_np[:L_cmp])
+    bin_hz    = np.fft.rfftfreq(nfft_a, d=1.0/SR)
+    # 1/3-octave centre freqs from 100 Hz to 8 kHz
+    centres   = [100, 125, 160, 200, 250, 315, 400, 500, 630, 800,
+                 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000]
+    for fc in centres:
+        lo, hi = fc / 2**(1/6), fc * 2**(1/6)
+        mask   = (bin_hz >= lo) & (bin_hz < hi)
+        if not mask.any():
+            continue
+        ratio_db = 10.0 * np.log10((sup_psd[mask].mean() + 1e-20) /
+                                   (cln_psd[mask].mean()  + 1e-20))
+        bar = '█' * int(abs(ratio_db)) if abs(ratio_db) >= 0.5 else '·'
+        sign = '+' if ratio_db >= 0 else '-'
+        print(f'  {fc:5d} Hz  {sign}{abs(ratio_db):4.1f} dB  {bar}')
+
     print(f'\nSpectralFlattener: {flattener.summary()}')
     print(f'\nRMS dB — clean {_rms_db(clean_np):.1f} | '
           f'suppressed {_rms_db(box_sup[:L]):.1f} | '
