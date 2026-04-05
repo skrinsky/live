@@ -81,7 +81,9 @@ class SpectralFlattener:
 
     # Time constants (frames at ~100 fps)
     SHORT_ALPHA   = 0.10    # ~10 frames = 100 ms
-    LONG_ALPHA    = 0.001   # ~1000 frames = 10 s half-life
+    LONG_ALPHA    = 0.001   # ~1000 frames = 10 s half-life (post-warmup)
+    WARMUP_FRAMES = 150     # ~1.5 s: fast-adapt long-term before notches begin
+    WARMUP_ALPHA  = 0.05    # fast convergence during warmup
 
     # Cut trigger
     PROMINENCE_DB = 1.5     # normalised band must exceed reference by this much
@@ -110,9 +112,10 @@ class SpectralFlattener:
             for i in range(self.N_BANDS)
         ]
 
-        self._short_norm = np.ones(self.N_BANDS, dtype=np.float64) / self.N_BANDS
-        self._long_norm  = np.ones(self.N_BANDS, dtype=np.float64) / self.N_BANDS
-        self._cut_db     = np.zeros(self.N_BANDS, dtype=np.float64)
+        self._short_norm  = np.ones(self.N_BANDS, dtype=np.float64) / self.N_BANDS
+        self._long_norm   = np.ones(self.N_BANDS, dtype=np.float64) / self.N_BANDS
+        self._cut_db      = np.zeros(self.N_BANDS, dtype=np.float64)
+        self._warmup_left = self.WARMUP_FRAMES
 
         self._filters = [
             PeakingEQ(f, sr=sr, q=self.CUT_Q, gain_db=0.0)
@@ -150,12 +153,19 @@ class SpectralFlattener:
         self._short_norm = (self.SHORT_ALPHA * band_norm +
                             (1.0 - self.SHORT_ALPHA) * self._short_norm)
 
-        # Long-term: freeze entirely when any deep notch is active so the
-        # reference preserves the pre-ring natural voice spectral shape.
-        # Any notch at all shifts spectral balance; we want to catch that shift
-        # across all bands, not just the bands adjacent to the notch.
+        # Long-term reference: captures the natural voice spectral shape.
+        # Warmup phase (first WARMUP_FRAMES frames): fast-adapt so the reference
+        # reflects the real voice shape before the first ring occurs.
+        # After warmup: freeze entirely when any deep notch is active so the
+        # reference holds the pre-ring natural voice shape for comparison.
         any_deep_notch = any(nd < -10.0 for _, nd, _ in active_notches)
-        if rms > self.VOICE_FLOOR and not any_deep_notch:
+        if self._warmup_left > 0:
+            if rms > self.VOICE_FLOOR:
+                self._long_norm = (
+                    self.WARMUP_ALPHA * band_norm +
+                    (1.0 - self.WARMUP_ALPHA) * self._long_norm)
+                self._warmup_left -= 1
+        elif rms > self.VOICE_FLOOR and not any_deep_notch:
             self._long_norm = (
                 self.LONG_ALPHA * band_norm +
                 (1.0 - self.LONG_ALPHA) * self._long_norm)
