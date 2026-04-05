@@ -42,6 +42,30 @@ _hpf_sos   = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
 _bin_freqs = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
 
 
+def _warmup_flattener(voice_np, noise_np, flattener, device, window,
+                      warmup_s: float = 3.0):
+    """
+    Pre-warm the SpectralFlattener reference from clean voice (no feedback).
+    Simulates the real-world startup where the performer speaks/sings before
+    any ring occurs.  Must be called before simulate_notch.
+    """
+    n_warm = int(warmup_s * SR)
+    analysis_buf = np.zeros(N_FFT, dtype=np.float32)
+    for i in range(n_warm // HOP):
+        s = i * HOP
+        block = np.clip(
+            voice_np[s:s+HOP].astype(np.float64) + noise_np[s:s+HOP].astype(np.float64),
+            -1.0, 1.0).astype(np.float32)
+        analysis_buf = np.roll(analysis_buf, -HOP)
+        analysis_buf[-HOP:] = block
+        buf_t = torch.from_numpy(analysis_buf).unsqueeze(0).to(device)
+        stft  = torch.stft(buf_t, N_FFT, N_FFT, N_FFT, window,
+                           center=False, return_complex=True)
+        mag_np = stft.abs()[0, :, 0].cpu().numpy()
+        rms    = float(np.sqrt(np.mean(block ** 2) + 1e-20))
+        flattener.update(mag_np, rms, [])   # no active notches → pure voice reference
+
+
 def simulate_notch(voice_np, noise_np, feedback_ir, gain,
                    model_det, notch_bank, device, window, threshold,
                    predictor=None, flattener=None):
@@ -204,6 +228,10 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     predictor.seed_from_ir(ir, gain=gain)
     notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
     flattener  = SpectralFlattener(_bin_freqs, sr=SR)
+    print('Pre-warming SpectralFlattener from clean voice (3s)…')
+    _warmup_flattener(voice_np, noise_np, flattener, device, window, warmup_s=3.0)
+    print(f'  long_norm range after warmup: '
+          f'[{flattener._long_norm.min():.4f}, {flattener._long_norm.max():.4f}]')
     mic_sup, box_sup, flat_sup, notch_logs = simulate_notch(
         voice_np, noise_np, ir, gain=gain,
         model_det=model_det, notch_bank=notch_bank,
