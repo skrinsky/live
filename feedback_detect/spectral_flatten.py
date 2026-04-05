@@ -80,20 +80,26 @@ class SpectralFlattener:
     F_MAX         = 12000.0
 
     # Short-term smoothing (frames at ~100 fps)
-    SHORT_ALPHA   = 0.05    # ~20 frames = 200 ms — smooth enough to survive
-                            # phoneme transitions without chasing transients
+    SHORT_ALPHA   = 0.05    # ~20 frames = 200 ms
 
     # Local-neighbor comparison window
-    # For band i, skip ±N_SKIP immediate neighbors, then average ±N_COMPARE bands.
-    # Example: N_SKIP=1, N_COMPARE=3 → compares band i to [i-4,i-3,i-2,i+2,i+3,i+4].
-    N_SKIP        = 1
+    # N_SKIP=0 means immediate neighbors ARE included — the notched adjacent
+    # bands (e.g. 651 Hz and 987 Hz) are directly compared to 802 Hz, which
+    # is exactly what exposes the notch-induced spectral hump.
+    N_SKIP        = 0
     N_COMPARE     = 3
 
-    # Cut trigger: band must be this many dB above its local neighbor average
-    PROMINENCE_DB = 2.0
-    MAX_CUT_DB    = -6.0
-    CUT_Q         = 2.5     # wide, musical cut — 1/3-oct bandwidth at this Q
-    CUT_SMOOTHING = 0.05    # slow attack (~20 frames) to avoid modulation
+    # Prominence integration: slow EMA of local prominence (notch-gate open only).
+    # Phoneme bursts (brief, large) average toward zero over the integration window.
+    # Persistent notch-induced elevation (~1-2 dB sustained) accumulates above threshold.
+    PROM_INT_ALPHA  = 0.002   # 500-frame = 5 s time constant
+    PROM_INT_DECAY  = 0.0005  # release when gate closes (slower than attack)
+
+    # Cut trigger: integrated band prominence must exceed this
+    PROMINENCE_DB = 1.0
+    MAX_CUT_DB    = -4.0
+    CUT_Q         = 2.5     # wide, musical cut
+    CUT_SMOOTHING = 0.05    # smooth attack to avoid modulation
 
     # Gate: only compare / cut when deep notches are active.
     # During clean speech the spectral shape is not distorted by notches,
@@ -128,9 +134,9 @@ class SpectralFlattener:
                     if (self.N_SKIP < abs(j - i) <= self.N_SKIP + self.N_COMPARE)]
             self._neighbor_idx.append(nbrs)
 
-        self._short_norm = np.ones(self.N_BANDS, dtype=np.float64) / self.N_BANDS
-        self._cut_db     = np.zeros(self.N_BANDS, dtype=np.float64)
-        self._max_prom   = np.zeros(self.N_BANDS, dtype=np.float64)  # diagnostics
+        self._short_norm  = np.ones(self.N_BANDS, dtype=np.float64) / self.N_BANDS
+        self._cut_db      = np.zeros(self.N_BANDS, dtype=np.float64)
+        self._smooth_prom = np.zeros(self.N_BANDS, dtype=np.float64)  # integrated prominence
 
         self._filters = [
             PeakingEQ(f, sr=sr, q=self.CUT_Q, gain_db=0.0)
@@ -158,12 +164,14 @@ class SpectralFlattener:
         self._short_norm = (self.SHORT_ALPHA * band_norm +
                             (1.0 - self.SHORT_ALPHA) * self._short_norm)
 
-        # ── Gate: only act when deep notches are present ───────────────────
+        # ── Gate: only integrate when deep notches are present ────────────
         deep_notches = [(nf, nd, nq) for nf, nd, nq in active_notches
                         if nd < self.NOTCH_ACTIVE_DB]
+
         if not deep_notches or rms <= self.VOICE_FLOOR:
-            # Release cuts toward 0 while no notches are active
-            self._cut_db *= (1.0 - self.CUT_SMOOTHING)
+            # Decay integrated prominence and release cuts while gate is closed
+            self._smooth_prom *= (1.0 - self.PROM_INT_DECAY)
+            self._cut_db      *= (1.0 - self.CUT_SMOOTHING)
             for i, filt in enumerate(self._filters):
                 filt.set_gain(float(self._cut_db[i]))
             return
@@ -175,7 +183,7 @@ class SpectralFlattener:
                 if abs(bf - nf) / bf < self.NOTCH_GUARD:
                     guard[i] = True
 
-        # Local-neighbor prominence: how much is each band above its neighbors?
+        # Instantaneous local-neighbor prominence
         prom_db = np.zeros(self.N_BANDS, dtype=np.float64)
         for i, nbrs in enumerate(self._neighbor_idx):
             if not nbrs:
@@ -185,10 +193,13 @@ class SpectralFlattener:
                 p = 10.0 * np.log10(self._short_norm[i] / neighbor_avg)
             prom_db[i] = 0.0 if not np.isfinite(p) else p
 
-        self._max_prom = np.maximum(self._max_prom, prom_db)
+        # Integrate prominence over time — phoneme bursts average toward zero,
+        # persistent notch-induced elevation accumulates above threshold.
+        self._smooth_prom += self.PROM_INT_ALPHA * (
+            np.maximum(prom_db, 0.0) - self._smooth_prom)
 
-        # Target cut: proportional to excess above threshold
-        excess = np.maximum(prom_db - self.PROMINENCE_DB, 0.0)
+        # Target cut based on INTEGRATED prominence
+        excess = np.maximum(self._smooth_prom - self.PROMINENCE_DB, 0.0)
         target = np.clip(-excess, self.MAX_CUT_DB, 0.0)
         target[guard] = 0.0
 
@@ -216,10 +227,11 @@ class SpectralFlattener:
             for f, db in active:
                 lines.append(f'  {f:.0f} Hz: {db:.1f} dB')
         lines.append(f'  threshold={self.PROMINENCE_DB} dB  '
-                     f'(local-neighbor: skip±{self.N_SKIP}, avg±{self.N_COMPARE})')
-        top = sorted(enumerate(self._max_prom), key=lambda x: -x[1])[:6]
-        lines.append('  peak local-prominence per band (top 6):')
-        for i, pk in top:
-            marker = ' ← cut' if pk >= self.PROMINENCE_DB else ''
-            lines.append(f'    {self.band_freqs[i]:.0f} Hz: {pk:.2f} dB{marker}')
+                     f'(local-neighbor: skip±{self.N_SKIP}, avg±{self.N_COMPARE}  '
+                     f'int_alpha={self.PROM_INT_ALPHA})')
+        top = sorted(enumerate(self._smooth_prom), key=lambda x: -x[1])[:8]
+        lines.append('  integrated prominence per band (top 8):')
+        for i, sp in top:
+            marker = ' ← cut' if sp >= self.PROMINENCE_DB else ''
+            lines.append(f'    {self.band_freqs[i]:.0f} Hz: {sp:.3f} dB{marker}')
         return '\n'.join(lines)
