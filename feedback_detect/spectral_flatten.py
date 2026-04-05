@@ -229,13 +229,21 @@ class SpectralFlattener:
             for f, db in active:
                 lines.append(f'  {f:.0f} Hz: {db:.1f} dB')
 
-        # Always show peak prominence per band so we can tune the threshold
         lines.append(f'  warmup_left={self._warmup_left}  threshold={self.PROMINENCE_DB} dB')
-        lines.append('  peak prominence seen per band (top 8):')
-        top = sorted(enumerate(self._max_prom_db), key=lambda x: -x[1])[:8]
-        for i, pk in top:
-            marker = ' ← would cut' if pk >= self.PROMINENCE_DB else ''
-            lines.append(f'    {self.band_freqs[i]:.0f} Hz: {pk:.2f} dB{marker}')
-        lines.append(f'  long_norm range: [{self._long_norm.min():.4f}, {self._long_norm.max():.4f}]'
-                     f'  (flat=={1/self.N_BANDS:.4f})')
+
+        # Show eligible (<2kHz, long_norm >= BAND_FLOOR) bands in detail
+        lines.append(f'  eligible bands (<{self.F_ACTIVE_MAX:.0f}Hz, ref>={self.BAND_FLOOR:.4f}):')
+        found_eligible = False
+        for i, f in enumerate(self.band_freqs):
+            if f > self.F_ACTIVE_MAX:
+                break
+            ln = self._long_norm[i]
+            eligible = ln >= self.BAND_FLOOR
+            lines.append(
+                f'    {f:6.0f} Hz  long={ln:.4f}  peak_prom={self._max_prom_db[i]:.2f}dB'
+                + ('' if eligible else '  [below floor, skipped]'))
+            if eligible:
+                found_eligible = True
+        if not found_eligible:
+            lines.append('    (none — all below BAND_FLOOR)')
         return '\n'.join(lines)
