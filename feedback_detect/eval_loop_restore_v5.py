@@ -87,7 +87,7 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
     # acc accumulator builds up sub-90 Hz energy that is never detected (below
     # MIN_FREQ_HZ=80 Hz) and never notched, clips mic_block, and creates
     # broadband harmonic distortion that sounds "underwater".
-    hpf_zi = np.zeros((_hpf_sos.shape[0], 1))
+    hpf_zi = np.zeros((_hpf_sos.shape[0], 2))
 
     for i in range(n // HOP):
         s = i * HOP
