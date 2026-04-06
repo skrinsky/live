@@ -277,17 +277,9 @@ class NotchBank:
                     else self.HOLD_FRAMES_PER_STEP)
 
     def _find_close(self, freq: float) -> float | None:
-        """Return the existing notch frequency closest to freq, but only if the
-        notch's current -3dB half-bandwidth (existing / (2*Q)) actually covers
-        freq.  This prevents a narrow notch at 775 Hz from absorbing an 855 Hz
-        detection that falls outside its suppression range — without tightening
-        FREQ_TOL_RATIO (which causes stacked-notch phase distortion)."""
-        for existing, state in self._notches.items():
-            if abs(existing - freq) / freq >= self.FREQ_TOL_RATIO:
-                continue
-            current_q = state[3]
-            half_bw = existing / (2.0 * current_q)
-            if abs(existing - freq) <= half_bw:
+        """Return the existing notch frequency closest to freq, if within FREQ_TOL_RATIO."""
+        for existing in self._notches:
+            if abs(existing - freq) / freq < self.FREQ_TOL_RATIO:
                 return existing
         return None
 
