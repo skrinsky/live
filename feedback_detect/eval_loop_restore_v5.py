@@ -80,6 +80,7 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
     lm_history   = np.zeros((N_FREQ, 11), dtype=np.float32)
     analysis_buf = np.zeros(N_FFT, dtype=np.float32)
     notch_logs   = []
+    prob_logs    = []   # per-frame prob_np snapshots for post-hoc diagnostics
 
     for i in range(n // HOP):
         s = i * HOP
@@ -123,6 +124,7 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
         out_block = notch_bank.process(mic_block)
         box_out[s:s+HOP] = out_block
         notch_logs.append(list(notch_bank.active_notches))
+        prob_logs.append(prob_np)
 
         # SpectralFlattener: adaptive wide-Q coloration correction
         if flattener is not None:
@@ -136,7 +138,7 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
         fb = np.convolve(flat_block.astype(np.float64), ir.astype(np.float64))
         acc[s:s + len(fb)] += fb
 
-    return mic_out[:n], box_out[:n], flat_out[:n], notch_logs
+    return mic_out[:n], box_out[:n], flat_out[:n], notch_logs, prob_logs
 
 
 def build_notch_mask_from_logs(notch_logs, n_frames):
@@ -228,7 +230,7 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     predictor.seed_from_ir(ir, gain=gain)
     notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
     flattener  = SpectralFlattener(_bin_freqs, sr=SR)
-    mic_sup, box_sup, flat_sup, notch_logs = simulate_notch(
+    mic_sup, box_sup, flat_sup, notch_logs, prob_logs = simulate_notch(
         voice_np, noise_np, ir, gain=gain,
         model_det=model_det, notch_bank=notch_bank,
         device=device, window=window, threshold=threshold,
@@ -236,6 +238,29 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     predictor.save()
     print(predictor.summary())
     print(f'  mic RMS: {_rms_db(mic_sup):.1f} dB')
+
+    # ── Notch frequency summary ────────────────────────────────────────────────
+    # Count how many frames each notch frequency was active (any depth).
+    from collections import Counter
+    notch_freq_counts: Counter = Counter()
+    for frame_notches in notch_logs:
+        for freq, depth, q in frame_notches:
+            notch_freq_counts[round(freq)] += 1
+    n_frames_total = len(notch_logs)
+    print(f'\nActive notch frequencies (>{int(n_frames_total*0.01)} frames = >1% of run):')
+    for freq, count in sorted(notch_freq_counts.items(), key=lambda x: -x[1]):
+        if count < n_frames_total * 0.01:
+            break
+        print(f'  {freq:6.0f} Hz  {count:5d} frames  ({100*count/n_frames_total:.0f}%)')
+
+    # ── 855 Hz detector probability diagnostic ────────────────────────────────
+    bin_855 = int(np.argmin(np.abs(_bin_freqs - 855.0)))
+    print(f'\nDetector probability at ~855 Hz (bin {bin_855} = {_bin_freqs[bin_855]:.1f} Hz):')
+    probs_855 = np.array([p[bin_855] for p in prob_logs])
+    print(f'  max={probs_855.max():.4f}  mean={probs_855.mean():.4f}  '
+          f'p90={np.percentile(probs_855, 90):.4f}  '
+          f'frames > 0.10: {(probs_855 > 0.10).sum()}  '
+          f'frames > 0.25: {(probs_855 > 0.25).sum()}')
 
     # ── Build notch mask from logs ─────────────────────────────────────────────
     # Use voice_restore FFT params (N_FFT=1024, HOP=480) — restorer expects 513 bins

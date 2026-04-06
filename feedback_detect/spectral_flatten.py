@@ -97,7 +97,7 @@ class SpectralFlattener:
 
     # Cut trigger: integrated band prominence must exceed this
     PROMINENCE_DB = 1.0
-    MAX_CUT_DB    = -4.0
+    MAX_CUT_DB    = -2.0
     CUT_Q         = 2.5     # wide, musical cut
     CUT_SMOOTHING = 0.05    # smooth attack to avoid modulation
 
