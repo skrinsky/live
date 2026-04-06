@@ -337,6 +337,22 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     flat_diff_rms = float(np.sqrt(np.mean((flat_sup[:L_flat] - box_sup[:L_flat])**2)))
     print(f'\nflattened vs suppressed RMS diff: {flat_diff_rms:.6f}  '
           f'(0.0 = flattener had no effect)')
+
+    # ── Spectral coloration map: flattened vs clean ─────────────────────────────
+    print('\nSpectral coloration (suppressed_out_flattened vs clean_reference, 1/3-oct bands):')
+    L_flat_cmp = min(len(flat_sup), len(clean_np))
+    flat_psd = _avg_spectrum(flat_sup[:L_flat_cmp])
+    for fc in centres:
+        lo, hi = fc / 2**(1/6), fc * 2**(1/6)
+        mask = (bin_hz >= lo) & (bin_hz < hi)
+        if not mask.any():
+            continue
+        ratio_db = 10.0 * np.log10((flat_psd[mask].mean() + 1e-20) /
+                                   (cln_psd[mask].mean()  + 1e-20))
+        bar = '█' * int(abs(ratio_db)) if abs(ratio_db) >= 0.5 else '·'
+        sign = '+' if ratio_db >= 0 else '-'
+        print(f'  {fc:5d} Hz  {sign}{abs(ratio_db):4.1f} dB  {bar}')
+
     print(f'\nSpectralFlattener: {flattener.summary()}')
     print(f'\nRMS dB — clean {_rms_db(clean_np):.1f} | '
           f'suppressed {_rms_db(box_sup[:L]):.1f} | '
