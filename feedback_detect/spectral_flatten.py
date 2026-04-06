@@ -194,7 +194,14 @@ class SpectralFlattener:
         for i, nbrs in enumerate(self._neighbor_idx):
             if not nbrs:
                 continue
-            neighbor_avg = self._short_norm[nbrs].mean() + 1e-20
+            # Exclude neighbors that are themselves elevated bridge bands
+            # (smooth_prom already above threshold) — they would pull the
+            # reference average up and hide adjacent bridges like 802 Hz.
+            # Falls back to all neighbors if none are reliable.
+            reliable = [j for j in nbrs
+                        if self._smooth_prom[j] < self.PROMINENCE_DB]
+            ref_nbrs = reliable if reliable else nbrs
+            neighbor_avg = self._short_norm[ref_nbrs].mean() + 1e-20
             with np.errstate(divide='ignore', invalid='ignore'):
                 p = 10.0 * np.log10(self._short_norm[i] / neighbor_avg)
             prom_db[i] = 0.0 if not np.isfinite(p) else p
