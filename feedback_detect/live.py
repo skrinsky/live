@@ -43,10 +43,29 @@ BLOCK_SIZE    = HOP      # samples per callback = one STFT frame (10 ms at 48 kH
 CLUSTER_TOL_RATIO = 0.18
 
 
+def _parabolic_peak(bin_freqs: np.ndarray, prob: np.ndarray, k: int) -> float:
+    """
+    Parabolic interpolation around bin k to find sub-bin peak frequency.
+    Fits a parabola to prob[k-1], prob[k], prob[k+1] and returns the
+    interpolated frequency at the parabola's peak.
+    Falls back to bin_freqs[k] if k is at the edge or the parabola is flat.
+    """
+    if k <= 0 or k >= len(prob) - 1:
+        return float(bin_freqs[k])
+    y0, y1, y2 = float(prob[k - 1]), float(prob[k]), float(prob[k + 1])
+    denom = y0 - 2.0 * y1 + y2
+    if abs(denom) < 1e-10:
+        return float(bin_freqs[k])
+    delta = 0.5 * (y0 - y2) / denom          # fractional bin offset, in [-0.5, 0.5]
+    delta = max(-0.5, min(0.5, delta))
+    bin_spacing = bin_freqs[1] - bin_freqs[0]  # linear spacing (SR / N_FFT)
+    return float(bin_freqs[k] + delta * bin_spacing)
+
+
 def _cluster_bins(bin_freqs: np.ndarray, prob: np.ndarray, mask: np.ndarray) -> list[float]:
     """
     Group above-threshold bins into clusters using log-scale frequency tolerance
-    and return the peak-probability frequency per cluster.
+    and return the parabolic-interpolated peak frequency per cluster.
     """
     if not mask.any():
         return []
@@ -65,7 +84,11 @@ def _cluster_bins(bin_freqs: np.ndarray, prob: np.ndarray, mask: np.ndarray) -> 
             current = [idx]
     clusters.append(current)
 
-    return [float(bin_freqs[c[np.argmax(prob[c])]]) for c in clusters]
+    result = []
+    for c in clusters:
+        peak_bin = c[np.argmax(prob[c])]
+        result.append(_parabolic_peak(bin_freqs, prob, peak_bin))
+    return result
 
 
 def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
