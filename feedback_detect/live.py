@@ -40,7 +40,7 @@ NOTCH_DEPTH   = -48.0
 BLOCK_SIZE    = HOP      # samples per callback = one STFT frame (10 ms at 48 kHz)
 
 # Log-scale cluster tolerance — matches NotchBank.FREQ_TOL_RATIO
-CLUSTER_TOL_RATIO = 0.18
+CLUSTER_TOL_RATIO = 0.08
 
 
 def _parabolic_peak(bin_freqs: np.ndarray, prob: np.ndarray, k: int) -> float:

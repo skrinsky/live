@@ -118,7 +118,7 @@ class NotchBank:
     """
 
     MAX_NOTCHES           = 24
-    FREQ_TOL_RATIO        = 0.18    # ±18% (~3 semitones) — log-scale mode matching
+    FREQ_TOL_RATIO        = 0.08    # ±8% — tight enough to separate nearby rings
     RELEASE_STEP_DB       = 3.0     # give back this many dB per probe step
     HOLD_FRAMES_PER_STEP  = 50      # frames between probe steps (~500ms at 100fps)
     LOCKED_HOLD_FRAMES    = 500     # frames between probes once locked (~5s at 100fps)

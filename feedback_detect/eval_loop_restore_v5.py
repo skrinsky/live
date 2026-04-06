@@ -152,7 +152,7 @@ def build_notch_mask_from_logs(notch_logs, n_frames):
 
 
 def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
-             det_ckpt=None, res_ckpt=None, out_dir=None):
+             det_ckpt=None, res_ckpt=None, out_dir=None, profile=None):
     det_path = Path(det_ckpt or CHECKPOINT_DET)
     res_path = Path(res_ckpt or CHECKPOINT_RES)
     assert det_path.exists(), f'No detector checkpoint at {det_path}'
@@ -225,8 +225,10 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
 
     # ── Run detector + notch loop ──────────────────────────────────────────────
     print('Running detector + NotchBank loop…')
-    profile_path = PROJECT_ROOT / 'data' / 'feedback_risk_profile.json'
-    predictor  = FeedbackPredictor(_bin_freqs, sr=SR, profile_path=profile_path)
+    # Eval starts fresh by default — no accumulated profile bleeding across runs.
+    # Pass --profile <path> to load/save the persistent profile (live use case).
+    predictor  = FeedbackPredictor(_bin_freqs, sr=SR,
+                                   profile_path=Path(profile) if profile else None)
     predictor.seed_from_ir(ir, gain=gain)
     notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
     flattener  = SpectralFlattener(_bin_freqs, sr=SR)
@@ -398,6 +400,9 @@ if __name__ == '__main__':
     p.add_argument('--detector',  type=str,   default=None)
     p.add_argument('--restorer',  type=str,   default=None)
     p.add_argument('--out-dir',   type=str,   default=None)
+    p.add_argument('--profile',   type=str,   default=None,
+                   help='path to risk profile JSON; if omitted a fresh predictor is used')
     args = p.parse_args()
     run_eval(gain=args.gain, duration_s=args.duration, threshold=args.threshold,
-             det_ckpt=args.detector, res_ckpt=args.restorer, out_dir=args.out_dir)
+             det_ckpt=args.detector, res_ckpt=args.restorer, out_dir=args.out_dir,
+             profile=args.profile)

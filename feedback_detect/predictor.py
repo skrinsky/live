@@ -79,7 +79,7 @@ class FeedbackPredictor:
     PREEMPTIVE_DEPTH_DB = -36.0
 
     # ── Matching ──────────────────────────────────────────────────────────────
-    FREQ_TOL_RATIO = 0.18   # ±18% (~3 semitones) — log-scale mode matching
+    FREQ_TOL_RATIO = 0.08   # ±8% — matches NotchBank, keeps nearby rings distinct
 
     def __init__(self,
                  bin_freqs:    np.ndarray,
