@@ -95,7 +95,10 @@ class SpectralFlattener:
     PROM_INT_ALPHA  = 0.002   # 500-frame = 5 s time constant
     PROM_INT_DECAY  = 0.0005  # release when gate closes (slower than attack)
 
-    # Cut trigger: integrated band prominence must exceed this
+    # Cut trigger: integrated WEIGHTED band prominence must exceed this.
+    # Prominence is scaled by _prom_weight before integration, so the effective
+    # threshold is lower in the perceptually sensitive voice-presence region
+    # (~800–2000 Hz) and higher at the extremes.
     PROMINENCE_DB = 1.0
     MAX_CUT_DB    = -4.0
     CUT_Q         = 2.5     # wide, musical cut
@@ -143,6 +146,15 @@ class SpectralFlattener:
         self._cut_db      = np.zeros(self.N_BANDS, dtype=np.float64)
         self._smooth_prom = np.zeros(self.N_BANDS, dtype=np.float64)  # integrated prominence
         self._peak_cut_db = np.zeros(self.N_BANDS, dtype=np.float64)  # most negative cut seen
+
+        # Perceptual prominence weights — log-Gaussian centred at 1200 Hz.
+        # The voice-presence region (~800–2000 Hz) gets weight ~2×, so coloration
+        # there crosses PROMINENCE_DB at half the raw prominence required at extremes.
+        # Effective threshold: PROMINENCE_DB / weight(f).
+        log_oct = np.log2(self.band_freqs / 1200.0)   # octaves from 1200 Hz
+        self._prom_weight = np.clip(
+            0.5 + 1.5 * np.exp(-0.5 * (log_oct / 1.5) ** 2),
+            0.5, 2.0).astype(np.float64)
 
         self._filters = [
             PeakingEQ(f, sr=sr, q=self.CUT_Q, gain_db=0.0)
@@ -201,8 +213,10 @@ class SpectralFlattener:
 
         # Integrate prominence over time — phoneme bursts average toward zero,
         # persistent notch-induced elevation accumulates above threshold.
+        # Weight by perceptual sensitivity before integrating so the voice-presence
+        # region (~800–2000 Hz) triggers at a lower raw prominence.
         self._smooth_prom += self.PROM_INT_ALPHA * (
-            np.maximum(prom_db, 0.0) - self._smooth_prom)
+            np.maximum(prom_db * self._prom_weight, 0.0) - self._smooth_prom)
 
         # Target cut based on INTEGRATED prominence
         excess = np.maximum(self._smooth_prom - self.PROMINENCE_DB, 0.0)
