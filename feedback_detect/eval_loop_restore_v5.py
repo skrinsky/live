@@ -236,10 +236,9 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
 
     # ── Run detector + notch loop ──────────────────────────────────────────────
     print('Running detector + NotchBank loop…')
-    # Eval starts fresh by default — no accumulated profile bleeding across runs.
-    # Pass --profile <path> to load/save the persistent profile (live use case).
+    default_profile = PROJECT_ROOT / 'data' / 'feedback_risk_profile.json'
     predictor  = FeedbackPredictor(_bin_freqs, sr=SR,
-                                   profile_path=Path(profile) if profile else None)
+                                   profile_path=Path(profile) if profile else default_profile)
     predictor.seed_from_ir(ir, gain=gain)
     notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
     flattener  = SpectralFlattener(_bin_freqs, sr=SR)
