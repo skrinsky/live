@@ -105,7 +105,12 @@ class SpectralFlattener:
     # During clean speech the spectral shape is not distorted by notches,
     # so this prevents cutting natural voice formants.
     NOTCH_ACTIVE_DB   = -10.0   # notch must be deeper than this to count
-    NOTCH_GUARD       = 0.25    # ±25% log-scale around active notch → no cut
+    # Guard zone: don't cut bands AT the notch frequency — the notch bank
+    # already handles those. ±8% is just wider than the notch's own -3dB
+    # bandwidth (Q≈5 → ±9%), so the notch itself is protected but the
+    # "bridge" band between adjacent notches (e.g. 802 Hz between 680/987)
+    # is eligible for SpectralFlattener cuts.
+    NOTCH_GUARD       = 0.08    # ±8% around active notch → no cut
 
     # Silence gate
     VOICE_FLOOR   = 1e-5
