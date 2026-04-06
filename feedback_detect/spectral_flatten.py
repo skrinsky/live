@@ -1,32 +1,28 @@
 """
-feedback_detect/spectral_flatten.py — Adaptive spectral coloration correction.
+feedback_detect/spectral_flatten.py — Notch-pair bridge EQ correction.
 
-After the NotchBank cuts at ring frequencies, neighboring bands stand out by
-contrast — the notch creates a spectral gap, making the untouched bands on
-either side sound perceptually prominent.
+When two deep notches sit within a critical band of each other (~1.25x,
+≈4 semitones), the unnotched region between them becomes perceptually
+elevated by contrast — the spectral gap makes the bridge stand out.
 
-Example: notches at ~680 Hz and ~987 Hz leave the 800 Hz region elevated
-by ~2.5 dB relative to its neighbors.  The historical-reference approach
-can't detect this because the effect is caused by the CURRENT spectral shape,
-not by a change over time.
+Example: notches at 775 Hz and 855 Hz (-48 dB each) leave ~814 Hz
+sounding elevated even though its absolute level has not changed.
 
 Design
 ------
-Compare each band's current smoothed energy to the average of its non-adjacent
-neighbors (skip ±1, average ±2–4).  Bands that are locally elevated because
-the notches dipped their neighbors get cut.  Only fires when deep notches are
-active — during clean speech the local spectral shape is not distorted by
-notches so false cuts are prevented by the notch-active gate.
+For each qualifying pair of active deep notches, place a gentle peaking
+cut at their geometric mean.  Cut depth scales with notch depth and is
+capped at MAX_CUT_DB.  Cuts attack smoothly when a pair is active and
+release when either notch lifts.
 
-Guard conditions:
-  1. Only when any notch is deeper than NOTCH_ACTIVE_THRESHOLD_DB — no cuts
-     during clean speech so natural voice formants are untouched.
-  2. Bands within NOTCH_GUARD (25%) of an active notch are excluded — the
-     notch itself is handled by NotchBank, not here.
+This is driven entirely by the notch bank state — it never fires during
+clean speech regardless of voice formant shape, and produces no false
+positives from spectral analysis.
 
 Only cuts — never boosts.  Cuts cannot cause feedback.
 """
 
+import math
 import numpy as np
 from scipy.signal import lfilter
 
@@ -48,7 +44,7 @@ class PeakingEQ:
         self.zi = np.zeros(2)
 
     def _set_coeffs(self):
-        A     = 10.0 ** (self.gain_db / 40.0)   # sqrt of linear gain
+        A     = 10.0 ** (self.gain_db / 40.0)
         w0    = 2.0 * np.pi * self.freq_hz / self.sr
         alpha = np.sin(w0) / (2.0 * self.q)
         cosw  = np.cos(w0)
@@ -75,184 +71,109 @@ class PeakingEQ:
 
 class SpectralFlattener:
 
-    N_BANDS       = 24
-    F_MIN         = 100.0
-    F_MAX         = 12000.0
-
-    # Short-term smoothing (frames at ~100 fps)
-    SHORT_ALPHA   = 0.05    # ~20 frames = 200 ms
-
-    # Local-neighbor comparison window
-    # N_SKIP=0 means immediate neighbors ARE included — the notched adjacent
-    # bands (e.g. 651 Hz and 987 Hz) are directly compared to 802 Hz, which
-    # is exactly what exposes the notch-induced spectral hump.
-    N_SKIP        = 0
-    N_COMPARE     = 3
-
-    # Prominence integration: slow EMA of local prominence (notch-gate open only).
-    # Phoneme bursts (brief, large) average toward zero over the integration window.
-    # Persistent notch-induced elevation (~1-2 dB sustained) accumulates above threshold.
-    PROM_INT_ALPHA  = 0.002   # 500-frame = 5 s time constant
-    PROM_INT_DECAY  = 0.0005  # release when gate closes (slower than attack)
-
-    # Cut trigger: integrated band prominence must exceed this
-    PROMINENCE_DB = 1.0
-    MAX_CUT_DB    = -2.0
-    CUT_Q         = 2.5     # wide, musical cut
-    CUT_SMOOTHING = 0.05    # smooth attack to avoid modulation
-
-    # Gate: only compare / cut when deep notches are active.
-    # During clean speech the spectral shape is not distorted by notches,
-    # so this prevents cutting natural voice formants.
-    NOTCH_ACTIVE_DB   = -10.0   # notch must be deeper than this to count
-    # Guard zone: don't cut bands AT the notch frequency — the notch bank
-    # already handles those. Kept tight (±3%) so the bridge band between
-    # closely-spaced notches (e.g. 825 Hz between 775 and 855 Hz) is
-    # eligible for SpectralFlattener cuts. A notched band sits at -48 dB
-    # and appears depressed vs neighbours, so SpectralFlattener naturally
-    # won't want to cut it — the guard is only needed to exclude the
-    # immediate notch centre bin itself.
-    NOTCH_GUARD       = 0.03    # ±3% around active notch → no cut
-
-    # Silence gate
-    VOICE_FLOOR   = 1e-5
+    # A pair qualifies when the two notches are within ~4 semitones (1.25×).
+    # Wider pairs are rare as isolated bridge cases — in a dense cluster,
+    # the bridge is usually already covered by another notch.
+    MAX_PAIR_RATIO    = 1.25    # ≈ 4 semitones
+    MIN_NOTCH_DB      = -20.0   # both notches must be at least this deep
+    BRIDGE_CUT_FACTOR = 0.08    # cut = min(notch_depths_db) × factor
+    MAX_CUT_DB        = -4.0    # absolute ceiling on any bridge cut
+    CUT_Q             = 2.5     # wide, musical cut
+    CUT_SMOOTHING     = 0.05    # EMA frames toward target (attack)
+    RELEASE_SMOOTHING = 0.02    # slower release than attack
+    IDLE_FRAMES       = 200     # frames at ~0 dB before removing filter
 
     def __init__(self, bin_freqs: np.ndarray, sr: int = 48000):
-        self.bin_freqs  = bin_freqs
-        self.sr         = sr
-
-        self.band_freqs = np.logspace(
-            np.log10(self.F_MIN), np.log10(self.F_MAX), self.N_BANDS)
-
-        # Bin-to-band mapping
-        edges = np.logspace(
-            np.log10(self.F_MIN * 2 ** (-1.0 / self.N_BANDS)),
-            np.log10(self.F_MAX * 2 ** ( 1.0 / self.N_BANDS)),
-            self.N_BANDS + 1)
-        self._band_masks = [
-            (bin_freqs >= edges[i]) & (bin_freqs < edges[i + 1])
-            for i in range(self.N_BANDS)
-        ]
-
-        # Pre-compute neighbor index sets for local comparison
-        self._neighbor_idx = []
-        for i in range(self.N_BANDS):
-            nbrs = [j for j in range(self.N_BANDS)
-                    if (self.N_SKIP < abs(j - i) <= self.N_SKIP + self.N_COMPARE)]
-            self._neighbor_idx.append(nbrs)
-
-        self._short_norm  = np.ones(self.N_BANDS, dtype=np.float64) / self.N_BANDS
-        self._cut_db      = np.zeros(self.N_BANDS, dtype=np.float64)
-        self._smooth_prom = np.zeros(self.N_BANDS, dtype=np.float64)  # integrated prominence
-        self._peak_cut_db = np.zeros(self.N_BANDS, dtype=np.float64)  # most negative cut seen
-
-        self._filters = [
-            PeakingEQ(f, sr=sr, q=self.CUT_Q, gain_db=0.0)
-            for f in self.band_freqs
-        ]
+        self.bin_freqs = bin_freqs
+        self.sr        = sr
+        # {(f_low, f_high): [PeakingEQ, current_cut_db, idle_counter]}
+        self._bridges: dict[tuple[float, float], list] = {}
+        self._peak_cuts: dict[tuple[float, float], float] = {}
 
     # ── public ────────────────────────────────────────────────────────────────
 
     def update(self, stft_mag: np.ndarray, rms: float,
-               active_notches: 'list[tuple[float,float,float]]'):
+               active_notches: 'list[tuple[float, float, float]]'):
         """
-        stft_mag       : (N_FREQ,) linear magnitude from current STFT frame
-        rms            : RMS of current audio block (silence gate)
+        stft_mag       : unused (kept for API compatibility)
+        rms            : unused
         active_notches : notch_bank.active_notches → [(freq, depth_db, q), ...]
         """
-        # Per-band power, normalised to spectral shape
-        band_power = np.array([
-            float((stft_mag[m] ** 2).sum()) + 1e-20
-            for m in self._band_masks
-        ])
-        total      = band_power.sum() + 1e-20
-        band_norm  = band_power / total
+        deep = [(f, d, q) for f, d, q in active_notches if d <= self.MIN_NOTCH_DB]
 
-        # Short-term smoothing — 200 ms, survives phoneme transitions
-        self._short_norm = (self.SHORT_ALPHA * band_norm +
-                            (1.0 - self.SHORT_ALPHA) * self._short_norm)
+        # Build target cuts for each qualifying pair
+        targets: dict[tuple[float, float], tuple[float, float]] = {}
+        for i in range(len(deep)):
+            f1, d1, q1 = deep[i]
+            for j in range(i + 1, len(deep)):
+                f2, d2, q2 = deep[j]
+                f_lo, f_hi = (f1, f2) if f1 < f2 else (f2, f1)
+                if f_hi / f_lo > self.MAX_PAIR_RATIO:
+                    continue
+                bridge = math.sqrt(f_lo * f_hi)
+                # Skip if bridge is already within the suppression range
+                # of another active notch (it's handled, no bridge effect)
+                if any(abs(bridge - f) <= f / (2.0 * q)
+                       for f, _, q in active_notches):
+                    continue
+                cut = max(min(d1, d2) * self.BRIDGE_CUT_FACTOR, self.MAX_CUT_DB)
+                targets[(f_lo, f_hi)] = (bridge, cut)
 
-        # ── Gate: only integrate when deep notches are present ────────────
-        deep_notches = [(nf, nd, nq) for nf, nd, nq in active_notches
-                        if nd < self.NOTCH_ACTIVE_DB]
+        # Update existing bridge filters
+        for key in list(self._bridges):
+            filt, cur_cut, idle = self._bridges[key]
+            if key in targets:
+                _, target_cut = targets[key]
+                new_cut = cur_cut + self.CUT_SMOOTHING * (target_cut - cur_cut)
+                self._bridges[key][1] = new_cut
+                self._bridges[key][2] = 0
+                filt.set_gain(float(new_cut))
+            else:
+                new_cut = cur_cut + self.RELEASE_SMOOTHING * (0.0 - cur_cut)
+                if abs(new_cut) < 0.05:
+                    new_cut = 0.0
+                self._bridges[key][1] = new_cut
+                filt.set_gain(float(new_cut))
+                if abs(new_cut) < 0.05:
+                    self._bridges[key][2] = idle + 1
+                    if self._bridges[key][2] >= self.IDLE_FRAMES:
+                        del self._bridges[key]
+                        continue
+            self._peak_cuts[key] = min(
+                self._peak_cuts.get(key, 0.0), self._bridges[key][1])
 
-        if not deep_notches or rms <= self.VOICE_FLOOR:
-            # Decay integrated prominence and release cuts while gate is closed
-            self._smooth_prom *= (1.0 - self.PROM_INT_DECAY)
-            self._cut_db      *= (1.0 - self.CUT_SMOOTHING)
-            for i, filt in enumerate(self._filters):
-                filt.set_gain(float(self._cut_db[i]))
-            return
-
-        # Guard zone: bands within NOTCH_GUARD of an active notch
-        guard = np.zeros(self.N_BANDS, dtype=bool)
-        for nf, _, _ in deep_notches:
-            for i, bf in enumerate(self.band_freqs):
-                if abs(bf - nf) / bf < self.NOTCH_GUARD:
-                    guard[i] = True
-
-        # Instantaneous local-neighbor prominence
-        prom_db = np.zeros(self.N_BANDS, dtype=np.float64)
-        for i, nbrs in enumerate(self._neighbor_idx):
-            if not nbrs:
-                continue
-            # Use median instead of mean — robust to outlier elevated bridge
-            # bands in the neighbor set without requiring explicit exclusion
-            # (which can cascade when many bands are simultaneously elevated).
-            neighbor_med = float(np.median(self._short_norm[nbrs])) + 1e-20
-            with np.errstate(divide='ignore', invalid='ignore'):
-                p = 10.0 * np.log10(self._short_norm[i] / neighbor_med)
-            prom_db[i] = 0.0 if not np.isfinite(p) else p
-
-        # Integrate prominence over time — phoneme bursts average toward zero,
-        # persistent notch-induced elevation accumulates above threshold.
-        self._smooth_prom += self.PROM_INT_ALPHA * (
-            np.maximum(prom_db, 0.0) - self._smooth_prom)
-
-        # Target cut based on INTEGRATED prominence
-        excess = np.maximum(self._smooth_prom - self.PROMINENCE_DB, 0.0)
-        target = np.clip(-excess, self.MAX_CUT_DB, 0.0)
-        target[guard] = 0.0
-
-        # Smooth toward target
-        self._cut_db += self.CUT_SMOOTHING * (target - self._cut_db)
-        self._peak_cut_db = np.minimum(self._peak_cut_db, self._cut_db)
-
-        for i, filt in enumerate(self._filters):
-            filt.set_gain(float(self._cut_db[i]))
+        # Add new bridge filters
+        for key, (bridge_freq, _) in targets.items():
+            if key not in self._bridges:
+                filt = PeakingEQ(bridge_freq, sr=self.sr,
+                                 q=self.CUT_Q, gain_db=0.0)
+                self._bridges[key] = [filt, 0.0, 0]
 
     def process(self, audio_block: np.ndarray) -> np.ndarray:
-        """Apply current EQ to the audio block."""
+        """Apply all active bridge cuts in series."""
         y = audio_block.astype(np.float32)
-        for filt in self._filters:
-            y = filt.process(y)
+        for filt, cut, _ in self._bridges.values():
+            if abs(cut) > 0.05:
+                y = filt.process(y)
         return y
 
     def summary(self) -> str:
-        active = [(self.band_freqs[i], self._cut_db[i])
-                  for i in range(self.N_BANDS) if self._cut_db[i] < -0.5]
+        active = [(k, v[1]) for k, v in self._bridges.items() if abs(v[1]) > 0.1]
         lines = []
         if not active:
-            lines.append('SpectralFlattener: no active cuts')
+            lines.append('SpectralFlattener: no active bridge cuts')
         else:
-            lines.append('SpectralFlattener cuts:')
-            for f, db in active:
-                lines.append(f'  {f:.0f} Hz: {db:.1f} dB')
-        lines.append(f'  threshold={self.PROMINENCE_DB} dB  '
-                     f'(local-neighbor: skip±{self.N_SKIP}, avg±{self.N_COMPARE}  '
-                     f'int_alpha={self.PROM_INT_ALPHA})')
-        top = sorted(enumerate(self._smooth_prom), key=lambda x: -x[1])[:8]
-        lines.append('  integrated prominence per band (top 8):')
-        for i, sp in top:
-            marker = ' ← cut' if sp >= self.PROMINENCE_DB else ''
-            lines.append(f'    {self.band_freqs[i]:.0f} Hz: {sp:.3f} dB{marker}')
-        # Peak cuts show what was actually applied during the run (cuts release at end)
-        peak = [(self.band_freqs[i], self._peak_cut_db[i])
-                for i in range(self.N_BANDS) if self._peak_cut_db[i] < -0.1]
-        if peak:
-            lines.append('  peak cuts applied during run:')
-            for f, db in sorted(peak, key=lambda x: x[1]):
-                lines.append(f'    {f:.0f} Hz: {db:.2f} dB')
-        else:
-            lines.append('  peak cuts applied during run: none')
+            lines.append('SpectralFlattener bridge cuts:')
+            for (f1, f2), cut in sorted(active, key=lambda x: x[1]):
+                bridge = math.sqrt(f1 * f2)
+                lines.append(f'  {bridge:.0f} Hz '
+                              f'(between {f1:.0f}/{f2:.0f} Hz): {cut:.1f} dB')
+        if self._peak_cuts:
+            peak = [(k, v) for k, v in self._peak_cuts.items() if v < -0.1]
+            if peak:
+                lines.append('  peak bridge cuts during run:')
+                for (f1, f2), cut in sorted(peak, key=lambda x: x[1]):
+                    bridge = math.sqrt(f1 * f2)
+                    lines.append(f'    {bridge:.0f} Hz '
+                                 f'({f1:.0f}/{f2:.0f} Hz): {cut:.2f} dB')
         return '\n'.join(lines)
