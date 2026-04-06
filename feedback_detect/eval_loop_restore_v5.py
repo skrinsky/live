@@ -82,12 +82,23 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
     notch_logs   = []
     prob_logs    = []   # per-frame prob_np snapshots for post-hoc diagnostics
 
+    # Stateful HPF — mirrors live.py: mic is high-pass filtered (90 Hz) before
+    # the notch bank and before feeding back to the speaker.  Without this the
+    # acc accumulator builds up sub-90 Hz energy that is never detected (below
+    # MIN_FREQ_HZ=80 Hz) and never notched, clips mic_block, and creates
+    # broadband harmonic distortion that sounds "underwater".
+    hpf_zi = np.zeros((_hpf_sos.shape[0], 1))
+
     for i in range(n // HOP):
         s = i * HOP
-        mic_block = (voice_np[s:s+HOP].astype(np.float64) +
-                     noise_np[s:s+HOP].astype(np.float64) +
-                     acc[s:s+HOP])
-        mic_block = np.clip(mic_block, -1.0, 1.0).astype(np.float32)
+        raw = (voice_np[s:s+HOP].astype(np.float64) +
+               noise_np[s:s+HOP].astype(np.float64) +
+               acc[s:s+HOP])
+        raw = np.clip(raw, -1.0, 1.0).astype(np.float32)
+
+        # HPF with persisted state — matches live.py block_hpf processing
+        mic_block, hpf_zi = sosfilt(_hpf_sos, raw, zi=hpf_zi)
+        mic_block = mic_block.astype(np.float32)
         mic_out[s:s+HOP] = mic_block
 
         analysis_buf = np.roll(analysis_buf, -HOP)
