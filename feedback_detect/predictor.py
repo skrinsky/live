@@ -108,8 +108,14 @@ class FeedbackPredictor:
 
         Finds the top-N spectral peaks in the loop's frequency response (IR × gain)
         that stand above the mean by at least peak_db_above_mean dB, and assigns
-        each a risk value of RISK_THRESHOLD - 0.5 across all voice states so they
-        fire pre-emption on the very first sub-threshold detector hint.
+        each a risk value of RISK_THRESHOLD across all voice states so they fire
+        pre-emption on the very first sub-threshold detector hint (prob > PRE_TRIGGER_PROB).
+
+        Seeding at exactly RISK_THRESHOLD (not below) means pre-emption fires
+        immediately — no accumulated ring event required.  Without this, with a
+        fresh profile, the ring grows unchecked until full-threshold detection fires,
+        which can be late enough that the peak amplitude clips and creates harmonic
+        distortion that persists for the rest of the run.
 
         In real-world use the equivalent is a brief soundcheck sweep measurement.
         """
@@ -133,9 +139,9 @@ class FeedbackPredictor:
             key = existing if existing is not None else freq
             if key not in self._risk:
                 self._risk[key] = np.zeros(self.N_STATES, dtype=np.float32)
-            # Set just below threshold — one real ring event pushes it over
+            # Set at threshold — fires pre-emption on the first detector hint
             self._risk[key][:] = np.maximum(
-                self._risk[key], self.RISK_THRESHOLD - 0.5)
+                self._risk[key], self.RISK_THRESHOLD)
             seeded += 1
 
         print(f'[FeedbackPredictor] seeded {seeded} IR-derived risk entries '
