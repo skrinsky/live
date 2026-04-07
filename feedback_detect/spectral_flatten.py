@@ -69,14 +69,19 @@ class PeakingEQ:
 
 class ChronicRingEQ:
 
-    TOP_N           = 8       # top N risk frequencies to cut
-    MIN_RISK        = 3.0     # minimum risk score to qualify (> predictor RISK_THRESHOLD=2.0)
-    MIN_CUT_DB      = -3.0    # cut at MIN_RISK
-    MAX_CUT_DB      = -12.0   # cut at RISK_MAX
-    RISK_MAX        = 20.0    # matches FeedbackPredictor.RISK_MAX
-    CUT_Q           = 2.0     # wide — not surgical
-    UPDATE_INTERVAL = 100     # frames between risk profile re-reads (~1 s at 100 fps)
-    CUT_SMOOTHING   = 0.02    # EMA per frame toward target (~50-frame / 500 ms time constant)
+    TOP_N               = 8       # top N risk frequencies to cut
+    MIN_RISK            = 3.0     # minimum risk score to qualify (> predictor RISK_THRESHOLD=2.0)
+    MIN_CUT_DB          = -2.0    # cut at MIN_RISK
+    MAX_CUT_DB          = -6.0    # cut at RISK_MAX — "a little wide EQ cut"
+    RISK_MAX            = 20.0    # matches FeedbackPredictor.RISK_MAX
+    CUT_Q               = 2.0     # wide — not surgical
+    # Skip chronic cut if the notch bank already has a deep notch whose
+    # -3dB half-bandwidth (nf / 2Q) actually covers the ring frequency.
+    # Uses physical coverage, not a fixed ratio, to avoid skipping overflow
+    # frequencies that sit just outside a notch's suppression range.
+    NOTCH_SKIP_DB       = -20.0   # if active notch is deeper than this, check coverage
+    UPDATE_INTERVAL     = 100     # frames between risk profile re-reads (~1 s at 100 fps)
+    CUT_SMOOTHING       = 0.02    # EMA per frame toward target (~50-frame / 500 ms time constant)
 
     def __init__(self, sr: int = 48000):
         self.sr = sr
@@ -85,7 +90,8 @@ class ChronicRingEQ:
         self._current_cuts: dict[float, float]     = {}
         self._targets:      dict[float, float]     = {}
         self._peak_cuts:    dict[float, float]     = {}
-        self._frame_count   = 0
+        self._frame_count    = 0
+        self._active_notches: 'list[tuple[float, float, float]]' = []
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -93,8 +99,9 @@ class ChronicRingEQ:
                active_notches: 'list[tuple[float, float, float]]'):
         """
         risk_profile   : predictor.risk_profile → {freq: np.ndarray(N_STATES,)}
-        active_notches : notch_bank.active_notches (unused, reserved for future)
+        active_notches : notch_bank.active_notches → [(freq, depth_db, q), ...]
         """
+        self._active_notches = active_notches
         self._frame_count += 1
         if self._frame_count >= self.UPDATE_INTERVAL:
             self._frame_count = 0
@@ -142,7 +149,18 @@ class ChronicRingEQ:
                   for freq, risk in risk_profile.items()
                   if float(risk.max()) >= self.MIN_RISK]
         scored.sort(key=lambda x: -x[1])
-        top = {freq: self._risk_to_cut(score) for freq, score in scored[:self.TOP_N]}
+        # Filter out frequencies already covered by a deep notch bank slot
+        deep_notches = [(f, q) for f, d, q in self._active_notches
+                        if d <= self.NOTCH_SKIP_DB]
+        top = {}
+        for freq, score in scored:
+            if len(top) >= self.TOP_N:
+                break
+            # Skip if any deep notch's half-BW physically covers this frequency
+            covered = any(abs(freq - nf) <= nf / (2.0 * q)
+                          for nf, q in deep_notches)
+            if not covered:
+                top[freq] = self._risk_to_cut(score)
 
         # Set releasing targets for frequencies no longer in top-N
         for freq in list(self._targets):
