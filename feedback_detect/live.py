@@ -15,7 +15,7 @@ Usage:
 """
 
 import sys
-import signal
+import time
 import argparse
 import numpy as np
 import torch
@@ -182,18 +182,17 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
         if outdata.shape[1] > 1:
             outdata[:, 1] = processed
 
-        # Status line
-        if notch_bank.active_notches or detected_freqs:
-            notch_str = ', '.join(f'{f:.0f}Hz/{d:.0f}dB'
-                                  for f, d, _ in notch_bank.active_notches)
-            det_str   = ', '.join(f'{f:.0f}' for f in detected_freqs) or '—'
-            pre_str   = ', '.join(f'{f:.0f}' for f in preemptive)     or '—'
-            print(f'\rDet:[{det_str}]  Pre:[{pre_str}]  Notches:[{notch_str}]'
-                  f'  Makeup:{makeup_gain.current_db:+.1f}dB    ',
-                  end='', flush=True)
+        # Status line — always print so you can see what's happening
+        notch_str = ', '.join(f'{f:.0f}Hz/{d:.0f}dB'
+                              for f, d, _ in notch_bank.active_notches) or '—'
+        det_str   = ', '.join(f'{f:.0f}' for f in detected_freqs) or '—'
+        pre_str   = ', '.join(f'{f:.0f}' for f in preemptive)     or '—'
+        peak_prob = float(prob_np.max())
+        print(f'\rDet:[{det_str}]  Pre:[{pre_str}]  Notches:[{notch_str}]'
+              f'  PeakP:{peak_prob:.2f}  Makeup:{makeup_gain.current_db:+.1f}dB    ',
+              end='', flush=True)
 
-    # ── Graceful shutdown ─────────────────────────────────────────────────────
-    def _shutdown(sig, frame):
+    def _shutdown():
         print('\n')
         print(predictor.summary())
         if save_profile:
@@ -201,21 +200,20 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
             predictor.profile_path = profile_path
             predictor.save()
             print(f'Profile saved to {profile_path}')
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, _shutdown)
 
     print(f'Running at {SR} Hz  block={BLOCK_SIZE} samples ({1000*BLOCK_SIZE/SR:.1f} ms)')
     print(f'threshold={threshold}  depth={depth_db} dB')
-    print('Ctrl+C to stop and save profile.\n')
+    print('Ctrl+C to stop.\n')
 
-    import time
-    with sd.Stream(samplerate=SR, blocksize=BLOCK_SIZE,
-                   dtype='float32', channels=1,
-                   device=audio_device,
-                   callback=callback):
-        while True:
-            time.sleep(0.1)
+    try:
+        with sd.Stream(samplerate=SR, blocksize=BLOCK_SIZE,
+                       dtype='float32', channels=1,
+                       device=audio_device,
+                       callback=callback):
+            while True:
+                time.sleep(0.1)
+    except KeyboardInterrupt:
+        _shutdown()
 
 
 if __name__ == '__main__':
