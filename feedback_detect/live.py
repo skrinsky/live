@@ -29,7 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT / 'feedback_detect'))
 from model            import FeedbackDetector, SR, N_FFT, HOP, N_FREQ
 from notch            import NotchBank
 from predictor        import FeedbackPredictor
-from spectral_flatten import ChronicRingEQ, AdaptiveMakeupGain, FeedbackGainRider
+from spectral_flatten import ChronicRingEQ, AdaptiveMakeupGain, FeedbackGainRider, FastRingDetector
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 CHECKPOINT    = PROJECT_ROOT / 'checkpoints' / 'feedback_detect' / 'best.pt'
@@ -112,6 +112,7 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
     predictor    = FeedbackPredictor(bin_freqs, sr=SR, profile_path=None)
     notch_bank   = NotchBank(sr=SR, depth_db=depth_db)
     chronic_eq   = ChronicRingEQ(bin_freqs, sr=SR)
+    fast_det     = FastRingDetector(bin_freqs, sr=SR)
     gain_rider   = FeedbackGainRider()
     makeup_gain  = AdaptiveMakeupGain()
 
@@ -174,8 +175,12 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
         chronic_eq.update(prob_np, notch_bank.active_notches)
         processed = chronic_eq.process(processed)
 
-        # ── Gain rider: duck on detection, return to unity when quiet ─────
-        ride_scalar = gain_rider.update(len(detected_freqs))
+        # ── Fast spike detector + gain rider ──────────────────────────────
+        # Fast path (~10 ms): magnitude spike → duck gain immediately
+        # Slow path (~100 ms): neural detector → permanent notch
+        n_spikes    = fast_det.update(mag[0, :, 0].cpu().numpy())
+        ride_trig   = len(detected_freqs) + n_spikes
+        ride_scalar = gain_rider.update(ride_trig)
         processed   = processed * ride_scalar
 
         # ── Output ────────────────────────────────────────────────────────
@@ -190,7 +195,7 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
         pre_str   = ', '.join(f'{f:.0f}' for f in preemptive)     or '—'
         peak_prob = float(prob_np.max())
         rms_db    = 20.0 * np.log10(float(np.sqrt(np.mean(block**2))) + 1e-9)
-        print(f'\rIn:{rms_db:+.0f}dB  PeakP:{peak_prob:.2f}  '
+        print(f'\rIn:{rms_db:+.0f}dB  PeakP:{peak_prob:.2f}  Spikes:{n_spikes}  '
               f'Det:[{det_str}]  Notches:[{notch_str}]  '
               f'Ride:{gain_rider.current_db:+.1f}dB    ',
               end='', flush=True)

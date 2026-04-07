@@ -23,6 +23,47 @@ import numpy as np
 from scipy.signal import lfilter
 
 
+class FastRingDetector:
+    """
+    Frame-by-frame spectral spike detector for fast feedback onset.
+
+    Compares current bin magnitude against a slow-moving per-bin background.
+    Fires when any bin rises SPIKE_DB above its recent background level.
+    Response time: 1-2 frames (~10-20 ms) vs ~100 ms for the neural model.
+
+    Only triggers the gain rider — the neural model still handles permanent notches.
+    """
+
+    SPIKE_DB    = 15.0   # dB rise above background to trigger
+    BG_ALPHA    = 0.05   # background EMA (~20 frames / 200 ms at 100 fps)
+    MIN_FREQ_HZ = 80.0
+
+    def __init__(self, bin_freqs: np.ndarray, sr: int = 48000):
+        self.bin_freqs = bin_freqs
+        self._bg_log   = None
+        self._valid    = (bin_freqs >= self.MIN_FREQ_HZ) & (bin_freqs < sr / 2)
+
+    def update(self, mag_np: np.ndarray) -> int:
+        """
+        mag_np : (N_FREQ,) linear STFT magnitude this frame.
+        Returns number of spiking bins (>0 → duck the gain rider).
+        """
+        log_mag = np.log(mag_np + 1e-8)
+
+        if self._bg_log is None:
+            self._bg_log = log_mag.copy()
+            return 0
+
+        rise_db = (log_mag - self._bg_log) * (20.0 / np.log(10))
+        n_spikes = int(np.sum(self._valid & (rise_db > self.SPIKE_DB)))
+
+        # Update background — slower when spiking to avoid chasing the ring
+        alpha = self.BG_ALPHA * 0.1 if n_spikes > 0 else self.BG_ALPHA
+        self._bg_log += alpha * (log_mag - self._bg_log)
+
+        return n_spikes
+
+
 class FeedbackGainRider:
     """
     Breaks the feedback loop by ducking output gain the instant a ring is
