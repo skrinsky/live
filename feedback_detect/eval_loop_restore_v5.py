@@ -377,8 +377,8 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
         print(f'  {fc:5d} Hz  {sign}{abs(ratio_db):4.1f} dB  {bar}')
 
     flat_diff_rms = float(np.sqrt(np.mean((flat_sup[:L_flat] - box_sup[:L_flat])**2)))
-    print(f'\nchronic_eq vs suppressed RMS diff: {flat_diff_rms:.6f}  '
-          f'(0.0 = chronic EQ had no effect)')
+    print(f'\npost-notch EQ vs suppressed RMS diff: {flat_diff_rms:.6f}  '
+          f'(0.0 = no EQ active)')
 
     # ── Spectral coloration map: flattened vs clean ─────────────────────────────
     print('\nSpectral coloration (suppressed_out_flattened vs clean_reference, 1/3-oct bands):')
@@ -395,7 +395,6 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
         sign = '+' if ratio_db >= 0 else '-'
         print(f'  {fc:5d} Hz  {sign}{abs(ratio_db):4.1f} dB  {bar}')
 
-    print(f'\nChronicRingEQ: {chronic_eq.summary()}')
     print(f'\nRMS dB — clean {_rms_db(clean_np):.1f} | '
           f'suppressed {_rms_db(box_sup[:L]):.1f} | '
           f'flattened {_rms_db(flat_sup[:L_flat]):.1f} | '
