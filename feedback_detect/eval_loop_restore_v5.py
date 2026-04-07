@@ -123,12 +123,14 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
         else:
             flat_block = out_block
 
-        # Adaptive makeup gain — ramps up when quiet, backs off on new detections
+        # Adaptive makeup gain — applied to output only, NOT to the feedback path
         if makeup_gain is not None:
-            gain_scalar = makeup_gain.update(freqs, notch_bank.active_notches)
-            flat_block  = np.clip(flat_block * gain_scalar, -1.0, 1.0)
+            gain_scalar  = makeup_gain.update(freqs, notch_bank.active_notches)
+            flat_out_blk = np.clip(flat_block * gain_scalar, -1.0, 1.0)
+        else:
+            flat_out_blk = flat_block
 
-        flat_out[s:s+HOP] = flat_block
+        flat_out[s:s+HOP] = flat_out_blk
 
         fb = np.convolve(flat_block.astype(np.float64), ir.astype(np.float64))
         acc[s:s + len(fb)] += fb
