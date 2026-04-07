@@ -218,12 +218,11 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
                                    profile_path=Path(profile) if profile else default_profile)
     predictor.seed_from_ir(ir, gain=gain)
     notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
-    chronic_eq = ChronicRingEQ(sr=SR)
     mic_sup, box_sup, flat_sup, notch_logs, prob_logs = simulate_notch(
         voice_np, noise_np, ir, gain=gain,
         model_det=model_det, notch_bank=notch_bank,
         device=device, window=window, threshold=threshold,
-        predictor=predictor, chronic_eq=chronic_eq)
+        predictor=predictor, chronic_eq=None)
     predictor.save()
     print(predictor.summary())
     print(f'  mic RMS: {_rms_db(mic_sup):.1f} dB')
@@ -242,14 +241,43 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
             break
         print(f'  {freq:6.0f} Hz  {count:5d} frames  ({100*count/n_frames_total:.0f}%)')
 
-    # ── 855 Hz detector probability diagnostic ────────────────────────────────
-    bin_855 = int(np.argmin(np.abs(_bin_freqs - 855.0)))
-    print(f'\nDetector probability at ~855 Hz (bin {bin_855} = {_bin_freqs[bin_855]:.1f} Hz):')
-    probs_855 = np.array([p[bin_855] for p in prob_logs])
-    print(f'  max={probs_855.max():.4f}  mean={probs_855.mean():.4f}  '
-          f'p90={np.percentile(probs_855, 90):.4f}  '
-          f'frames > 0.10: {(probs_855 > 0.10).sum()}  '
-          f'frames > 0.25: {(probs_855 > 0.25).sum()}')
+    # ── Ring zone diagnostic: detector vs notch bank, 600–1100 Hz ────────────
+    # Shows every STFT bin in the zone: peak detector prob, whether a notch
+    # was ever placed there, and whether high-prob frames were absorbed by a
+    # nearby notch instead of getting their own slot.
+    ZONE_LO, ZONE_HI = 600.0, 1100.0
+    prob_arr = np.array(prob_logs)          # (n_frames, N_FREQ)
+    zone_mask = (_bin_freqs >= ZONE_LO) & (_bin_freqs <= ZONE_HI)
+    zone_bins = np.where(zone_mask)[0]
+
+    # Per-bin peak probability across the whole run
+    peak_prob = prob_arr[:, zone_bins].max(axis=0)
+
+    # Which notch freqs appeared in this zone across the run
+    notch_zone: dict[float, int] = {}
+    for frame_notches in notch_logs:
+        for f, _, _ in frame_notches:
+            if ZONE_LO <= f <= ZONE_HI:
+                notch_zone[f] = notch_zone.get(f, 0) + 1
+
+    print(f'\nRing zone {ZONE_LO:.0f}–{ZONE_HI:.0f} Hz — detector peak prob per bin '
+          f'(threshold={threshold}):')
+    for i, bin_idx in enumerate(zone_bins):
+        hz   = _bin_freqs[bin_idx]
+        prob = peak_prob[i]
+        if prob < 0.05:
+            continue
+        # Find nearest notch in zone (if any)
+        nearest_notch = min(notch_zone.keys(), key=lambda f: abs(f - hz)) \
+                        if notch_zone else None
+        if nearest_notch is not None:
+            dist_pct = abs(nearest_notch - hz) / hz * 100
+            notch_info = (f'→ notch @ {nearest_notch:.0f} Hz  '
+                          f'({dist_pct:.1f}% away, {notch_zone[nearest_notch]} frames)')
+        else:
+            notch_info = '→ NO notch in zone'
+        flag = ' *** HIGH' if prob > threshold else ''
+        print(f'  {hz:6.1f} Hz  prob={prob:.3f}{flag}  {notch_info}')
 
     # ── Build notch mask from logs ─────────────────────────────────────────────
     # Use voice_restore FFT params (N_FFT=1024, HOP=480) — restorer expects 513 bins
