@@ -29,7 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT / 'feedback_detect'))
 from model            import FeedbackDetector, SR, N_FFT, HOP, N_FREQ
 from notch            import NotchBank
 from predictor        import FeedbackPredictor
-from spectral_flatten import ChronicRingEQ, AdaptiveMakeupGain
+from spectral_flatten import ChronicRingEQ, AdaptiveMakeupGain, FeedbackGainRider
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 CHECKPOINT    = PROJECT_ROOT / 'checkpoints' / 'feedback_detect' / 'best.pt'
@@ -109,10 +109,11 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
 
     bin_freqs  = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
     # Always start fresh — no profile loaded on boot (plug-and-play, no room assumptions)
-    predictor   = FeedbackPredictor(bin_freqs, sr=SR, profile_path=None)
-    notch_bank  = NotchBank(sr=SR, depth_db=depth_db)
-    chronic_eq  = ChronicRingEQ(bin_freqs, sr=SR)
-    makeup_gain = AdaptiveMakeupGain()
+    predictor    = FeedbackPredictor(bin_freqs, sr=SR, profile_path=None)
+    notch_bank   = NotchBank(sr=SR, depth_db=depth_db)
+    chronic_eq   = ChronicRingEQ(bin_freqs, sr=SR)
+    gain_rider   = FeedbackGainRider()
+    makeup_gain  = AdaptiveMakeupGain()
 
     hpf_sos    = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
 
@@ -173,9 +174,9 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
         chronic_eq.update(prob_np, notch_bank.active_notches)
         processed = chronic_eq.process(processed)
 
-        # ── Adaptive makeup gain (disabled until detector is validated) ───
-        # gain_scalar = makeup_gain.update(detected_freqs, notch_bank.active_notches)
-        # processed   = np.clip(processed * gain_scalar, -1.0, 1.0)
+        # ── Gain rider: duck on detection, return to unity when quiet ─────
+        ride_scalar = gain_rider.update(len(detected_freqs))
+        processed   = processed * ride_scalar
 
         # ── Output ────────────────────────────────────────────────────────
         outdata[:, 0] = processed
@@ -191,7 +192,7 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
         rms_db    = 20.0 * np.log10(float(np.sqrt(np.mean(block**2))) + 1e-9)
         print(f'\rIn:{rms_db:+.0f}dB  PeakP:{peak_prob:.2f}  '
               f'Det:[{det_str}]  Notches:[{notch_str}]  '
-              f'Makeup:{makeup_gain.current_db:+.1f}dB    ',
+              f'Ride:{gain_rider.current_db:+.1f}dB    ',
               end='', flush=True)
 
     def _shutdown():
