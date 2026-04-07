@@ -72,10 +72,11 @@ class PeakingEQ:
 class SpectralFlattener:
 
     # A pair qualifies when the two notches are within ~4 semitones (1.25×).
-    # Wider pairs are rare as isolated bridge cases — in a dense cluster,
-    # the bridge is usually already covered by another notch.
     MAX_PAIR_RATIO    = 1.25    # ≈ 4 semitones
     MIN_NOTCH_DB      = -20.0   # both notches must be at least this deep
+    # Gate: with many simultaneous deep notches the system is in saturation.
+    # Bridge correction is only meaningful for a few isolated notches.
+    MAX_DEEP_FOR_BRIDGE = 6     # skip all bridge cuts if more than this many deep notches
     BRIDGE_CUT_FACTOR = 0.08    # cut = min(notch_depths_db) × factor
     MAX_CUT_DB        = -4.0    # absolute ceiling on any bridge cut
     CUT_Q             = 2.5     # wide, musical cut
@@ -99,25 +100,28 @@ class SpectralFlattener:
         rms            : unused
         active_notches : notch_bank.active_notches → [(freq, depth_db, q), ...]
         """
-        deep = [(f, d, q) for f, d, q in active_notches if d <= self.MIN_NOTCH_DB]
+        deep = sorted([(f, d, q) for f, d, q in active_notches
+                       if d <= self.MIN_NOTCH_DB], key=lambda x: x[0])
+        deep_freqs = [f for f, _, _ in deep]
 
         # Build target cuts for each qualifying pair
         targets: dict[tuple[float, float], tuple[float, float]] = {}
-        for i in range(len(deep)):
-            f1, d1, q1 = deep[i]
-            for j in range(i + 1, len(deep)):
-                f2, d2, q2 = deep[j]
-                f_lo, f_hi = (f1, f2) if f1 < f2 else (f2, f1)
-                if f_hi / f_lo > self.MAX_PAIR_RATIO:
-                    continue
-                bridge = math.sqrt(f_lo * f_hi)
-                # Skip if bridge is already within the suppression range
-                # of another active notch (it's handled, no bridge effect)
-                if any(abs(bridge - f) <= f / (2.0 * q)
-                       for f, _, q in active_notches):
-                    continue
-                cut = max(min(d1, d2) * self.BRIDGE_CUT_FACTOR, self.MAX_CUT_DB)
-                targets[(f_lo, f_hi)] = (bridge, cut)
+        if len(deep) <= self.MAX_DEEP_FOR_BRIDGE:
+            for i in range(len(deep)):
+                f1, d1, q1 = deep[i]
+                for j in range(i + 1, len(deep)):
+                    f2, d2, q2 = deep[j]
+                    f_lo, f_hi = (f1, f2) if f1 < f2 else (f2, f1)
+                    if f_hi / f_lo > self.MAX_PAIR_RATIO:
+                        continue
+                    # Adjacent-only: skip if any other deep notch sits between them.
+                    # That intermediate notch already breaks up the bridge.
+                    if any(f_lo < f < f_hi for f in deep_freqs
+                           if f != f_lo and f != f_hi):
+                        continue
+                    bridge = math.sqrt(f_lo * f_hi)
+                    cut = max(min(d1, d2) * self.BRIDGE_CUT_FACTOR, self.MAX_CUT_DB)
+                    targets[(f_lo, f_hi)] = (bridge, cut)
 
         # Update existing bridge filters
         for key in list(self._bridges):
