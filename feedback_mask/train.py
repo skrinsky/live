@@ -342,7 +342,7 @@ def train():
     assert vocal_files, f'No vocal files >= {SEQ_SECS}s'
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'FeedbackMaskNet (GTCRN@48kHz): {n_params:,} parameters on {device}')
+    print(f'FeedbackMaskNet (per-bin GRU): {n_params:,} parameters on {device}')
     print(f'Clip: {SEQ_SECS}s ({SEQ_LEN} samples), batch accumulation: {BATCH_SIZE}')
     print(f'Vocal files: {len(vocal_files)}, noise: {len(noise_files)}, '
           f'mains IRs: {len(mains_ir_files)}, monitor IRs: {len(monitor_ir_files)}')
