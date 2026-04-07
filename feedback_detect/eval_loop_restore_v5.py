@@ -146,7 +146,7 @@ def build_notch_mask_from_logs(notch_logs, n_frames):
 
 
 def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
-             det_ckpt=None, res_ckpt=None, out_dir=None, profile=None):
+             det_ckpt=None, res_ckpt=None, out_dir=None, profile=None, vocal=None):
     det_path = Path(det_ckpt or CHECKPOINT_DET)
     res_path = Path(res_ckpt or CHECKPOINT_RES)
     assert det_path.exists(), f'No detector checkpoint at {det_path}'
@@ -189,8 +189,11 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     ir   /= (peak + 1e-8)
 
     # ── Load vocal ─────────────────────────────────────────────────────────────
-    vocal_files = [f for f in (PROJECT_ROOT / 'data' / 'clean_vocals').rglob('*.wav')
-                   if not f.name.startswith('._') and '__MACOSX' not in str(f)]
+    if vocal:
+        vocal_files = [Path(vocal)]
+    else:
+        vocal_files = [f for f in (PROJECT_ROOT / 'data' / 'clean_vocals').rglob('*.wav')
+                       if not f.name.startswith('._') and '__MACOSX' not in str(f)]
     vocal_path_used = None
     if vocal_files:
         vocal_path_used = vocal_files[0]
@@ -426,7 +429,9 @@ if __name__ == '__main__':
     p.add_argument('--out-dir',   type=str,   default=None)
     p.add_argument('--profile',   type=str,   default=None,
                    help='path to risk profile JSON; if omitted a fresh predictor is used')
+    p.add_argument('--vocal',     type=str,   default=None,
+                   help='path to a specific vocal wav (use a val file, not a train file)')
     args = p.parse_args()
     run_eval(gain=args.gain, duration_s=args.duration, threshold=args.threshold,
              det_ckpt=args.detector, res_ckpt=args.restorer, out_dir=args.out_dir,
-             profile=args.profile)
+             profile=args.profile, vocal=args.vocal)
