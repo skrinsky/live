@@ -173,9 +173,9 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
         chronic_eq.update(prob_np, notch_bank.active_notches)
         processed = chronic_eq.process(processed)
 
-        # ── Adaptive makeup gain ───────────────────────────────────────────
-        gain_scalar = makeup_gain.update(detected_freqs, notch_bank.active_notches)
-        processed   = np.clip(processed * gain_scalar, -1.0, 1.0)
+        # ── Adaptive makeup gain (disabled until detector is validated) ───
+        # gain_scalar = makeup_gain.update(detected_freqs, notch_bank.active_notches)
+        # processed   = np.clip(processed * gain_scalar, -1.0, 1.0)
 
         # ── Output ────────────────────────────────────────────────────────
         outdata[:, 0] = processed
@@ -188,8 +188,10 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
         det_str   = ', '.join(f'{f:.0f}' for f in detected_freqs) or '—'
         pre_str   = ', '.join(f'{f:.0f}' for f in preemptive)     or '—'
         peak_prob = float(prob_np.max())
-        print(f'\rDet:[{det_str}]  Pre:[{pre_str}]  Notches:[{notch_str}]'
-              f'  PeakP:{peak_prob:.2f}  Makeup:{makeup_gain.current_db:+.1f}dB    ',
+        rms_db    = 20.0 * np.log10(float(np.sqrt(np.mean(block**2))) + 1e-9)
+        print(f'\rIn:{rms_db:+.0f}dB  PeakP:{peak_prob:.2f}  '
+              f'Det:[{det_str}]  Notches:[{notch_str}]  '
+              f'Makeup:{makeup_gain.current_db:+.1f}dB    ',
               end='', flush=True)
 
     def _shutdown():
