@@ -209,11 +209,13 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
     print(f'threshold={threshold}  depth={depth_db} dB')
     print('Ctrl+C to stop and save profile.\n')
 
+    import time
     with sd.Stream(samplerate=SR, blocksize=BLOCK_SIZE,
                    dtype='float32', channels=1,
                    device=audio_device,
                    callback=callback):
-        sd.sleep(10 * 3600 * 1000)
+        while True:
+            time.sleep(0.1)
 
 
 if __name__ == '__main__':
