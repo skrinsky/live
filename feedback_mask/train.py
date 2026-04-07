@@ -59,31 +59,34 @@ def make_hpf(cutoff_hz=90):
 
 def sample_gain(epoch):
     """
-    Curriculum gain distribution.
+    Gain distribution — HARD CAP at 0.99.
 
-    Phase 1 (epochs 1-149): onset-heavy.
-      Model learns to detect and notch at the stability threshold.
-      Mostly near-threshold cases where the mic still has vocal information.
-      10% off / 15% sub-threshold / 60% near-threshold (0.7-1.2) / 15% moderate (1.2-1.8)
-      No extreme cases — too little vocal info to learn from.
+    Gain > 1.0 causes the IIR feedback loop to be unstable: the signal grows
+    exponentially and clips to ±1 within the first second of a 4s clip.
+    Clipping is irreversible — the model cannot recover the vocal from a
+    saturated signal, so those examples contribute no useful gradient.
+    They actively poison learning by dragging the gradient toward silence.
 
-    Phase 2 (epochs 150+): refine for severe feedback.
-      Model already knows onset detection; now learns to break a full howl.
-      10% off / 10% sub-threshold / 35% near-threshold / 30% moderate / 15% extreme (1.8-2.5)
+    0.99 is the hardest tractable case: the ring barely decays (takes ~70
+    reflections to halve), representing the real-world scenario just before
+    feedback takes off. This is exactly what the model needs to learn to suppress.
+
+    Two phases differ only in how much near-threshold exposure:
+      Phase 1 (epochs 1-149): mostly sub-threshold, model learns what rings look like
+      Phase 2 (epochs 150+):  heavier near-threshold, model learns to suppress them
     """
     def _one():
         t = random.random()
         if epoch < 150:
-            if t < 0.10:   return 0.0                        # path off
-            elif t < 0.25: return random.uniform(0.2, 0.7)   # sub-threshold (15%)
-            elif t < 0.85: return random.uniform(0.7, 1.2)   # near-threshold onset (60%)
-            else:          return random.uniform(1.2, 1.4)   # moderate severe (15%) — capped at 1.4 to keep examples learnable
+            if t < 0.10:   return 0.0                         # path off (10%)
+            elif t < 0.30: return random.uniform(0.2, 0.6)    # clearly sub-threshold (20%)
+            elif t < 0.70: return random.uniform(0.6, 0.85)   # moderate ring (40%)
+            else:          return random.uniform(0.85, 0.99)  # near-threshold (30%)
         else:
-            if t < 0.10:   return 0.0                        # path off
-            elif t < 0.20: return random.uniform(0.2, 0.7)   # sub-threshold (10%)
-            elif t < 0.55: return random.uniform(0.7, 1.2)   # near-threshold (35%)
-            elif t < 0.85: return random.uniform(1.2, 1.8)   # moderate severe (30%)
-            else:          return random.uniform(1.8, 2.5)   # extreme (15%)
+            if t < 0.10:   return 0.0                         # path off (10%)
+            elif t < 0.20: return random.uniform(0.2, 0.6)    # clearly sub-threshold (10%)
+            elif t < 0.50: return random.uniform(0.6, 0.85)   # moderate ring (30%)
+            else:          return random.uniform(0.85, 0.99)  # near-threshold (50%)
     return _one(), _one()
 
 
@@ -263,8 +266,8 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     # 50% of clips ramp from stable → howling to simulate feedback building up
     # (vocalist walks toward monitor, engineer nudges fader, mic cups, etc.)
     if random.random() < 0.50:
-        gain_lo  = random.uniform(0.2, 0.9)
-        gain_hi  = random.uniform(1.0, 1.4 if epoch < 150 else 2.5)
+        gain_lo  = random.uniform(0.2, 0.7)
+        gain_hi  = random.uniform(0.85, 0.99)  # never exceeds stability threshold
         split    = random.randint(int(0.2 * SEQ_LEN), int(0.5 * SEQ_LEN))
         h_lo     = _add_resonators(mains_norm * gain_lo + mon_norm * gain_lo,
                                    SR, ir_path=room_ir_path)
