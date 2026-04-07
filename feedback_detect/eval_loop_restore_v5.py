@@ -201,7 +201,9 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
             import pandas as pd, io
             df  = pd.read_parquet(str(vocal_path_used))
             row = df.iloc[0]['audio']          # HuggingFace audio column
-            if isinstance(row, dict) and 'bytes' in row:
+            if isinstance(row, (bytes, bytearray)):
+                v, vsr = sf.read(io.BytesIO(row), dtype='float32')
+            elif isinstance(row, dict) and 'bytes' in row:
                 v, vsr = sf.read(io.BytesIO(row['bytes']), dtype='float32')
             else:
                 # already decoded: {'array': np.ndarray, 'sampling_rate': int}
