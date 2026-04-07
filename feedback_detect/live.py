@@ -33,7 +33,7 @@ from spectral_flatten import ChronicRingEQ, AdaptiveMakeupGain
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 CHECKPOINT    = PROJECT_ROOT / 'checkpoints' / 'feedback_detect' / 'best.pt'
-PROFILE_PATH  = PROJECT_ROOT / 'data' / 'feedback_risk_profile.json'
+PROFILE_PATH  = PROJECT_ROOT / 'data' / 'feedback_risk_profile.json'  # diagnostic only
 DETECT_THRESH = 0.25
 MIN_FREQ_HZ   = 80.0
 NOTCH_DEPTH   = -48.0
@@ -92,10 +92,9 @@ def _cluster_bins(bin_freqs: np.ndarray, prob: np.ndarray, mask: np.ndarray) -> 
 
 
 def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
-        checkpoint=None, profile=None, device=None):
+        checkpoint=None, device=None, save_profile=None):
 
     ckpt_path    = Path(checkpoint or CHECKPOINT)
-    profile_path = Path(profile   or PROFILE_PATH)
     assert ckpt_path.exists(), f'No checkpoint at {ckpt_path} — train first.'
 
     audio_device = device   # None → sounddevice default
@@ -109,7 +108,8 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
     print(f'FeedbackDetector  loaded from {ckpt_path}')
 
     bin_freqs  = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
-    predictor   = FeedbackPredictor(bin_freqs, sr=SR, profile_path=profile_path)
+    # Always start fresh — no profile loaded on boot (plug-and-play, no room assumptions)
+    predictor   = FeedbackPredictor(bin_freqs, sr=SR, profile_path=None)
     notch_bank  = NotchBank(sr=SR, depth_db=depth_db)
     chronic_eq  = ChronicRingEQ(bin_freqs, sr=SR)
     makeup_gain = AdaptiveMakeupGain()
@@ -192,17 +192,19 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
                   f'  Makeup:{makeup_gain.current_db:+.1f}dB    ',
                   end='', flush=True)
 
-    # ── Graceful shutdown — save profile on Ctrl+C ────────────────────────────
+    # ── Graceful shutdown ─────────────────────────────────────────────────────
     def _shutdown(sig, frame):
-        print('\n\nSaving risk profile…')
-        predictor.save()
+        print('\n')
         print(predictor.summary())
-        print(f'Profile saved to {profile_path}')
+        if save_profile:
+            profile_path = Path(save_profile)
+            predictor.profile_path = profile_path
+            predictor.save()
+            print(f'Profile saved to {profile_path}')
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)
 
-    print(f'FeedbackPredictor profile: {profile_path}')
     print(f'Running at {SR} Hz  block={BLOCK_SIZE} samples ({1000*BLOCK_SIZE/SR:.1f} ms)')
     print(f'threshold={threshold}  depth={depth_db} dB')
     print('Ctrl+C to stop and save profile.\n')
@@ -220,11 +222,12 @@ if __name__ == '__main__':
                     help='detection probability threshold (default 0.25)')
     ap.add_argument('--depth',      type=float, default=NOTCH_DEPTH,
                     help='max notch depth dB (default -48)')
-    ap.add_argument('--checkpoint', type=str,   default=None)
-    ap.add_argument('--profile',    type=str,   default=None,
-                    help='path to risk profile JSON (default data/feedback_risk_profile.json)')
-    ap.add_argument('--device',     type=int,   default=None,
+    ap.add_argument('--checkpoint',    type=str,   default=None)
+    ap.add_argument('--save-profile',  type=str,   default=None,
+                    help='if set, save learned risk profile to this path on exit (diagnostic)')
+    ap.add_argument('--device',        type=int,   default=None,
                     help='sounddevice device index (default: system default)')
     args = ap.parse_args()
     run(threshold=args.threshold, depth_db=args.depth,
-        checkpoint=args.checkpoint, profile=args.profile, device=args.device)
+        checkpoint=args.checkpoint, device=args.device,
+        save_profile=args.save_profile)
