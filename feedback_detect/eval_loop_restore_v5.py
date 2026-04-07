@@ -28,7 +28,7 @@ from feedback_detect.notch import NotchBank
 from feedback_detect.predictor import FeedbackPredictor
 from feedback_detect.live import _cluster_bins
 from feedback_detect.eval_loop import _rms_db
-from feedback_detect.spectral_flatten import SpectralFlattener
+from feedback_detect.spectral_flatten import ChronicRingEQ
 
 from voice_restore.model_v5 import VoiceRestorerV5, apply_compensation
 from voice_restore.model_v5 import N_FREQ as VR_N_FREQ, N_FFT as VR_N_FFT
@@ -42,33 +42,11 @@ _hpf_sos   = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
 _bin_freqs = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
 
 
-def _warmup_flattener(voice_np, noise_np, flattener, device, window,
-                      warmup_s: float = 3.0):
-    """
-    Pre-warm the SpectralFlattener reference from clean voice (no feedback).
-    Simulates the real-world startup where the performer speaks/sings before
-    any ring occurs.  Must be called before simulate_notch.
-    """
-    n_warm = int(warmup_s * SR)
-    analysis_buf = np.zeros(N_FFT, dtype=np.float32)
-    for i in range(n_warm // HOP):
-        s = i * HOP
-        block = np.clip(
-            voice_np[s:s+HOP].astype(np.float64) + noise_np[s:s+HOP].astype(np.float64),
-            -1.0, 1.0).astype(np.float32)
-        analysis_buf = np.roll(analysis_buf, -HOP)
-        analysis_buf[-HOP:] = block
-        buf_t = torch.from_numpy(analysis_buf).unsqueeze(0).to(device)
-        stft  = torch.stft(buf_t, N_FFT, N_FFT, N_FFT, window,
-                           center=False, return_complex=True)
-        mag_np = stft.abs()[0, :, 0].cpu().numpy()
-        rms    = float(np.sqrt(np.mean(block ** 2) + 1e-20))
-        flattener.update(mag_np, rms, [])   # no active notches → pure voice reference
 
 
 def simulate_notch(voice_np, noise_np, feedback_ir, gain,
                    model_det, notch_bank, device, window, threshold,
-                   predictor=None, flattener=None):
+                   predictor=None, chronic_eq=None):
     ir  = (feedback_ir * gain).astype(np.float32)
     n   = len(voice_np)
     acc = np.zeros(n + len(ir), dtype=np.float64)
@@ -137,11 +115,10 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
         notch_logs.append(list(notch_bank.active_notches))
         prob_logs.append(prob_np)
 
-        # SpectralFlattener: adaptive wide-Q coloration correction
-        if flattener is not None:
-            rms = float(np.sqrt(np.mean(out_block ** 2) + 1e-20))
-            flattener.update(stft_mag_np, rms, notch_bank.active_notches)
-            flat_block = flattener.process(out_block)
+        # ChronicRingEQ: persistent wide cuts at chronic ring zones
+        if chronic_eq is not None and predictor is not None:
+            chronic_eq.update(predictor.risk_profile, notch_bank.active_notches)
+            flat_block = chronic_eq.process(out_block)
         else:
             flat_block = out_block
         flat_out[s:s+HOP] = flat_block
@@ -241,12 +218,12 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
                                    profile_path=Path(profile) if profile else default_profile)
     predictor.seed_from_ir(ir, gain=gain)
     notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
-    flattener  = SpectralFlattener(_bin_freqs, sr=SR)
+    chronic_eq = ChronicRingEQ(sr=SR)
     mic_sup, box_sup, flat_sup, notch_logs, prob_logs = simulate_notch(
         voice_np, noise_np, ir, gain=gain,
         model_det=model_det, notch_bank=notch_bank,
         device=device, window=window, threshold=threshold,
-        predictor=predictor, flattener=flattener)
+        predictor=predictor, chronic_eq=chronic_eq)
     predictor.save()
     print(predictor.summary())
     print(f'  mic RMS: {_rms_db(mic_sup):.1f} dB')
@@ -372,8 +349,8 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
         print(f'  {fc:5d} Hz  {sign}{abs(ratio_db):4.1f} dB  {bar}')
 
     flat_diff_rms = float(np.sqrt(np.mean((flat_sup[:L_flat] - box_sup[:L_flat])**2)))
-    print(f'\nflattened vs suppressed RMS diff: {flat_diff_rms:.6f}  '
-          f'(0.0 = flattener had no effect)')
+    print(f'\nchronic_eq vs suppressed RMS diff: {flat_diff_rms:.6f}  '
+          f'(0.0 = chronic EQ had no effect)')
 
     # ── Spectral coloration map: flattened vs clean ─────────────────────────────
     print('\nSpectral coloration (suppressed_out_flattened vs clean_reference, 1/3-oct bands):')
@@ -390,7 +367,7 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
         sign = '+' if ratio_db >= 0 else '-'
         print(f'  {fc:5d} Hz  {sign}{abs(ratio_db):4.1f} dB  {bar}')
 
-    print(f'\nSpectralFlattener: {flattener.summary()}')
+    print(f'\nChronicRingEQ: {chronic_eq.summary()}')
     print(f'\nRMS dB — clean {_rms_db(clean_np):.1f} | '
           f'suppressed {_rms_db(box_sup[:L]):.1f} | '
           f'flattened {_rms_db(flat_sup[:L_flat]):.1f} | '

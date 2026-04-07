@@ -1,28 +1,26 @@
 """
-feedback_detect/spectral_flatten.py — Notch-pair bridge EQ correction.
+feedback_detect/spectral_flatten.py — Chronic-ring background EQ.
 
-When two deep notches sit within a critical band of each other (~1.25x,
-≈4 semitones), the unnotched region between them becomes perceptually
-elevated by contrast — the spectral gap makes the bridge stand out.
+Applies gentle, wide peaking cuts at the frequencies the FeedbackPredictor
+has identified as persistent ringers.  Runs in series after the surgical
+NotchBank.
 
-Example: notches at 775 Hz and 855 Hz (-48 dB each) leave ~814 Hz
-sounding elevated even though its absolute level has not changed.
+The NotchBank handles acute ring onsets: narrow, deep, reactive.
+ChronicRingEQ handles the background: frequencies that ring often enough
+to fill a notch slot most of the time get a persistent wide cut that
+reduces the base ring level.  The acute breaks then require less surgical
+depth, and the notch bank evicts fewer slots.
 
-Design
-------
-For each qualifying pair of active deep notches, place a gentle peaking
-cut at their geometric mean.  Cut depth scales with notch depth and is
-capped at MAX_CUT_DB.  Cuts attack smoothly when a pair is active and
-release when either notch lifts.
-
-This is driven entirely by the notch bank state — it never fires during
-clean speech regardless of voice formant shape, and produces no false
-positives from spectral analysis.
+Source of truth
+---------------
+predictor.risk_profile — risk[freq] = np.ndarray(N_STATES,) of accumulated
+ring counts per voice state.  The top-N frequencies by max risk across all
+states are the chronic ringers.  Cut depth scales linearly from MIN_CUT_DB
+at MIN_RISK up to MAX_CUT_DB at RISK_MAX.
 
 Only cuts — never boosts.  Cuts cannot cause feedback.
 """
 
-import math
 import numpy as np
 from scipy.signal import lfilter
 
@@ -35,7 +33,7 @@ class PeakingEQ:
     """
 
     def __init__(self, freq_hz: float, sr: int = 48000,
-                 q: float = 3.0, gain_db: float = 0.0):
+                 q: float = 2.0, gain_db: float = 0.0):
         self.sr       = sr
         self.freq_hz  = freq_hz
         self.q        = q
@@ -69,115 +67,110 @@ class PeakingEQ:
         return y
 
 
-class SpectralFlattener:
+class ChronicRingEQ:
 
-    # A pair qualifies when the two notches are within ~4 semitones (1.25×).
-    MAX_PAIR_RATIO    = 1.25    # ≈ 4 semitones
-    MIN_NOTCH_DB      = -20.0   # both notches must be at least this deep
-    # Gate: with many simultaneous deep notches the system is in saturation.
-    # Bridge correction is only meaningful for a few isolated notches.
-    MAX_DEEP_FOR_BRIDGE = 6     # skip all bridge cuts if more than this many deep notches
-    BRIDGE_CUT_FACTOR = 0.08    # cut = min(notch_depths_db) × factor
-    MAX_CUT_DB        = -4.0    # absolute ceiling on any bridge cut
-    CUT_Q             = 2.5     # wide, musical cut
-    CUT_SMOOTHING     = 0.05    # EMA frames toward target (attack)
-    RELEASE_SMOOTHING = 0.02    # slower release than attack
-    IDLE_FRAMES       = 200     # frames at ~0 dB before removing filter
+    TOP_N           = 8       # top N risk frequencies to cut
+    MIN_RISK        = 3.0     # minimum risk score to qualify (> predictor RISK_THRESHOLD=2.0)
+    MIN_CUT_DB      = -3.0    # cut at MIN_RISK
+    MAX_CUT_DB      = -12.0   # cut at RISK_MAX
+    RISK_MAX        = 20.0    # matches FeedbackPredictor.RISK_MAX
+    CUT_Q           = 2.0     # wide — not surgical
+    UPDATE_INTERVAL = 100     # frames between risk profile re-reads (~1 s at 100 fps)
+    CUT_SMOOTHING   = 0.02    # EMA per frame toward target (~50-frame / 500 ms time constant)
 
-    def __init__(self, bin_freqs: np.ndarray, sr: int = 48000):
-        self.bin_freqs = bin_freqs
-        self.sr        = sr
-        # {(f_low, f_high): [PeakingEQ, current_cut_db, idle_counter]}
-        self._bridges: dict[tuple[float, float], list] = {}
-        self._peak_cuts: dict[tuple[float, float], float] = {}
+    def __init__(self, sr: int = 48000):
+        self.sr = sr
+        # {freq_hz: PeakingEQ}
+        self._filters:      dict[float, PeakingEQ] = {}
+        self._current_cuts: dict[float, float]     = {}
+        self._targets:      dict[float, float]     = {}
+        self._peak_cuts:    dict[float, float]     = {}
+        self._frame_count   = 0
 
     # ── public ────────────────────────────────────────────────────────────────
 
-    def update(self, stft_mag: np.ndarray, rms: float,
+    def update(self, risk_profile: 'dict[float, np.ndarray]',
                active_notches: 'list[tuple[float, float, float]]'):
         """
-        stft_mag       : unused (kept for API compatibility)
-        rms            : unused
-        active_notches : notch_bank.active_notches → [(freq, depth_db, q), ...]
+        risk_profile   : predictor.risk_profile → {freq: np.ndarray(N_STATES,)}
+        active_notches : notch_bank.active_notches (unused, reserved for future)
         """
-        deep = sorted([(f, d, q) for f, d, q in active_notches
-                       if d <= self.MIN_NOTCH_DB], key=lambda x: x[0])
-        deep_freqs = [f for f, _, _ in deep]
-
-        # Build target cuts for each qualifying pair
-        targets: dict[tuple[float, float], tuple[float, float]] = {}
-        if len(deep) <= self.MAX_DEEP_FOR_BRIDGE:
-            for i in range(len(deep)):
-                f1, d1, q1 = deep[i]
-                for j in range(i + 1, len(deep)):
-                    f2, d2, q2 = deep[j]
-                    f_lo, f_hi = (f1, f2) if f1 < f2 else (f2, f1)
-                    if f_hi / f_lo > self.MAX_PAIR_RATIO:
-                        continue
-                    # Adjacent-only: skip if any other deep notch sits between them.
-                    # That intermediate notch already breaks up the bridge.
-                    if any(f_lo < f < f_hi for f in deep_freqs
-                           if f != f_lo and f != f_hi):
-                        continue
-                    bridge = math.sqrt(f_lo * f_hi)
-                    cut = max(min(d1, d2) * self.BRIDGE_CUT_FACTOR, self.MAX_CUT_DB)
-                    targets[(f_lo, f_hi)] = (bridge, cut)
-
-        # Update existing bridge filters
-        for key in list(self._bridges):
-            filt, cur_cut, idle = self._bridges[key]
-            if key in targets:
-                _, target_cut = targets[key]
-                new_cut = cur_cut + self.CUT_SMOOTHING * (target_cut - cur_cut)
-                self._bridges[key][1] = new_cut
-                self._bridges[key][2] = 0
-                filt.set_gain(float(new_cut))
-            else:
-                new_cut = cur_cut + self.RELEASE_SMOOTHING * (0.0 - cur_cut)
-                if abs(new_cut) < 0.05:
-                    new_cut = 0.0
-                self._bridges[key][1] = new_cut
-                filt.set_gain(float(new_cut))
-                if abs(new_cut) < 0.05:
-                    self._bridges[key][2] = idle + 1
-                    if self._bridges[key][2] >= self.IDLE_FRAMES:
-                        del self._bridges[key]
-                        continue
-            self._peak_cuts[key] = min(
-                self._peak_cuts.get(key, 0.0), self._bridges[key][1])
-
-        # Add new bridge filters
-        for key, (bridge_freq, _) in targets.items():
-            if key not in self._bridges:
-                filt = PeakingEQ(bridge_freq, sr=self.sr,
-                                 q=self.CUT_Q, gain_db=0.0)
-                self._bridges[key] = [filt, 0.0, 0]
+        self._frame_count += 1
+        if self._frame_count >= self.UPDATE_INTERVAL:
+            self._frame_count = 0
+            self._rebuild_targets(risk_profile)
+        self._smooth()
 
     def process(self, audio_block: np.ndarray) -> np.ndarray:
-        """Apply all active bridge cuts in series."""
+        """Apply all active chronic cuts in series."""
         y = audio_block.astype(np.float32)
-        for filt, cut, _ in self._bridges.values():
-            if abs(cut) > 0.05:
+        for freq, filt in self._filters.items():
+            if abs(self._current_cuts.get(freq, 0.0)) > 0.05:
                 y = filt.process(y)
         return y
 
     def summary(self) -> str:
-        active = [(k, v[1]) for k, v in self._bridges.items() if abs(v[1]) > 0.1]
+        active = [(f, self._current_cuts[f])
+                  for f in self._filters if abs(self._current_cuts.get(f, 0.0)) > 0.1]
         lines = []
         if not active:
-            lines.append('SpectralFlattener: no active bridge cuts')
+            lines.append('ChronicRingEQ: no active cuts')
         else:
-            lines.append('SpectralFlattener bridge cuts:')
-            for (f1, f2), cut in sorted(active, key=lambda x: x[1]):
-                bridge = math.sqrt(f1 * f2)
-                lines.append(f'  {bridge:.0f} Hz '
-                              f'(between {f1:.0f}/{f2:.0f} Hz): {cut:.1f} dB')
+            lines.append('ChronicRingEQ cuts:')
+            for f, cut in sorted(active, key=lambda x: x[1]):
+                tgt = self._targets.get(f, 0.0)
+                lines.append(f'  {f:.0f} Hz: {cut:.1f} dB  (target {tgt:.1f} dB)')
         if self._peak_cuts:
-            peak = [(k, v) for k, v in self._peak_cuts.items() if v < -0.1]
+            peak = [(f, v) for f, v in self._peak_cuts.items() if v < -0.1]
             if peak:
-                lines.append('  peak bridge cuts during run:')
-                for (f1, f2), cut in sorted(peak, key=lambda x: x[1]):
-                    bridge = math.sqrt(f1 * f2)
-                    lines.append(f'    {bridge:.0f} Hz '
-                                 f'({f1:.0f}/{f2:.0f} Hz): {cut:.2f} dB')
+                lines.append('  peak cuts during run:')
+                for f, cut in sorted(peak, key=lambda x: x[1]):
+                    lines.append(f'    {f:.0f} Hz: {cut:.2f} dB')
         return '\n'.join(lines)
+
+    # ── private ───────────────────────────────────────────────────────────────
+
+    def _risk_to_cut(self, score: float) -> float:
+        """Linear interpolation: MIN_RISK → MIN_CUT_DB, RISK_MAX → MAX_CUT_DB."""
+        t = min(1.0, max(0.0,
+                (score - self.MIN_RISK) / (self.RISK_MAX - self.MIN_RISK)))
+        return self.MIN_CUT_DB + t * (self.MAX_CUT_DB - self.MIN_CUT_DB)
+
+    def _rebuild_targets(self, risk_profile: 'dict[float, np.ndarray]'):
+        """Re-read risk table and update cut targets."""
+        scored = [(freq, float(risk.max()))
+                  for freq, risk in risk_profile.items()
+                  if float(risk.max()) >= self.MIN_RISK]
+        scored.sort(key=lambda x: -x[1])
+        top = {freq: self._risk_to_cut(score) for freq, score in scored[:self.TOP_N]}
+
+        # Set releasing targets for frequencies no longer in top-N
+        for freq in list(self._targets):
+            if freq not in top:
+                self._targets[freq] = 0.0
+
+        # Update or add targets
+        for freq, cut in top.items():
+            self._targets[freq] = cut
+            if freq not in self._filters:
+                self._filters[freq]      = PeakingEQ(freq, sr=self.sr,
+                                                     q=self.CUT_Q, gain_db=0.0)
+                self._current_cuts[freq] = 0.0
+
+    def _smooth(self):
+        """Step each filter's gain one EMA frame toward its target."""
+        to_remove = []
+        for freq in list(self._filters):
+            target  = self._targets.get(freq, 0.0)
+            current = self._current_cuts.get(freq, 0.0)
+            new     = current + self.CUT_SMOOTHING * (target - current)
+            self._current_cuts[freq] = new
+            self._filters[freq].set_gain(float(new))
+            self._peak_cuts[freq] = min(self._peak_cuts.get(freq, 0.0), new)
+            # Remove filter once it has fully released to 0
+            if target == 0.0 and abs(new) < 0.05:
+                to_remove.append(freq)
+        for freq in to_remove:
+            del self._filters[freq]
+            del self._current_cuts[freq]
+            self._targets.pop(freq, None)
