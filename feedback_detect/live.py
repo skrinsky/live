@@ -118,7 +118,7 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
 
     # Per-session state (mutated inside callback via nonlocal)
     analysis_buf = np.zeros(N_FFT, dtype=np.float32)
-    hpf_zi       = np.zeros((2, 1))
+    hpf_zi       = np.zeros((hpf_sos.shape[0], 2))
     gru_h        = None
     lm_history   = np.zeros((N_FREQ, 11), dtype=np.float32)
 
