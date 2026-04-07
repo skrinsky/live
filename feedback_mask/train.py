@@ -91,21 +91,15 @@ def sample_gain(epoch):
 
 class HybridLoss(nn.Module):
     """
-    Compressed complex STFT loss + SI-SDR + onset speed + early vocal quality.
+    Compressed complex STFT loss + scale-sensitive SDR.
 
-    Base terms (dense learning signal):
-      30 × RI compressed MSE   — phase-aware per-bin gradient every frame
-      70 × magnitude MSE       — perceptual spectral reconstruction
-       1 × SI-SDR full seq     — overall signal quality
+    30 × RI compressed MSE   — phase-aware per-bin gradient every frame
+    70 × magnitude MSE       — perceptual spectral reconstruction
+     1 × scale-sensitive SDR — prevents broadband attenuation shortcut
 
-    Refinement terms (nudge toward fast suppression and clean vocals at onset):
-       2 × onset-weighted mag  — frames near t=0 weighted by exp(-t/50),
-                                  penalises residual feedback surviving early frames
-     0.5 × SI-SDR first second — rewards output sounding clean immediately at onset,
-                                  not just averaged over the whole 4s clip
+    Deliberately minimal: onset/early-SDR/mask terms were removed because
+    they introduced conflicting gradients that caused the loss to plateau.
     """
-    ONSET_TAU   = 50    # frames — onset weight decay (~500ms at 10ms/frame)
-    EARLY_SECS  = 1.0   # seconds of signal used for early SI-SDR term
 
     def __init__(self):
         super().__init__()
@@ -124,68 +118,23 @@ class HybridLoss(nn.Module):
                  (y_pred - y_true).pow(2).sum(-1).clamp(1e-8)).log10().mean()
 
     def forward(self, pred, true, mic, epoch=1):
-        """pred, true, mic: (B, F, T, 2), epoch: current training epoch (for mask warmup)"""
+        """pred, true, mic: (B, F, T, 2)"""
         pr, pi = pred[..., 0], pred[..., 1]
         tr, ti = true[..., 0], true[..., 1]
-        mr, mi = mic[..., 0],  mic[..., 1]
         pm = (pr**2 + pi**2 + 1e-12).sqrt()
         tm = (tr**2 + ti**2 + 1e-12).sqrt()
-        mm = (mr**2 + mi**2 + 1e-12).sqrt()
 
-        # ── Base STFT terms ────────────────────────────────────────────────────
-        # Compression 0.5 (was 0.3): less aggressive compression = amplitude
-        # mismatches hurt more, preventing the model outputting a quiet but
-        # spectrally-correct signal and getting away with it.
         real_loss = F.mse_loss(pr / pm.pow(0.5), tr / tm.pow(0.5))
         imag_loss = F.mse_loss(pi / pm.pow(0.5), ti / tm.pow(0.5))
         mag_loss  = F.mse_loss(pm.pow(0.5),       tm.pow(0.5))
 
-        # ── Time-domain signals ────────────────────────────────────────────────
-        # Clamp before istft: early-training model output can be extreme,
-        # causing istft overflow → NaN SDR loss. Clamp is tight enough to
-        # not affect well-trained outputs (normal STFT bins << 1e3).
+        # Clamp before istft: early-training model output can be extreme
         y_pred = torch.istft(pr.clamp(-1e3, 1e3) + 1j * pi.clamp(-1e3, 1e3), N_FFT, HOP, N_FFT, self.window)
         y_true = torch.istft(tr + 1j * ti,                    N_FFT, HOP, N_FFT, self.window)
 
-        # ── Full-sequence SDR (scale-sensitive) ────────────────────────────────
         sdr_full = self._sdr(y_pred, y_true)
 
-        # ── Onset-weighted magnitude loss ──────────────────────────────────────
-        T = pm.shape[2]
-        t = torch.arange(T, dtype=pm.dtype, device=pm.device)
-        onset_w = torch.exp(-t / self.ONSET_TAU)
-        onset_w = onset_w / onset_w.sum()
-        frame_mag = ((pm.pow(0.5) - tm.pow(0.5))**2).mean(dim=(0, 1))   # (T,)
-        onset_mag_loss = (frame_mag * onset_w).sum()
-
-        # ── Early SDR (first EARLY_SECS seconds) ───────────────────────────────
-        early_samps = int(self.EARLY_SECS * SR)
-        sdr_early = self._sdr(y_pred[..., :early_samps],
-                               y_true[..., :early_samps])
-
-        # ── Direct mask supervision ────────────────────────────────────────────
-        # We generate synthetic data, so we know exactly where feedback is.
-        # Ideal mask: target_mag / mic_mag — suppress where mic has extra energy
-        # (feedback), pass through where mic ≈ target (clean vocal).
-        # Predicted mask: enhanced_mag / mic_mag — what the model actually did.
-        # Per-bin, per-frame MSE gives direct gradient signal about WHERE to
-        # suppress, not just indirect signal from reconstruction error.
-        ideal_mask = (tm / (mm + 1e-8)).clamp(0.0, 1.0)
-        pred_mask  = (pm / (mm + 1e-8)).clamp(0.0, 1.0)
-        mask_loss  = F.mse_loss(pred_mask, ideal_mask)
-
-        # Mask weight warmup: ramp 0→10 over first 50 epochs, hold at 10.
-        # Model starts with near-zero output → mask_loss≈1.0 early.
-        # At weight 40 this dominates and destabilises training.
-        # Let reconstruction learning settle first, then add mask supervision.
-        mask_w = min(10.0, 10.0 * epoch / 50.0)
-
-        return (30 * (real_loss + imag_loss)
-                + 70 * mag_loss
-                +  1 * sdr_full
-                +  2 * onset_mag_loss
-                + 0.5 * sdr_early
-                + mask_w * mask_loss)
+        return 30 * (real_loss + imag_loss) + 70 * mag_loss + sdr_full
 
 
 # ── Per-step training function ─────────────────────────────────────────────────
@@ -386,8 +335,10 @@ def train():
     model     = FeedbackMaskNet().to(device)
     criterion = HybridLoss().to(device)
     optimizer = Adam(model.parameters(), lr=args.lr or LR)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
-                                   patience=5, min_lr=1e-6)
+    # CosineAnnealingLR cycles lr between LR and 1e-6 over EPOCHS.
+    # Unlike ReduceLROnPlateau, it never freezes permanently — even if a
+    # local minimum is hit, the next cycle restarts at LR and can escape.
+    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     ckpt_dir  = PROJECT_ROOT / 'checkpoints' / 'gtcrn_feedback'
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     writer    = SummaryWriter(str(ckpt_dir / 'tb'))
@@ -495,7 +446,7 @@ def train():
             optimizer.zero_grad()
 
         avg_loss = epoch_loss / max(valid_steps // BATCH_SIZE, 1)
-        scheduler.step(avg_loss)
+        scheduler.step()
         writer.add_scalar('loss/train', avg_loss, epoch)
         cur_lr  = optimizer.param_groups[0]['lr']
         best_str = f'{best_loss:.4f}' if best_loss < float('inf') else 'none'
