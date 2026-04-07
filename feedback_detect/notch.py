@@ -117,7 +117,7 @@ class NotchBank:
       2. out = notch_bank.process(block)
     """
 
-    MAX_NOTCHES           = 24
+    MAX_NOTCHES           = 36
     FREQ_TOL_RATIO        = 0.18    # ±18% (~3 semitones) — log-scale mode matching
     RELEASE_STEP_DB       = 3.0     # give back this many dB per probe step
     HOLD_FRAMES_PER_STEP  = 50      # frames between probe steps (~500ms at 100fps)
