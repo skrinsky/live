@@ -90,54 +90,29 @@ def sample_gain(epoch):
     return _one(), _one()
 
 
-# ── HybridLoss (STFT-domain + SI-SDR) ─────────────────────────────────────────
+# ── Loss ───────────────────────────────────────────────────────────────────────
 
-class HybridLoss(nn.Module):
+class MagLoss(nn.Module):
     """
-    Compressed complex STFT loss + scale-sensitive SDR.
+    Plain magnitude MSE — the only loss that makes sense for this task.
 
-    30 × RI compressed MSE   — phase-aware per-bin gradient every frame
-    70 × magnitude MSE       — perceptual spectral reconstruction
-     1 × scale-sensitive SDR — prevents broadband attenuation shortcut
+    Why not compressed RI + SDR:
+    - Compressed RI terms (pr/pm^0.5) amplify noise when mic and target have
+      different magnitudes (which they always do for near-threshold clips after
+      RMS normalization). This causes ±50% loss variance epoch to epoch.
+    - SDR can spike when target gets scaled near-zero on strong-ring ramp clips.
 
-    Deliberately minimal: onset/early-SDR/mask terms were removed because
-    they introduced conflicting gradients that caused the loss to plateau.
+    Why plain mag MSE works with passthrough initialization:
+    - Sub-threshold clips: pm ≈ tm → loss ≈ 0 → no gradient → model stays at passthrough
+    - Near-threshold clips: pm > tm at ring bins → pushes mask down at those bins
+    - Can't learn silence: non-ring bins have zero gradient, no incentive to suppress them
     """
 
-    def __init__(self):
-        super().__init__()
-        win = torch.hann_window(N_FFT).sqrt()
-        self.register_buffer('window', win)
-
-    @staticmethod
-    def _sdr(y_pred, y_true):
-        """Scale-sensitive SDR on (..., T) tensors. Returns scalar.
-        Unlike SI-SDR, penalises amplitude mismatch — a quieter prediction
-        is NOT equivalent to a full-amplitude one. This prevents the model
-        from learning broadband attenuation as a shortcut.
-        Numerator clamped to 1e-8 to prevent log10(0) for silence targets
-        (pure-feedback training clips where target = zeros)."""
-        return -(y_true.pow(2).sum(-1).clamp(1e-8) /
-                 (y_pred - y_true).pow(2).sum(-1).clamp(1e-8)).log10().mean()
-
-    def forward(self, pred, true, mic, epoch=1):
-        """pred, true, mic: (B, F, T, 2)"""
-        pr, pi = pred[..., 0], pred[..., 1]
-        tr, ti = true[..., 0], true[..., 1]
-        pm = (pr**2 + pi**2 + 1e-12).sqrt()
-        tm = (tr**2 + ti**2 + 1e-12).sqrt()
-
-        real_loss = F.mse_loss(pr / pm.pow(0.5), tr / tm.pow(0.5))
-        imag_loss = F.mse_loss(pi / pm.pow(0.5), ti / tm.pow(0.5))
-        mag_loss  = F.mse_loss(pm.pow(0.5),       tm.pow(0.5))
-
-        # Clamp before istft: early-training model output can be extreme
-        y_pred = torch.istft(pr.clamp(-1e3, 1e3) + 1j * pi.clamp(-1e3, 1e3), N_FFT, HOP, N_FFT, self.window)
-        y_true = torch.istft(tr + 1j * ti,                    N_FFT, HOP, N_FFT, self.window)
-
-        sdr_full = self._sdr(y_pred, y_true)
-
-        return 30 * (real_loss + imag_loss) + 70 * mag_loss + sdr_full
+    def forward(self, pred, true, mic=None, epoch=1):
+        """pred, true: (B, F, T, 2)"""
+        pm = (pred[..., 0]**2 + pred[..., 1]**2 + 1e-12).sqrt()
+        tm = (true[..., 0]**2 + true[..., 1]**2 + 1e-12).sqrt()
+        return F.mse_loss(pm, tm)
 
 
 # ── Per-step training function ─────────────────────────────────────────────────
@@ -336,7 +311,7 @@ def train():
     device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window    = torch.hann_window(N_FFT).sqrt().to(device)
     model     = FeedbackMaskNet().to(device)
-    criterion = HybridLoss().to(device)
+    criterion = MagLoss().to(device)
     optimizer = Adam(model.parameters(), lr=args.lr or LR)
     # CosineAnnealingLR cycles lr between LR and 1e-6 over EPOCHS.
     # Unlike ReduceLROnPlateau, it never freezes permanently — even if a
