@@ -29,6 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT / 'feedback_detect'))
 from model            import FeedbackDetector, SR, N_FFT, HOP, N_FREQ
 from notch            import NotchBank
 from predictor        import FeedbackPredictor
+from spectral_flatten import ChronicRingEQ
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 CHECKPOINT    = PROJECT_ROOT / 'checkpoints' / 'feedback_detect' / 'best.pt'
@@ -110,6 +111,7 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
     bin_freqs  = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
     predictor  = FeedbackPredictor(bin_freqs, sr=SR, profile_path=profile_path)
     notch_bank = NotchBank(sr=SR, depth_db=depth_db)
+    chronic_eq = ChronicRingEQ(bin_freqs, sr=SR)
 
     hpf_sos    = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
 
@@ -165,6 +167,10 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
                           preemptive_freqs=preemptive)
         processed = notch_bank.process(block_hpf)
 
+
+        # ── ChronicRingEQ (absorbed-ring overflow cuts) ───────────────────
+        chronic_eq.update(prob_np, notch_bank.active_notches)
+        processed = chronic_eq.process(processed)
 
         # ── Output ────────────────────────────────────────────────────────
         outdata[:, 0] = processed

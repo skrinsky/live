@@ -1,22 +1,20 @@
 """
-feedback_detect/spectral_flatten.py — Chronic-ring background EQ.
+feedback_detect/spectral_flatten.py — Absorbed-ring EQ correction.
 
-Applies gentle, wide peaking cuts at the frequencies the FeedbackPredictor
-has identified as persistent ringers.  Runs in series after the surgical
-NotchBank.
+Detects frequencies that the notch bank cannot handle because they are
+being absorbed (merged via FREQ_TOL_RATIO) by a nearby notch whose
+actual -3dB bandwidth does NOT cover them.  These bins have high
+detector probability but zero suppression — they just ring.
 
-The NotchBank handles acute ring onsets: narrow, deep, reactive.
-ChronicRingEQ handles the background: frequencies that ring often enough
-to fill a notch slot most of the time get a persistent wide cut that
-reduces the base ring level.  The acute breaks then require less surgical
-depth, and the notch bank evicts fewer slots.
-
-Source of truth
----------------
-predictor.risk_profile — risk[freq] = np.ndarray(N_STATES,) of accumulated
-ring counts per voice state.  The top-N frequencies by max risk across all
-states are the chronic ringers.  Cut depth scales linearly from MIN_CUT_DB
-at MIN_RISK up to MAX_CUT_DB at RISK_MAX.
+Per frame:
+  1. Mark bins as "covered" if any active notch's half-bandwidth
+     (notch_freq / 2*Q) physically includes them.
+  2. Bins with prob > PROB_THRESHOLD that are NOT covered are
+     "absorbed overflow" — ringing without suppression.
+  3. Accumulate a slow per-bin running average of overflow state.
+  4. When a bin's average exceeds UNCOV_TRIGGER (persistent, not
+     transient), cluster it with neighbours and apply a gentle wide
+     peaking cut at the cluster peak frequency.
 
 Only cuts — never boosts.  Cuts cannot cause feedback.
 """
@@ -69,64 +67,87 @@ class PeakingEQ:
 
 class ChronicRingEQ:
 
-    TOP_N               = 8       # top N risk frequencies to cut
-    MIN_RISK            = 3.0     # minimum risk score to qualify (> predictor RISK_THRESHOLD=2.0)
-    MIN_CUT_DB          = -2.0    # cut at MIN_RISK
-    MAX_CUT_DB          = -6.0    # cut at RISK_MAX — "a little wide EQ cut"
-    RISK_MAX            = 20.0    # matches FeedbackPredictor.RISK_MAX
-    CUT_Q               = 2.0     # wide — not surgical
-    # Skip chronic cut if the notch bank already has a deep notch whose
-    # -3dB half-bandwidth (nf / 2Q) actually covers the ring frequency.
-    # Uses physical coverage, not a fixed ratio, to avoid skipping overflow
-    # frequencies that sit just outside a notch's suppression range.
-    NOTCH_SKIP_DB       = -20.0   # if active notch is deeper than this, check coverage
-    UPDATE_INTERVAL     = 100     # frames between risk profile re-reads (~1 s at 100 fps)
-    CUT_SMOOTHING       = 0.02    # EMA per frame toward target (~50-frame / 500 ms time constant)
+    PROB_THRESHOLD  = 0.25     # bins above this are "ringing"
+    NOTCH_MIN_DB    = -10.0    # notch must be deeper to count as coverage
+    MIN_FREQ_HZ     = 80.0     # ignore below HPF cutoff
 
-    def __init__(self, sr: int = 48000):
-        self.sr = sr
-        # {freq_hz: PeakingEQ}
-        self._filters:      dict[float, PeakingEQ] = {}
-        self._current_cuts: dict[float, float]     = {}
-        self._targets:      dict[float, float]     = {}
-        self._peak_cuts:    dict[float, float]     = {}
-        self._frame_count    = 0
-        self._active_notches: 'list[tuple[float, float, float]]' = []
+    # Per-bin running average of "high-prob and uncovered"
+    UNCOV_ALPHA     = 0.005    # attack  ~200 frames / ~2 s at 100 fps
+    UNCOV_DECAY     = 0.002    # release ~500 frames / ~5 s
+    UNCOV_TRIGGER   = 0.10     # fire cut when avg exceeds this
+
+    # Clustering overflow bins into cuts
+    CLUSTER_RATIO   = 0.10     # merge bins within 10% of each other
+
+    # Cut parameters — gentle, wide
+    MIN_CUT_DB      = -2.0     # depth at UNCOV_TRIGGER
+    MAX_CUT_DB      = -6.0     # depth at full saturation
+    CUT_Q           = 2.0
+    CUT_SMOOTHING   = 0.02     # EMA per frame toward target
+    UPDATE_INTERVAL = 50       # frames between rebuilding cut targets
+    IDLE_FRAMES     = 200      # frames at ~0 dB before removing filter
+
+    def __init__(self, bin_freqs: np.ndarray, sr: int = 48000):
+        self.bin_freqs    = bin_freqs
+        self.sr           = sr
+        self._uncov_prob  = np.zeros(len(bin_freqs), dtype=np.float32)
+        # {freq: [PeakingEQ, current_cut_db, idle_counter]}
+        self._filters:    dict[float, list]  = {}
+        self._targets:    dict[float, float] = {}
+        self._peak_cuts:  dict[float, float] = {}
+        self._frame_count = 0
 
     # ── public ────────────────────────────────────────────────────────────────
 
-    def update(self, risk_profile: 'dict[float, np.ndarray]',
+    def update(self, prob_np: np.ndarray,
                active_notches: 'list[tuple[float, float, float]]'):
         """
-        risk_profile   : predictor.risk_profile → {freq: np.ndarray(N_STATES,)}
+        prob_np        : (N_FREQ,) per-bin detector probabilities
         active_notches : notch_bank.active_notches → [(freq, depth_db, q), ...]
         """
-        self._active_notches = active_notches
+        # ── Which bins are physically covered by an active notch? ──────────
+        covered = np.zeros(len(self.bin_freqs), dtype=bool)
+        for f, d, q in active_notches:
+            if d > self.NOTCH_MIN_DB:
+                continue
+            half_bw = f / (2.0 * q)
+            covered |= np.abs(self.bin_freqs - f) <= half_bw
+
+        # ── Accumulate per-bin overflow state ──────────────────────────────
+        overflow = ((prob_np > self.PROB_THRESHOLD)
+                    & ~covered
+                    & (self.bin_freqs >= self.MIN_FREQ_HZ))
+        self._uncov_prob[overflow]  += self.UNCOV_ALPHA * (
+            1.0 - self._uncov_prob[overflow])
+        self._uncov_prob[~overflow]  = np.maximum(
+            0.0, self._uncov_prob[~overflow] - self.UNCOV_DECAY)
+
+        # ── Periodically rebuild cut targets from accumulated state ────────
         self._frame_count += 1
         if self._frame_count >= self.UPDATE_INTERVAL:
             self._frame_count = 0
-            self._rebuild_targets(risk_profile)
+            self._rebuild_targets()
         self._smooth()
 
     def process(self, audio_block: np.ndarray) -> np.ndarray:
-        """Apply all active chronic cuts in series."""
         y = audio_block.astype(np.float32)
-        for freq, filt in self._filters.items():
-            if abs(self._current_cuts.get(freq, 0.0)) > 0.05:
+        for filt, cut, _ in self._filters.values():
+            if abs(cut) > 0.05:
                 y = filt.process(y)
         return y
 
     def summary(self) -> str:
-        active = [(f, self._current_cuts[f])
-                  for f in self._filters if abs(self._current_cuts.get(f, 0.0)) > 0.1]
+        active = [(f, v[1]) for f, v in self._filters.items()
+                  if abs(v[1]) > 0.1]
         lines = []
         if not active:
             lines.append('ChronicRingEQ: no active cuts')
         else:
-            lines.append('ChronicRingEQ cuts:')
+            lines.append('ChronicRingEQ absorbed-ring cuts:')
             for f, cut in sorted(active, key=lambda x: x[1]):
-                tgt = self._targets.get(f, 0.0)
-                lines.append(f'  {f:.0f} Hz: {cut:.1f} dB  (target {tgt:.1f} dB)')
+                bi = int(np.argmin(np.abs(self.bin_freqs - f)))
+                lines.append(f'  {f:.0f} Hz: {cut:.1f} dB'
+                              f'  (uncov_avg={self._uncov_prob[bi]:.3f})')
         if self._peak_cuts:
             peak = [(f, v) for f, v in self._peak_cuts.items() if v < -0.1]
             if peak:
@@ -137,58 +158,67 @@ class ChronicRingEQ:
 
     # ── private ───────────────────────────────────────────────────────────────
 
-    def _risk_to_cut(self, score: float) -> float:
-        """Linear interpolation: MIN_RISK → MIN_CUT_DB, RISK_MAX → MAX_CUT_DB."""
-        t = min(1.0, max(0.0,
-                (score - self.MIN_RISK) / (self.RISK_MAX - self.MIN_RISK)))
-        return self.MIN_CUT_DB + t * (self.MAX_CUT_DB - self.MIN_CUT_DB)
+    def _rebuild_targets(self):
+        trigger_bins = np.where(self._uncov_prob > self.UNCOV_TRIGGER)[0]
 
-    def _rebuild_targets(self, risk_profile: 'dict[float, np.ndarray]'):
-        """Re-read risk table and update cut targets."""
-        scored = [(freq, float(risk.max()))
-                  for freq, risk in risk_profile.items()
-                  if float(risk.max()) >= self.MIN_RISK]
-        scored.sort(key=lambda x: -x[1])
-        # Filter out frequencies already covered by a deep notch bank slot
-        deep_notches = [(f, q) for f, d, q in self._active_notches
-                        if d <= self.NOTCH_SKIP_DB]
-        top = {}
-        for freq, score in scored:
-            if len(top) >= self.TOP_N:
-                break
-            # Skip if any deep notch's half-BW physically covers this frequency
-            covered = any(abs(freq - nf) <= nf / (2.0 * q)
-                          for nf, q in deep_notches)
-            if not covered:
-                top[freq] = self._risk_to_cut(score)
+        new_targets: dict[float, float] = {}
+        if len(trigger_bins):
+            # Cluster bins by log-scale proximity
+            clusters: list[list[int]] = []
+            current = [int(trigger_bins[0])]
+            for idx in trigger_bins[1:]:
+                f_last = self.bin_freqs[current[-1]]
+                f_this = self.bin_freqs[idx]
+                if abs(f_this - f_last) / f_last < self.CLUSTER_RATIO:
+                    current.append(int(idx))
+                else:
+                    clusters.append(current)
+                    current = [int(idx)]
+            clusters.append(current)
 
-        # Set releasing targets for frequencies no longer in top-N
+            for cluster in clusters:
+                peak_i  = cluster[int(np.argmax(self._uncov_prob[cluster]))]
+                freq    = float(self.bin_freqs[peak_i])
+                level   = float(self._uncov_prob[peak_i])
+                t       = min(1.0, (level - self.UNCOV_TRIGGER)
+                              / max(1e-6, 1.0 - self.UNCOV_TRIGGER))
+                new_targets[freq] = self.MIN_CUT_DB + t * (
+                    self.MAX_CUT_DB - self.MIN_CUT_DB)
+
+        # Release targets no longer active
         for freq in list(self._targets):
-            if freq not in top:
+            if not any(abs(freq - nf) / freq < self.CLUSTER_RATIO
+                       for nf in new_targets):
                 self._targets[freq] = 0.0
 
-        # Update or add targets
-        for freq, cut in top.items():
-            self._targets[freq] = cut
-            if freq not in self._filters:
-                self._filters[freq]      = PeakingEQ(freq, sr=self.sr,
-                                                     q=self.CUT_Q, gain_db=0.0)
-                self._current_cuts[freq] = 0.0
+        # Add / update
+        for freq, cut in new_targets.items():
+            existing = next((ef for ef in self._filters
+                             if abs(ef - freq) / freq < self.CLUSTER_RATIO),
+                            None)
+            key = existing if existing is not None else freq
+            self._targets[key] = cut
+            if key not in self._filters:
+                self._filters[key] = [
+                    PeakingEQ(key, sr=self.sr, q=self.CUT_Q, gain_db=0.0),
+                    0.0, 0]
 
     def _smooth(self):
-        """Step each filter's gain one EMA frame toward its target."""
         to_remove = []
-        for freq in list(self._filters):
+        for freq, state in self._filters.items():
+            filt, cur, idle = state
             target  = self._targets.get(freq, 0.0)
-            current = self._current_cuts.get(freq, 0.0)
-            new     = current + self.CUT_SMOOTHING * (target - current)
-            self._current_cuts[freq] = new
-            self._filters[freq].set_gain(float(new))
-            self._peak_cuts[freq] = min(self._peak_cuts.get(freq, 0.0), new)
-            # Remove filter once it has fully released to 0
-            if target == 0.0 and abs(new) < 0.05:
-                to_remove.append(freq)
+            new_cut = cur + self.CUT_SMOOTHING * (target - cur)
+            state[1] = new_cut
+            filt.set_gain(float(new_cut))
+            self._peak_cuts[freq] = min(
+                self._peak_cuts.get(freq, 0.0), new_cut)
+            if target == 0.0 and abs(new_cut) < 0.05:
+                state[2] = idle + 1
+                if state[2] >= self.IDLE_FRAMES:
+                    to_remove.append(freq)
+            else:
+                state[2] = 0
         for freq in to_remove:
             del self._filters[freq]
-            del self._current_cuts[freq]
             self._targets.pop(freq, None)

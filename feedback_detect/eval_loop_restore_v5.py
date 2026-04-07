@@ -30,6 +30,7 @@ from feedback_detect.live import _cluster_bins
 from feedback_detect.eval_loop import _rms_db
 from feedback_detect.spectral_flatten import ChronicRingEQ
 
+
 from voice_restore.model_v5 import VoiceRestorerV5, apply_compensation
 from voice_restore.model_v5 import N_FREQ as VR_N_FREQ, N_FFT as VR_N_FFT
 VR_HOP = VR_N_FFT // 2   # 512 — 50% overlap required for perfect OLA with sqrt-Hann window
@@ -115,9 +116,9 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
         notch_logs.append(list(notch_bank.active_notches))
         prob_logs.append(prob_np)
 
-        # ChronicRingEQ: persistent wide cuts at chronic ring zones
-        if chronic_eq is not None and predictor is not None:
-            chronic_eq.update(predictor.risk_profile, notch_bank.active_notches)
+        # ChronicRingEQ: gentle cuts at absorbed overflow rings
+        if chronic_eq is not None:
+            chronic_eq.update(prob_np, notch_bank.active_notches)
             flat_block = chronic_eq.process(out_block)
         else:
             flat_block = out_block
@@ -218,11 +219,12 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
                                    profile_path=Path(profile) if profile else default_profile)
     predictor.seed_from_ir(ir, gain=gain)
     notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
+    chronic_eq = ChronicRingEQ(_bin_freqs, sr=SR)
     mic_sup, box_sup, flat_sup, notch_logs, prob_logs = simulate_notch(
         voice_np, noise_np, ir, gain=gain,
         model_det=model_det, notch_bank=notch_bank,
         device=device, window=window, threshold=threshold,
-        predictor=predictor, chronic_eq=None)
+        predictor=predictor, chronic_eq=chronic_eq)
     predictor.save()
     print(predictor.summary())
     print(f'  mic RMS: {_rms_db(mic_sup):.1f} dB')
@@ -377,8 +379,9 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
         print(f'  {fc:5d} Hz  {sign}{abs(ratio_db):4.1f} dB  {bar}')
 
     flat_diff_rms = float(np.sqrt(np.mean((flat_sup[:L_flat] - box_sup[:L_flat])**2)))
-    print(f'\npost-notch EQ vs suppressed RMS diff: {flat_diff_rms:.6f}  '
-          f'(0.0 = no EQ active)')
+    print(f'\nChronicRingEQ vs suppressed RMS diff: {flat_diff_rms:.6f}  '
+          f'(0.0 = no absorbed rings found)')
+    print(f'\n{chronic_eq.summary()}')
 
     # ── Spectral coloration map: flattened vs clean ─────────────────────────────
     print('\nSpectral coloration (suppressed_out_flattened vs clean_reference, 1/3-oct bands):')
