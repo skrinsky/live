@@ -197,7 +197,18 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     vocal_path_used = None
     if vocal_files:
         vocal_path_used = vocal_files[0]
-        v, vsr = sf.read(str(vocal_path_used), dtype='float32')
+        if vocal_path_used.suffix == '.parquet':
+            import pandas as pd, io
+            df  = pd.read_parquet(str(vocal_path_used))
+            row = df.iloc[0]['audio']          # HuggingFace audio column
+            if isinstance(row, dict) and 'bytes' in row:
+                v, vsr = sf.read(io.BytesIO(row['bytes']), dtype='float32')
+            else:
+                # already decoded: {'array': np.ndarray, 'sampling_rate': int}
+                v   = np.array(row['array'], dtype=np.float32)
+                vsr = int(row['sampling_rate'])
+        else:
+            v, vsr = sf.read(str(vocal_path_used), dtype='float32')
         if v.ndim > 1: v = v.mean(1)
         if vsr != SR:
             raise ValueError(f'Vocal SR={vsr}, expected {SR}')
