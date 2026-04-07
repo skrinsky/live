@@ -340,6 +340,19 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     mic_np = np.nan_to_num(mic_np, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
     mic_np = np.clip(mic_np, -1.0, 1.0)
 
+    # Console HPF — must match live.py and run_inference.py (90 Hz, randomised ±20 Hz)
+    hpf_mic = make_hpf(np.random.uniform(70, 120))
+    mic_np  = sosfilt(hpf_mic, mic_np).astype(np.float32)
+
+    # RMS normalisation — must match live.py TARGET_RMS=0.1 so the model sees
+    # the same amplitude distribution at inference as it does during training.
+    # Scale target by the same factor to preserve the ideal mask ratio.
+    TARGET_RMS = 0.1
+    mic_rms    = float(np.sqrt(np.mean(mic_np ** 2))) + 1e-8
+    rms_scale  = TARGET_RMS / mic_rms
+    mic_np     = np.clip(mic_np * rms_scale, -1.0, 1.0).astype(np.float32)
+    target_np  = np.clip(target_np * rms_scale, -1.0, 1.0).astype(np.float32)
+
     # Mic frequency response — same profile applied to both mic and target so the
     # model sees consistent coloration and only needs to suppress the feedback
     mic_name  = random.choice(MIC_NAMES)
@@ -484,8 +497,11 @@ def train():
         avg_loss = epoch_loss / max(valid_steps // BATCH_SIZE, 1)
         scheduler.step(avg_loss)
         writer.add_scalar('loss/train', avg_loss, epoch)
+        cur_lr  = optimizer.param_groups[0]['lr']
         best_str = f'{best_loss:.4f}' if best_loss < float('inf') else 'none'
-        print(f'Epoch {epoch:3d} | loss {avg_loss:.4f} | best {best_str} | valid {valid_steps}/{N_STEPS}')
+        phase   = 1 if epoch < 150 else 2
+        print(f'Epoch {epoch:3d} | loss {avg_loss:.4f} | best {best_str} | '
+              f'phase {phase} | lr {cur_lr:.2e} | valid {valid_steps}/{N_STEPS}')
 
         if avg_loss < best_loss:
             best_loss = avg_loss
