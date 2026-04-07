@@ -264,6 +264,13 @@ class FeedbackMaskNet(nn.Module):
 
         mask = self.erb.bs(feat)    # (B,2,T,F)
 
+        # Shift real component by +1 so the model starts at passthrough (1+0j)
+        # rather than silence (0+0j). Without this, sub-threshold examples
+        # (where the correct answer IS passthrough) conflict with near-threshold
+        # examples (where suppression is needed), causing huge loss variance.
+        # After shift: mask_real ∈ (0,2), mask_imag ∈ (-1,1). At init ≈ (1,0).
+        mask = torch.stack([mask[:, 0] + 1.0, mask[:, 1]], dim=1)
+
         enh  = self.mask(mask, spec_ref.permute(0,3,2,1))   # (B,2,T,F)
         return enh.permute(0,3,2,1), (h1, h2)   # (B,F,T,2), hidden state
 
