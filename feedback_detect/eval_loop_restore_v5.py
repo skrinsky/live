@@ -112,7 +112,11 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
         ) if predictor else []
         notch_bank.update(freqs, _bin_freqs, prob_np, preemptive_freqs=preemptive)
         out_block = notch_bank.process(mic_block)
-        box_out[s:s+HOP] = out_block
+
+        # Adaptive makeup gain — compute scalar here so box_out and flat_out share it
+        gain_scalar = makeup_gain.update(freqs, notch_bank.active_notches) \
+                      if makeup_gain is not None else 1.0
+        box_out[s:s+HOP] = np.clip(out_block * gain_scalar, -1.0, 1.0)
         notch_logs.append(list(notch_bank.active_notches))
         prob_logs.append(prob_np)
 
@@ -123,14 +127,7 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
         else:
             flat_block = out_block
 
-        # Adaptive makeup gain — applied to output only, NOT to the feedback path
-        if makeup_gain is not None:
-            gain_scalar  = makeup_gain.update(freqs, notch_bank.active_notches)
-            flat_out_blk = np.clip(flat_block * gain_scalar, -1.0, 1.0)
-        else:
-            flat_out_blk = flat_block
-
-        flat_out[s:s+HOP] = flat_out_blk
+        flat_out[s:s+HOP] = np.clip(flat_block * gain_scalar, -1.0, 1.0)
 
         fb = np.convolve(flat_block.astype(np.float64), ir.astype(np.float64))
         acc[s:s + len(fb)] += fb

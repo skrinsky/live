@@ -36,7 +36,7 @@ class AdaptiveMakeupGain:
       - any detection → ring is active → back off + hold
     """
 
-    MAX_DB            = 6.0    # never boost more than this
+    MAX_DB            = 12.0   # never boost more than this
     RAMP_DB_PER_FRAME = 0.002  # +0.2 dB/s at 100 fps — slow climb
     BACK_OFF_DB       = 1.5    # step back this many dB on each detection event
     HOLD_FRAMES       = 300    # frames to hold after backing off before ramping (~3 s)
