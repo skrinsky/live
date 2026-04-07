@@ -174,7 +174,7 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
         processed = chronic_eq.process(processed)
 
         # ── Adaptive makeup gain ───────────────────────────────────────────
-        gain_scalar = makeup_gain.update(len(detected_freqs))
+        gain_scalar = makeup_gain.update(detected_freqs, notch_bank.active_notches)
         processed   = np.clip(processed * gain_scalar, -1.0, 1.0)
 
         # ── Output ────────────────────────────────────────────────────────

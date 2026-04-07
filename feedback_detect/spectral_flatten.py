@@ -45,12 +45,27 @@ class AdaptiveMakeupGain:
         self.current_db = 0.0
         self._hold      = 0
 
-    def update(self, n_detections: int) -> float:
+    def update(self, detected_freqs: list,
+               active_notches: 'list[tuple[float, float, float]]') -> float:
         """
-        n_detections : len(detected_freqs) from the detector this frame.
+        detected_freqs  : confirmed ringing frequencies this frame
+        active_notches  : notch_bank.active_notches → [(freq, depth_db, q), ...]
         Returns linear gain scalar to multiply the output block by.
+
+        Only counts detections at frequencies NOT already covered by an active
+        notch — re-triggers of existing notches don't prevent gain from ramping.
         """
-        if n_detections > 0:
+        NOTCH_TOL = 0.18   # same as NotchBank.FREQ_TOL_RATIO
+        notched_freqs = [f for f, _, __ in active_notches]
+
+        n_new = 0
+        for freq in detected_freqs:
+            already_notched = any(
+                abs(freq - nf) / freq < NOTCH_TOL for nf in notched_freqs)
+            if not already_notched:
+                n_new += 1
+
+        if n_new > 0:
             self.current_db = max(0.0, self.current_db - self.BACK_OFF_DB)
             self._hold      = self.HOLD_FRAMES
         elif self._hold > 0:
