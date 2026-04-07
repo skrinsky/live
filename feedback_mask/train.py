@@ -405,16 +405,18 @@ def train():
     print(f'Vocal files: {len(vocal_files)}, noise: {len(noise_files)}, '
           f'mains IRs: {len(mains_ir_files)}, monitor IRs: {len(monitor_ir_files)}')
 
-    best_loss = float('inf')
+    best_loss   = float('inf')
+    start_epoch = 1
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         state = ckpt if isinstance(ckpt, dict) and 'model' in ckpt else {'model': ckpt}
         model.load_state_dict(state['model'])
-        best_loss = state.get('best_loss', float('inf'))
-        print(f'Warm-started from {args.resume} (best_loss={best_loss:.4f})')
+        best_loss   = state.get('best_loss', float('inf'))
+        start_epoch = state.get('epoch', 0) + 1
+        print(f'Resumed from {args.resume} (epoch {start_epoch}, best_loss={best_loss:.4f})')
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
         epoch_loss  = 0.0
         valid_steps = 0
