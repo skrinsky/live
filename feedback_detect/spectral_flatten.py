@@ -89,9 +89,7 @@ class FeedbackGainRider:
         Returns linear gain scalar.
         """
         if n_detections > 0:
-            # Slam down — deeper if already ducked (ring not yet suppressed)
-            self.current_db = max(self.MIN_DUCK_DB,
-                                  self.current_db + self.DUCK_DB)
+            self.current_db = self.DUCK_DB
         else:
             self.current_db = min(0.0, self.current_db + self.RELEASE_DB_PER_FRAME)
         return 10.0 ** (self.current_db / 20.0)
