@@ -28,7 +28,7 @@ from feedback_detect.notch import NotchBank
 from feedback_detect.predictor import FeedbackPredictor
 from feedback_detect.live import _cluster_bins
 from feedback_detect.eval_loop import _rms_db
-from feedback_detect.spectral_flatten import ChronicRingEQ
+from feedback_detect.spectral_flatten import ChronicRingEQ, AdaptiveMakeupGain
 
 
 from voice_restore.model_v5 import VoiceRestorerV5, apply_compensation
@@ -47,7 +47,7 @@ _bin_freqs = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
 
 def simulate_notch(voice_np, noise_np, feedback_ir, gain,
                    model_det, notch_bank, device, window, threshold,
-                   predictor=None, chronic_eq=None):
+                   predictor=None, chronic_eq=None, makeup_gain=None):
     ir  = (feedback_ir * gain).astype(np.float32)
     n   = len(voice_np)
     acc = np.zeros(n + len(ir), dtype=np.float64)
@@ -122,6 +122,12 @@ def simulate_notch(voice_np, noise_np, feedback_ir, gain,
             flat_block = chronic_eq.process(out_block)
         else:
             flat_block = out_block
+
+        # Adaptive makeup gain — ramps up when quiet, backs off on new detections
+        if makeup_gain is not None:
+            gain_scalar = makeup_gain.update(len(freqs))
+            flat_block  = np.clip(flat_block * gain_scalar, -1.0, 1.0)
+
         flat_out[s:s+HOP] = flat_block
 
         fb = np.convolve(flat_block.astype(np.float64), ir.astype(np.float64))
@@ -218,13 +224,14 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
     predictor  = FeedbackPredictor(_bin_freqs, sr=SR,
                                    profile_path=Path(profile) if profile else default_profile)
     predictor.seed_from_ir(ir, gain=gain)
-    notch_bank = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
-    chronic_eq = ChronicRingEQ(_bin_freqs, sr=SR)
+    notch_bank  = NotchBank(sr=SR, q=15.0, depth_db=-48.0)
+    chronic_eq  = ChronicRingEQ(_bin_freqs, sr=SR)
+    makeup_gain = AdaptiveMakeupGain()
     mic_sup, box_sup, flat_sup, notch_logs, prob_logs = simulate_notch(
         voice_np, noise_np, ir, gain=gain,
         model_det=model_det, notch_bank=notch_bank,
         device=device, window=window, threshold=threshold,
-        predictor=predictor, chronic_eq=chronic_eq)
+        predictor=predictor, chronic_eq=chronic_eq, makeup_gain=makeup_gain)
     predictor.save()
     print(predictor.summary())
     print(f'  mic RMS: {_rms_db(mic_sup):.1f} dB')
@@ -398,6 +405,7 @@ def run_eval(gain=1.3, duration_s=60.0, threshold=0.4,
         sign = '+' if ratio_db >= 0 else '-'
         print(f'  {fc:5d} Hz  {sign}{abs(ratio_db):4.1f} dB  {bar}')
 
+    print(f'\nAdaptiveMakeupGain settled at: {makeup_gain.current_db:+.2f} dB')
     print(f'\nRMS dB — clean {_rms_db(clean_np):.1f} | '
           f'suppressed {_rms_db(box_sup[:L]):.1f} | '
           f'flattened {_rms_db(flat_sup[:L_flat]):.1f} | '

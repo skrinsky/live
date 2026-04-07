@@ -29,7 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT / 'feedback_detect'))
 from model            import FeedbackDetector, SR, N_FFT, HOP, N_FREQ
 from notch            import NotchBank
 from predictor        import FeedbackPredictor
-from spectral_flatten import ChronicRingEQ
+from spectral_flatten import ChronicRingEQ, AdaptiveMakeupGain
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 CHECKPOINT    = PROJECT_ROOT / 'checkpoints' / 'feedback_detect' / 'best.pt'
@@ -109,9 +109,10 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
     print(f'FeedbackDetector  loaded from {ckpt_path}')
 
     bin_freqs  = np.fft.rfftfreq(N_FFT, d=1.0 / SR)
-    predictor  = FeedbackPredictor(bin_freqs, sr=SR, profile_path=profile_path)
-    notch_bank = NotchBank(sr=SR, depth_db=depth_db)
-    chronic_eq = ChronicRingEQ(bin_freqs, sr=SR)
+    predictor   = FeedbackPredictor(bin_freqs, sr=SR, profile_path=profile_path)
+    notch_bank  = NotchBank(sr=SR, depth_db=depth_db)
+    chronic_eq  = ChronicRingEQ(bin_freqs, sr=SR)
+    makeup_gain = AdaptiveMakeupGain()
 
     hpf_sos    = butter(2, 90.0 / (SR / 2), btype='high', output='sos')
 
@@ -172,6 +173,10 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
         chronic_eq.update(prob_np, notch_bank.active_notches)
         processed = chronic_eq.process(processed)
 
+        # ── Adaptive makeup gain ───────────────────────────────────────────
+        gain_scalar = makeup_gain.update(len(detected_freqs))
+        processed   = np.clip(processed * gain_scalar, -1.0, 1.0)
+
         # ── Output ────────────────────────────────────────────────────────
         outdata[:, 0] = processed
         if outdata.shape[1] > 1:
@@ -183,7 +188,8 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
                                   for f, d, _ in notch_bank.active_notches)
             det_str   = ', '.join(f'{f:.0f}' for f in detected_freqs) or '—'
             pre_str   = ', '.join(f'{f:.0f}' for f in preemptive)     or '—'
-            print(f'\rDet:[{det_str}]  Pre:[{pre_str}]  Notches:[{notch_str}]    ',
+            print(f'\rDet:[{det_str}]  Pre:[{pre_str}]  Notches:[{notch_str}]'
+                  f'  Makeup:{makeup_gain.current_db:+.1f}dB    ',
                   end='', flush=True)
 
     # ── Graceful shutdown — save profile on Ctrl+C ────────────────────────────

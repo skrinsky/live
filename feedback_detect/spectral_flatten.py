@@ -23,6 +23,44 @@ import numpy as np
 from scipy.signal import lfilter
 
 
+class AdaptiveMakeupGain:
+    """
+    Feedback-aware broadband makeup gain.
+
+    Slowly ramps gain up after the notch bank quiets the room.
+    Backs off immediately when the detector fires new rings.
+    Finds its own ceiling — no manual tuning needed.
+
+    Signal: len(detected_freqs) per frame.
+      - 0 detections → room is quiet → ramp up
+      - any detection → ring is active → back off + hold
+    """
+
+    MAX_DB            = 6.0    # never boost more than this
+    RAMP_DB_PER_FRAME = 0.002  # +0.2 dB/s at 100 fps — slow climb
+    BACK_OFF_DB       = 1.5    # step back this many dB on each detection event
+    HOLD_FRAMES       = 300    # frames to hold after backing off before ramping (~3 s)
+
+    def __init__(self):
+        self.current_db = 0.0
+        self._hold      = 0
+
+    def update(self, n_detections: int) -> float:
+        """
+        n_detections : len(detected_freqs) from the detector this frame.
+        Returns linear gain scalar to multiply the output block by.
+        """
+        if n_detections > 0:
+            self.current_db = max(0.0, self.current_db - self.BACK_OFF_DB)
+            self._hold      = self.HOLD_FRAMES
+        elif self._hold > 0:
+            self._hold -= 1
+        else:
+            self.current_db = min(self.MAX_DB,
+                                  self.current_db + self.RAMP_DB_PER_FRAME)
+        return 10.0 ** (self.current_db / 20.0)
+
+
 class PeakingEQ:
     """
     Stateful biquad peaking/cutting EQ.
