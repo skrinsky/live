@@ -210,7 +210,7 @@ def run(threshold=DETECT_THRESH, depth_db=NOTCH_DEPTH,
     try:
         with sd.Stream(samplerate=SR, blocksize=BLOCK_SIZE,
                        dtype='float32', channels=1,
-                       device=audio_device,
+                       device=audio_device, latency='low',
                        callback=callback):
             while True:
                 time.sleep(0.1)
