@@ -90,29 +90,28 @@ def sample_gain(epoch):
     return _one(), _one()
 
 
-# ── Loss ───────────────────────────────────────────────────────────────────────
+# ── Oracle supervision helpers ──────────────────────────────────────────────────
 
-class MagLoss(nn.Module):
+def _stability_check(h, max_gain=0.99):
+    """Re-normalise h so spectral peak stays ≤ max_gain after resonators are added."""
+    peak = np.abs(np.fft.rfft(h, n=max(len(h) * 4, 4096))).max()
+    if peak > max_gain:
+        h = h * (max_gain / (peak + 1e-8))
+    return h
+
+
+def _ideal_mask_for_ir(h):
     """
-    Plain magnitude MSE — the only loss that makes sense for this task.
+    Oracle ideal suppression mask from feedback IR spectral response.
 
-    Why not compressed RI + SDR:
-    - Compressed RI terms (pr/pm^0.5) amplify noise when mic and target have
-      different magnitudes (which they always do for near-threshold clips after
-      RMS normalization). This causes ±50% loss variance epoch to epoch.
-    - SDR can spike when target gets scaled near-zero on strong-ring ramp clips.
+    fb_spec[k] = per-bin loop gain at STFT bin k.
+    At a ring frequency fb_spec ≈ 0.8-0.99.  ideal_mask = clip(1 - fb_spec, 0, 1).
+    Ring bins get mask≈0 (suppress), silent-loop bins get mask≈1 (pass through).
 
-    Why plain mag MSE works with passthrough initialization:
-    - Sub-threshold clips: pm ≈ tm → loss ≈ 0 → no gradient → model stays at passthrough
-    - Near-threshold clips: pm > tm at ring bins → pushes mask down at those bins
-    - Can't learn silence: non-ring bins have zero gradient, no incentive to suppress them
+    Returns float32 array of shape (N_FREQ,).
     """
-
-    def forward(self, pred, true, mic=None, epoch=1):
-        """pred, true: (B, F, T, 2)"""
-        pm = (pred[..., 0]**2 + pred[..., 1]**2 + 1e-12).sqrt()
-        tm = (true[..., 0]**2 + true[..., 1]**2 + 1e-12).sqrt()
-        return F.mse_loss(pm, tm)
+    fb_spec = np.abs(np.fft.rfft(h, n=N_FFT))[:N_FREQ].astype(np.float32)
+    return np.clip(1.0 - fb_spec, 0.0, 1.0)
 
 
 # ── Per-step training function ─────────────────────────────────────────────────
@@ -185,19 +184,20 @@ def _add_resonators(h, sr, ir_path=None, n=None):
     return h
 
 
-def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
+def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
                    room_ir_np, noise_np, device, window, room_ir_path=None, epoch=1):
     """
-    Recursive feedback simulation → STFT → model → loss.
+    Recursive feedback simulation → STFT → model → oracle BCE loss.
 
     mic[n] = speech[n] + gain × Σ h[k] × mic[n-k]   (IIR via lfilter)
 
-    gain < 1.0  → decaying resonance
-    gain = 1.0  → sustained tone (marginal stability)
-    gain > 1.0  → exponential howl, clipped at ±1 (saturated squeal)
+    Oracle supervision: since we generate feedback synthetically, we know
+    exactly which bins are ringing from the feedback IR spectral response.
+    ideal_mask = clip(1 - |FFT(h_ring_ir)|, 0, 1)
 
-    Target is always the reverberant clean vocal — model learns to invert the
-    feedback loop and output clean speech regardless of gain level.
+    BCE(pred_mask, ideal_mask) directly supervises which bins to suppress,
+    bypassing the implicit reconstruction loss entirely. No more silent-gradient
+    problem, no more MagLoss scale confusion. Starting loss ≈ 0.1-0.2.
     Returns scalar loss tensor with graph attached.
     """
     # Room reverb → target (what the model should output)
@@ -240,24 +240,30 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
 
     # 50% of clips ramp from stable → howling to simulate feedback building up
     # (vocalist walks toward monitor, engineer nudges fader, mic cups, etc.)
-    if random.random() < 0.50:
+    is_ramp = random.random() < 0.50
+    if is_ramp:
         gain_lo  = random.uniform(0.2, 0.7)
         gain_hi  = random.uniform(0.85, 0.99)  # never exceeds stability threshold
         split    = random.randint(int(0.2 * SEQ_LEN), int(0.5 * SEQ_LEN))
-        h_lo     = _add_resonators(mains_norm * gain_lo + mon_norm * gain_lo,
-                                   SR, ir_path=room_ir_path)
-        h_hi     = _add_resonators(mains_norm * gain_hi + mon_norm * gain_hi,
-                                   SR, ir_path=room_ir_path)
+        # _stability_check: resonators can push spectral peak above gain level → overflow fix
+        h_lo = _stability_check(_add_resonators(mains_norm * gain_lo + mon_norm * gain_lo,
+                                                SR, ir_path=room_ir_path))
+        h_hi = _stability_check(_add_resonators(mains_norm * gain_hi + mon_norm * gain_hi,
+                                                SR, ir_path=room_ir_path))
         a_lo = np.concatenate([[1.0], -h_lo.astype(np.float64)])
         a_hi = np.concatenate([[1.0], -h_hi.astype(np.float64)])
         zi   = np.zeros(len(a_lo) - 1)
         y1, zi = lfilter([1.0], a_lo, noisy_clean[:split], zi=zi)
         y2, _  = lfilter([1.0], a_hi, noisy_clean[split:], zi=zi)
         mic_np = np.concatenate([y1, y2])
+        h_combined = None  # not used in ramp case
     else:
         mains_gain, monitor_gain = sample_gain(epoch)
-        h_combined = _add_resonators(mains_norm * mains_gain + mon_norm * monitor_gain,
-                                     SR, ir_path=room_ir_path)
+        h_combined = _stability_check(
+            _add_resonators(mains_norm * mains_gain + mon_norm * monitor_gain,
+                            SR, ir_path=room_ir_path))
+        h_lo = h_hi = None  # not used in constant case
+        split = 0
         if h_combined.max() == 0:
             mic_np = noisy_clean.copy()
         else:
@@ -286,17 +292,31 @@ def train_one_step(model, criterion, vocal_np, mains_ir_np, monitor_ir_np,
     mic_np    = apply_random_mic_response(mic_np,    SR, mic_name=mic_name)
     target_np = apply_random_mic_response(target_np, SR, mic_name=mic_name)
 
-    # STFT → (1, F, T, 2)
+    # STFT mic → (1, F, T, 2)
     mic_t    = torch.from_numpy(mic_np).unsqueeze(0).to(device)
-    tgt_t    = torch.from_numpy(target_np).unsqueeze(0).to(device)
     mic_stft = torch.stft(mic_t, N_FFT, HOP, N_FFT, window, return_complex=True)
-    tgt_stft = torch.stft(tgt_t, N_FFT, HOP, N_FFT, window, return_complex=True)
     mic_spec = torch.stack([mic_stft.real, mic_stft.imag], dim=-1)
-    tgt_spec = torch.stack([tgt_stft.real, tgt_stft.imag], dim=-1)
 
-    enh_spec, _ = model(mic_spec)
+    # Model forward — returns (enhanced, mask, h_new); mask: (1, N_FREQ, T)
+    _, pred_mask, _ = model(mic_spec)
+    T = pred_mask.shape[2]
 
-    return criterion(enh_spec, tgt_spec, mic_spec, epoch=epoch)
+    # Oracle ideal mask: derived from the feedback IR we actually used.
+    # Ring bins get mask≈0 (suppress), silent-loop bins get mask≈1 (pass through).
+    if is_ramp:
+        split_frame  = min(split // HOP, T)
+        mask_lo_np   = _ideal_mask_for_ir(h_lo)                          # (N_FREQ,)
+        mask_hi_np   = _ideal_mask_for_ir(h_hi)                          # (N_FREQ,)
+        ideal_np     = np.empty((N_FREQ, T), dtype=np.float32)
+        ideal_np[:, :split_frame] = mask_lo_np[:, None]
+        ideal_np[:, split_frame:] = mask_hi_np[:, None]
+        ideal_mask_t = torch.from_numpy(ideal_np).unsqueeze(0).to(device)  # (1, N_FREQ, T)
+    else:
+        mask_np      = _ideal_mask_for_ir(h_combined)                    # (N_FREQ,)
+        ideal_mask_t = (torch.from_numpy(mask_np).to(device)
+                        .view(1, N_FREQ, 1).expand(1, N_FREQ, T).contiguous())
+
+    return F.binary_cross_entropy(pred_mask, ideal_mask_t)
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
@@ -311,7 +331,6 @@ def train():
     device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     window    = torch.hann_window(N_FFT).sqrt().to(device)
     model     = FeedbackMaskNet().to(device)
-    criterion = MagLoss().to(device)
     optimizer = Adam(model.parameters(), lr=args.lr or LR)
     # CosineAnnealingLR cycles lr between LR and 1e-6 over EPOCHS.
     # Unlike ReduceLROnPlateau, it never freezes permanently — even if a
@@ -400,7 +419,7 @@ def train():
             noise_np = noise_np[n0:n0 + SEQ_LEN]
 
             loss = train_one_step(
-                model, criterion, vocal_np,
+                model, vocal_np,
                 mains_ir_np, monitor_ir_np, room_ir_np, noise_np,
                 device, window, room_ir_path=room_ir_path, epoch=epoch
             )

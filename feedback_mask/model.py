@@ -132,7 +132,7 @@ class FeedbackMaskNet(nn.Module):
         mask = mask.reshape(B, F, T, 1)                              # (B, F, T, 1)
 
         enhanced = spec * mask                                       # (B, F, T, 2)
-        return enhanced, h_new
+        return enhanced, mask.squeeze(-1), h_new                     # mask: (B, F, T)
 
 
 if __name__ == '__main__':
