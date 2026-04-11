@@ -322,14 +322,20 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
         ideal_mask_t = (torch.from_numpy(mask_np).to(device)
                         .view(1, N_FREQ, 1).expand(1, N_FREQ, T).contiguous())
 
-    # Upweight ring bins (target=0) so their gradient dominates non-ring bins.
-    # Without this: ~0.3% ring bins vs 99.7% non-ring → ring gradient swamped.
-    # Weight 50: ring bins contribute ~equal total gradient to non-ring bins.
-    RING_WEIGHT = 50.0
-    weight = torch.where(ideal_mask_t < 0.5,
-                         torch.full_like(ideal_mask_t, RING_WEIGHT),
-                         torch.ones_like(ideal_mask_t))
-    return F.binary_cross_entropy(pred_mask, ideal_mask_t, weight=weight)
+    # Class-balanced BCE: average ring bins and non-ring bins separately,
+    # then sum. This eliminates the constant-mask attractor that RING_WEIGHT
+    # creates (with 1% ring bins + weight=50, the gradient-zero point is a
+    # constant mask ≈ 0.5, and the GRU only learns ±0.03 deviations around it).
+    # With balanced loss, the constant optimum is p=0.5 — a saddle point the
+    # GRU naturally breaks out of toward ring→0, non-ring→1.
+    ring_mask_bool = ideal_mask_t < 0.5
+    if ring_mask_bool.any():
+        ring_loss    = F.binary_cross_entropy(pred_mask[ring_mask_bool],
+                                              ideal_mask_t[ring_mask_bool])
+        nonring_loss = F.binary_cross_entropy(pred_mask[~ring_mask_bool],
+                                              ideal_mask_t[~ring_mask_bool])
+        return ring_loss + nonring_loss
+    return F.binary_cross_entropy(pred_mask, ideal_mask_t)
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
