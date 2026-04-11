@@ -97,9 +97,9 @@ class FeedbackMaskNet(nn.Module):
         self.gru = nn.GRU(freq_ch, gru_hidden, num_layers=1, batch_first=True)
 
         self.fc = nn.Linear(gru_hidden, 1)
-        # Passthrough initialisation: sigmoid(3) ≈ 0.95
-        nn.init.zeros_(self.fc.weight)
-        nn.init.constant_(self.fc.bias, 3.0)
+        # Default PyTorch init (Kaiming uniform weight, uniform bias).
+        # Do NOT zero the weight — zero weight disconnects the GRU from the
+        # loss gradient (∂L/∂gru_h ∝ fc.weight ≈ 0 → GRU never trains).
 
     def forward(self, spec, h=None):
         """
