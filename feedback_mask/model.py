@@ -97,9 +97,11 @@ class FeedbackMaskNet(nn.Module):
         self.gru = nn.GRU(freq_ch, gru_hidden, num_layers=1, batch_first=True)
 
         self.fc = nn.Linear(gru_hidden, 1)
-        # Default PyTorch init (Kaiming uniform weight, uniform bias).
-        # Do NOT zero the weight — zero weight disconnects the GRU from the
-        # loss gradient (∂L/∂gru_h ∝ fc.weight ≈ 0 → GRU never trains).
+        # bias=3.0 → sigmoid(3)≈0.95 passthrough at init.
+        # Non-ring bins start near target=1 → tiny gradient → stay at passthrough.
+        # Ring bins start at 0.95 vs target=0 → large gradient → get pushed down.
+        # Do NOT zero the weight — that disconnects the GRU from the loss gradient.
+        nn.init.constant_(self.fc.bias, 3.0)
 
     def forward(self, spec, h=None):
         """
