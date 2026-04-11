@@ -41,16 +41,19 @@ from model import FeedbackMaskNet, SR, N_FFT, HOP, N_FREQ
 from mic_profiles import apply_random_mic_response, MIC_NAMES
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
-SEQ_SECS     = 4.0       # seconds per training clip
+SEQ_SECS     = 10.0      # seconds per training clip — long enough to distinguish
+                         # sustained feedback ring (~6s decay constant at gain=0.85)
+                         # from voiced vowels (200-500ms). 4s was too short.
 SEQ_LEN      = int(SEQ_SECS * SR)
 BATCH_SIZE   = 16        # gradient accumulation steps before optimizer.step()
 EPOCHS       = 300
-LR           = 1e-4      # reduced from 3e-4: mask supervision adds variance, needs stable LR
+LR           = 1e-4
 GRAD_CLIP    = 1.0
 MAX_IR_LEN         = int(1.5 * SR)
 FEEDBACK_TRUNC     = int(0.05 * SR)   # 50ms — captures resonant modes, keeps IIR order low
-N_STEPS            = 1600             # sequences per epoch — scaled up with BATCH_SIZE=16 to
-                                      # maintain ~100 optimizer steps/epoch (was 400/4=100)
+N_STEPS            = 800              # 800 steps × 16 batch = 50 optimizer steps/epoch
+                                      # Fewer steps than before but each clip is 10s so
+                                      # total audio/epoch is similar (~8000s)
 
 
 def make_hpf(cutoff_hz=90):
@@ -100,18 +103,21 @@ def _stability_check(h, max_gain=0.99):
     return h
 
 
-def _ideal_mask_for_ir(h):
+def _ideal_mask_for_ir(h, suppress_above=0.5):
     """
-    Oracle ideal suppression mask from feedback IR spectral response.
+    Hard oracle suppression mask from feedback IR spectral response.
 
-    fb_spec[k] = per-bin loop gain at STFT bin k.
-    At a ring frequency fb_spec ≈ 0.8-0.99.  ideal_mask = clip(1 - fb_spec, 0, 1).
-    Ring bins get mask≈0 (suppress), silent-loop bins get mask≈1 (pass through).
+    Bins where loop gain > suppress_above → mask=0 (suppress).
+    Bins where loop gain ≤ suppress_above → mask=1 (pass through).
+
+    Hard binary targets give BCE floor of 0 (vs ~0.18 floor for soft targets).
+    Sub-threshold clips (gain<0.5) produce all-ones oracle → near-zero gradient →
+    model stays at passthrough. Near-threshold clips drive the suppression gradient.
 
     Returns float32 array of shape (N_FREQ,).
     """
     fb_spec = np.abs(np.fft.rfft(h, n=N_FFT))[:N_FREQ].astype(np.float32)
-    return np.clip(1.0 - fb_spec, 0.0, 1.0)
+    return (fb_spec < suppress_above).astype(np.float32)
 
 
 # ── Per-step training function ─────────────────────────────────────────────────
