@@ -322,7 +322,14 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
         ideal_mask_t = (torch.from_numpy(mask_np).to(device)
                         .view(1, N_FREQ, 1).expand(1, N_FREQ, T).contiguous())
 
-    return F.binary_cross_entropy(pred_mask, ideal_mask_t)
+    # Upweight ring bins (target=0) so their gradient dominates non-ring bins.
+    # Without this: ~0.3% ring bins vs 99.7% non-ring → ring gradient swamped.
+    # Weight 50: ring bins contribute ~equal total gradient to non-ring bins.
+    RING_WEIGHT = 50.0
+    weight = torch.where(ideal_mask_t < 0.5,
+                         torch.full_like(ideal_mask_t, RING_WEIGHT),
+                         torch.ones_like(ideal_mask_t))
+    return F.binary_cross_entropy(pred_mask, ideal_mask_t, weight=weight)
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
