@@ -54,8 +54,12 @@ FEEDBACK_TRUNC     = int(0.05 * SR)   # 50ms — captures resonant modes, keeps 
 N_STEPS            = 800              # 800 steps × 16 batch = 50 optimizer steps/epoch
                                       # Fewer steps than before but each clip is 10s so
                                       # total audio/epoch is similar (~8000s)
-DETECT_THRESH      = 1.5              # mic/target magnitude ratio above which a bin is ringing
-                                      # (matches FeedbackDetector's proven threshold)
+DETECT_THRESH      = 10.0             # mic/target magnitude ratio above which a bin is ringing.
+                                      # Must be high (not 1.5) for a mask model: at near-threshold
+                                      # gain the IIR loop amplifies the whole spectrum ~2-4×, so
+                                      # 1.5 labels ~40% of bins as ring → broadband suppression.
+                                      # The resonator peaks are ~20× amplified, so 10 isolates
+                                      # only those bins (~1% of spectrum) → selective notching.
 RING_WEIGHT        = 80.0             # upweight ring bins in BCE — mirrors FeedbackDetector's
                                       # POS_WEIGHT=80 which was validated to work on this data
 
