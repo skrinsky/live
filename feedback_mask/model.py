@@ -97,11 +97,12 @@ class FeedbackMaskNet(nn.Module):
         self.gru = nn.GRU(freq_ch, gru_hidden, num_layers=1, batch_first=True)
 
         self.fc = nn.Linear(gru_hidden, 1)
-        # bias=3.0 → sigmoid(3)≈0.95 passthrough at init.
-        # Non-ring bins start near target=1 → tiny gradient → stay at passthrough.
-        # Ring bins start at 0.95 vs target=0 → large gradient → get pushed down.
-        # Do NOT zero the weight — that disconnects the GRU from the loss gradient.
-        nn.init.constant_(self.fc.bias, 3.0)
+        # bias=0.0 → sigmoid(0)=0.5 at init = class-balanced BCE equilibrium.
+        # At init, ring and nonring gradients are exactly equal (both BCE(0.5,{0,1})≈0.693).
+        # This lets the GRU learn to differentiate ring vs non-ring from a neutral starting
+        # point. bias=3.0 was wrong: ring gradient (60×) dominated nonring at init, training
+        # the GRU to suppress everything before passthrough could be established.
+        nn.init.constant_(self.fc.bias, 0.0)
 
     def forward(self, spec, h=None):
         """
