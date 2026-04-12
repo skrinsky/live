@@ -75,12 +75,12 @@ def sample_gain(epoch):
     feedback takes off. This is exactly what the model needs to learn to suppress.
 
     Two phases differ only in how much near-threshold exposure:
-      Phase 1 (epochs 1-149): mostly sub-threshold, model learns what rings look like
-      Phase 2 (epochs 150+):  heavier near-threshold, model learns to suppress them
+      Phase 1 (epochs 1-29):  mostly sub-threshold, model learns what rings look like
+      Phase 2 (epochs 30+):   heavier near-threshold, model learns to suppress them
     """
     def _one():
         t = random.random()
-        if epoch < 150:
+        if epoch < 30:
             if t < 0.10:   return 0.0                         # path off (10%)
             elif t < 0.30: return random.uniform(0.2, 0.6)    # clearly sub-threshold (20%)
             elif t < 0.70: return random.uniform(0.6, 0.85)   # moderate ring (40%)
@@ -103,21 +103,41 @@ def _stability_check(h, max_gain=0.99):
     return h
 
 
-def _ideal_mask_for_ir(h, suppress_above=0.5):
+def _ideal_mask_from_ring_freqs(ring_freqs, h, suppress_above=0.5):
     """
-    Hard oracle suppression mask from feedback IR spectral response.
+    Sparse oracle mask: suppress only the bins where we placed resonators,
+    and only when the loop gain at those bins actually exceeds suppress_above.
 
-    Bins where loop gain > suppress_above → mask=0 (suppress).
-    Bins where loop gain ≤ suppress_above → mask=1 (pass through).
+    Using the full-IR threshold (fb_stft > 0.5) labeled 20-40% of bins as ring
+    because reverberant rooms have many frequencies with high loop gain.  That
+    produced broadband attenuation instead of selective notching.
 
-    Hard binary targets give BCE floor of 0 (vs ~0.18 floor for soft targets).
-    Sub-threshold clips (gain<0.5) produce all-ones oracle → near-zero gradient →
-    model stays at passthrough. Near-threshold clips drive the suppression gradient.
+    By marking only the resonator-specific bins we keep the oracle sparse
+    (~1-3 bins per clip) so the model learns to notch, not attenuate.
 
-    Returns float32 array of shape (N_FREQ,).
+    Uses 8× oversampled FFT so off-bin resonators are correctly attributed to
+    their nearest STFT bin.
+
+    Returns float32 array of shape (N_FREQ,), ones except at ring bins.
     """
-    fb_spec = np.abs(np.fft.rfft(h, n=N_FFT))[:N_FREQ].astype(np.float32)
-    return (fb_spec < suppress_above).astype(np.float32)
+    mask = np.ones(N_FREQ, dtype=np.float32)
+    if not ring_freqs:
+        return mask
+
+    K = 8
+    fb_fine = np.abs(np.fft.rfft(h, n=K * N_FFT)).astype(np.float32)
+    fb_pad  = np.zeros(K * N_FREQ, dtype=np.float32)
+    fb_pad[:len(fb_fine)] = fb_fine
+
+    for freq in ring_freqs:
+        bin_k      = int(round(freq * N_FFT / SR))
+        bin_k      = min(max(bin_k, 0), N_FREQ - 1)
+        fine_start = bin_k * K
+        bin_gain   = fb_pad[fine_start : fine_start + K].max()
+        if bin_gain > suppress_above:
+            mask[bin_k] = 0.0
+
+    return mask
 
 
 # ── Per-step training function ─────────────────────────────────────────────────
@@ -171,12 +191,16 @@ def _add_resonators(h, sr, ir_path=None, n=None):
     If ir_path is from a known room (room_dimensions.json), resonators are
     placed at the actual axial modal frequencies of that room.
     Otherwise, frequencies are random in the 100–4000 Hz feedback range.
+
+    Returns (h_with_resonators, ring_freqs) so callers can build a precise
+    oracle that marks only the resonator bins, not all high-gain room bins.
     """
     n = n if n is not None else random.randint(0, 3)
     if n == 0:
-        return h
+        return h, []
     modal_freqs = _modal_freqs_for_ir(ir_path) if ir_path else None
     t = np.arange(len(h)) / sr
+    ring_freqs = []
     for _ in range(n):
         if modal_freqs:
             freq = random.choice(modal_freqs)
@@ -187,7 +211,8 @@ def _add_resonators(h, sr, ir_path=None, n=None):
         decay     = np.pi * freq / Q
         resonance = gain * np.exp(-decay * t) * np.sin(2 * np.pi * freq * t)
         h = h + resonance.astype(h.dtype)
-    return h
+        ring_freqs.append(freq)
+    return h, ring_freqs
 
 
 def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
@@ -252,10 +277,12 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
         gain_hi  = random.uniform(0.85, 0.99)  # never exceeds stability threshold
         split    = random.randint(int(0.2 * SEQ_LEN), int(0.5 * SEQ_LEN))
         # _stability_check: resonators can push spectral peak above gain level → overflow fix
-        h_lo = _stability_check(_add_resonators(mains_norm * gain_lo + mon_norm * gain_lo,
-                                                SR, ir_path=room_ir_path))
-        h_hi = _stability_check(_add_resonators(mains_norm * gain_hi + mon_norm * gain_hi,
-                                                SR, ir_path=room_ir_path))
+        h_lo_pre, ring_freqs_lo = _add_resonators(mains_norm * gain_lo + mon_norm * gain_lo,
+                                                   SR, ir_path=room_ir_path)
+        h_lo = _stability_check(h_lo_pre)
+        h_hi_pre, ring_freqs_hi = _add_resonators(mains_norm * gain_hi + mon_norm * gain_hi,
+                                                   SR, ir_path=room_ir_path)
+        h_hi = _stability_check(h_hi_pre)
         a_lo = np.concatenate([[1.0], -h_lo.astype(np.float64)])
         a_hi = np.concatenate([[1.0], -h_hi.astype(np.float64)])
         zi   = np.zeros(len(a_lo) - 1)
@@ -265,10 +292,12 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
         h_combined = None  # not used in ramp case
     else:
         mains_gain, monitor_gain = sample_gain(epoch)
-        h_combined = _stability_check(
-            _add_resonators(mains_norm * mains_gain + mon_norm * monitor_gain,
-                            SR, ir_path=room_ir_path))
+        h_combined_pre, ring_freqs_combined = _add_resonators(
+            mains_norm * mains_gain + mon_norm * monitor_gain,
+            SR, ir_path=room_ir_path)
+        h_combined = _stability_check(h_combined_pre)
         h_lo = h_hi = None  # not used in constant case
+        ring_freqs_lo = ring_freqs_hi = None  # not used in constant case
         split = 0
         if h_combined.max() == 0:
             mic_np = noisy_clean.copy()
@@ -311,14 +340,14 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     # Ring bins get mask≈0 (suppress), silent-loop bins get mask≈1 (pass through).
     if is_ramp:
         split_frame  = min(split // HOP, T)
-        mask_lo_np   = _ideal_mask_for_ir(h_lo)                          # (N_FREQ,)
-        mask_hi_np   = _ideal_mask_for_ir(h_hi)                          # (N_FREQ,)
+        mask_lo_np   = _ideal_mask_from_ring_freqs(ring_freqs_lo, h_lo)   # (N_FREQ,)
+        mask_hi_np   = _ideal_mask_from_ring_freqs(ring_freqs_hi, h_hi)   # (N_FREQ,)
         ideal_np     = np.empty((N_FREQ, T), dtype=np.float32)
         ideal_np[:, :split_frame] = mask_lo_np[:, None]
         ideal_np[:, split_frame:] = mask_hi_np[:, None]
         ideal_mask_t = torch.from_numpy(ideal_np).unsqueeze(0).to(device)  # (1, N_FREQ, T)
     else:
-        mask_np      = _ideal_mask_for_ir(h_combined)                    # (N_FREQ,)
+        mask_np      = _ideal_mask_from_ring_freqs(ring_freqs_combined, h_combined)  # (N_FREQ,)
         ideal_mask_t = (torch.from_numpy(mask_np).to(device)
                         .view(1, N_FREQ, 1).expand(1, N_FREQ, T).contiguous())
 
