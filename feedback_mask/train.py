@@ -313,19 +313,22 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     tgt_stft = torch.stft(tgt_t, N_FFT, HOP, N_FFT, window, return_complex=True)
     mic_spec = torch.stack([mic_stft.real, mic_stft.imag], dim=-1)
 
-    # Target magnitude for reconstruction loss
+    # Target and mic magnitudes
     tgt_mag = tgt_stft.abs()                                           # (1, N_FREQ, T)
+    mic_mag = mic_stft.abs()                                           # (1, N_FREQ, T)
 
     # Model forward — uses enhanced output, not just mask
     enh_spec, _, _ = model(mic_spec)
     enh_mag = (enh_spec[..., 0].pow(2) + enh_spec[..., 1].pow(2) + 1e-12).sqrt()
 
-    # L1 reconstruction: make enhanced magnitude match clean target.
-    # No artificial weighting needed — ring bins naturally generate large gradients
-    # (mic_mag >> tgt_mag → large L1 error → suppress) while non-ring bins resist
-    # over-suppression (mic_mag ≈ tgt_mag → large error if over-suppressed → pass through).
-    # The model can't converge to all-zeros (tgt_mag would dominate the loss).
-    return F.l1_loss(enh_mag, tgt_mag)
+    # Weighted L1: ring bins (tgt_mag << mic_mag) get 80× weight vs non-ring bins.
+    # Without weighting: 480 non-ring bins push mask→1 and overwhelm the 1 ring bin
+    # pushing mask→0 (480:1 gradient imbalance). RING_WEIGHT=80 matches FeedbackDetector's
+    # POS_WEIGHT=80, giving ring bins ~16:1 gradient advantage at mask≈0.94.
+    RING_WEIGHT = 80.0
+    per_bin_ratio = (tgt_mag / (mic_mag + 1e-8)).clamp(0, 1)          # ≈0 at ring, ≈1 at non-ring
+    bin_weight    = (1 - per_bin_ratio) * (RING_WEIGHT - 1) + 1       # 80 at ring, 1 at non-ring
+    return (bin_weight * F.l1_loss(enh_mag, tgt_mag, reduction='none')).mean()
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
