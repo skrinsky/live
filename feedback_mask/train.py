@@ -267,14 +267,29 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     hpf_mic = make_hpf(np.random.uniform(70, 120))
     mic_np  = sosfilt(hpf_mic, mic_np).astype(np.float32)
 
-    # RMS normalisation — must match live.py TARGET_RMS=0.1 so the model sees
-    # the same amplitude distribution at inference as it does during training.
-    # Scale target by the same factor to preserve the ideal mask ratio.
+    # RMS normalisation — mic is always scaled to TARGET_RMS so inference sees
+    # the same amplitude distribution as training (matches live.py TARGET_RMS=0.1).
+    # Target is normalised INDEPENDENTLY to its own RMS.
+    #
+    # Why independent normalisation for target:
+    #   At near-threshold feedback (gain=0.85-0.99), mic_rms >> tgt_rms because
+    #   the resonator dominates the mic signal. Scaling both by the same factor
+    #   (0.1 / mic_rms) makes tgt_mag ≈ 0 everywhere — not just at ring bins.
+    #   The L1 loss then pushes mask → 0 everywhere on these clips, and because
+    #   their loss magnitude is large (mic at 0.1 RMS, target ≈ 0), they
+    #   dominate the gradient and override the correct signal from low-gain clips.
+    #   Independent normalisation ensures tgt_mag reflects the spectral shape of
+    #   the clean vocal (ring bins quiet, speech bins energetic) at any feedback
+    #   gain level, giving the model a consistent selective-suppression target.
     TARGET_RMS = 0.1
     mic_rms    = float(np.sqrt(np.mean(mic_np ** 2))) + 1e-8
-    rms_scale  = TARGET_RMS / mic_rms
-    mic_np     = np.clip(mic_np * rms_scale, -1.0, 1.0).astype(np.float32)
-    target_np  = np.clip(target_np * rms_scale, -1.0, 1.0).astype(np.float32)
+    mic_np     = np.clip(mic_np * (TARGET_RMS / mic_rms), -1.0, 1.0).astype(np.float32)
+
+    tgt_rms    = float(np.sqrt(np.mean(target_np ** 2))) + 1e-8
+    if tgt_rms > 0.001:   # skip for pure-feedback/silence targets — stays near-zero
+        target_np = np.clip(target_np * (TARGET_RMS / tgt_rms), -1.0, 1.0).astype(np.float32)
+    else:
+        target_np = target_np.astype(np.float32)   # silence target → L1 pushes mask → 0 (correct)
 
     # Mic frequency response — same profile applied to both mic and target so the
     # model sees consistent coloration and only needs to suppress the feedback
