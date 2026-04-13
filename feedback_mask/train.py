@@ -54,14 +54,6 @@ FEEDBACK_TRUNC     = int(0.05 * SR)   # 50ms — captures resonant modes, keeps 
 N_STEPS            = 800              # 800 steps × 16 batch = 50 optimizer steps/epoch
                                       # Fewer steps than before but each clip is 10s so
                                       # total audio/epoch is similar (~8000s)
-DETECT_THRESH      = 10.0             # mic/target magnitude ratio above which a bin is ringing.
-                                      # Must be high (not 1.5) for a mask model: at near-threshold
-                                      # gain the IIR loop amplifies the whole spectrum ~2-4×, so
-                                      # 1.5 labels ~40% of bins as ring → broadband suppression.
-                                      # The resonator peaks are ~20× amplified, so 10 isolates
-                                      # only those bins (~1% of spectrum) → selective notching.
-RING_WEIGHT        = 80.0             # upweight ring bins in BCE — mirrors FeedbackDetector's
-                                      # POS_WEIGHT=80 which was validated to work on this data
 
 
 def make_hpf(cutoff_hz=90):
@@ -297,22 +289,19 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     tgt_stft = torch.stft(tgt_t, N_FFT, HOP, N_FFT, window, return_complex=True)
     mic_spec = torch.stack([mic_stft.real, mic_stft.imag], dim=-1)
 
-    # Ring labels: bin is ringing when mic_mag > DETECT_THRESH × tgt_mag.
-    # Same criterion as FeedbackDetector (proven to work on this data).
-    # pass_label = 1 - ring_label matches our mask semantics (mask=1 → pass, mask=0 → suppress).
-    mic_mag    = mic_stft.abs()                                        # (1, N_FREQ, T)
-    tgt_mag    = tgt_stft.abs()                                        # (1, N_FREQ, T)
-    ring_label = (mic_mag > DETECT_THRESH * tgt_mag).float()          # (1, N_FREQ, T)
-    pass_label = 1.0 - ring_label                                      # (1, N_FREQ, T)
+    # Target magnitude for reconstruction loss
+    tgt_mag = tgt_stft.abs()                                           # (1, N_FREQ, T)
 
-    # Model forward — returns (enhanced, mask, h_new); mask: (1, N_FREQ, T)
-    _, pred_mask, _ = model(mic_spec)
+    # Model forward — uses enhanced output, not just mask
+    enh_spec, _, _ = model(mic_spec)
+    enh_mag = (enh_spec[..., 0].pow(2) + enh_spec[..., 1].pow(2) + 1e-12).sqrt()
 
-    # Weighted BCE: ring bins (rare) get RING_WEIGHT× higher loss weight.
-    # Without upweighting, the model predicts passthrough everywhere (L1/BCE minimum
-    # at the median target which is 1.0 since ~99% of bins are non-ring).
-    w = ring_label * (RING_WEIGHT - 1.0) + 1.0                        # (1, N_FREQ, T)
-    return F.binary_cross_entropy(pred_mask, pass_label, weight=w)
+    # L1 reconstruction: make enhanced magnitude match clean target.
+    # No artificial weighting needed — ring bins naturally generate large gradients
+    # (mic_mag >> tgt_mag → large L1 error → suppress) while non-ring bins resist
+    # over-suppression (mic_mag ≈ tgt_mag → large error if over-suppressed → pass through).
+    # The model can't converge to all-zeros (tgt_mag would dominate the loss).
+    return F.l1_loss(enh_mag, tgt_mag)
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
