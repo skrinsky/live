@@ -206,6 +206,15 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     snr_db      = np.random.uniform(5, 40)
     noise_scale = vocal_rms / noise_rms * 10**(-snr_db / 20)
     noisy_clean = (target_np + noise_np * noise_scale).astype(np.float64)
+    # Target = vocal + noise (not clean vocal). The feedback suppressor's job is
+    # to remove ONLY the feedback ring; noise and reverb are "wanted" and should
+    # pass through. Without this, the model simultaneously learns denoising and
+    # feedback suppression. Those objectives conflict: denoising wants mask < 1
+    # at every bin (noise is present everywhere), while feedback suppression wants
+    # mask ≈ 1 at non-ring bins. The model compromises at a globally low mask
+    # (~0.17) that satisfies neither task. Adding noise to target makes the ideal
+    # mask = 1 at all non-ring bins and 0 only at the ring bin.
+    target_np = noisy_clean.astype(np.float32)
 
     # ── Pure-feedback case (10%): no vocal, mic is open between songs ──────────
     # Model must learn to output silence when only feedback is present.
