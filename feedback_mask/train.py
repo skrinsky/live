@@ -321,17 +321,22 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     enh_spec, _, _ = model(mic_spec)
     enh_mag = (enh_spec[..., 0].pow(2) + enh_spec[..., 1].pow(2) + 1e-12).sqrt()
 
-    # Weighted L1: ring bins (tgt_mag << mic_mag) get 80× weight vs non-ring bins.
-    # Without weighting: 480 non-ring bins push mask→1 and overwhelm the 1 ring bin
-    # pushing mask→0 (480:1 gradient imbalance). RING_WEIGHT=80 gives ring bins
-    # ~3:1 gradient advantage at high-gain clips (ring elevation ~20×).
+    # Weighted L1: ring bins (tgt_mag << mic_mag) get RING_WEIGHT× weight vs non-ring.
+    # Gradient balance analysis (at ring elevation ~3×, per_bin_ratio≈0.31):
+    #   ring gradient   = bin_weight_ring × mic_mag_ring × 1 bin
+    #                   = (0.69×RING_WEIGHT) × 15.9 × 1
+    #   non-ring total  = 1 × 4.9 × 480 bins = 2333
+    #   Break-even: RING_WEIGHT > 213.  Use 300 for ring to win ~1.3:1.
+    #
+    # RING_WEIGHT=80 was wrong: ring gradient (875) < non-ring (2333), so model
+    # learned "high log_mag → pass through" (opposite of suppression).
     #
     # Critical: scale the ring weighting by max(per_bin_ratio). For silence/noise-only
     # clips (target=zeros), per_bin_ratio=0 everywhere → max=0 → ring_weight_scale=0
     # → bin_weight=1 uniformly. Without this, silence clips get weight=80 everywhere
     # and overwhelm the voice passthrough gradient by 8.9:1, causing oscillation.
     # For voice clips, non-ring bins have per_bin_ratio≈1 → max≈1 → scale=1 (unchanged).
-    RING_WEIGHT = 80.0
+    RING_WEIGHT = 300.0
     per_bin_ratio     = (tgt_mag / (mic_mag + 1e-8)).clamp(0, 1)       # ≈0 at ring, ≈1 at non-ring
     ring_weight_scale = per_bin_ratio.max().clamp(0, 1)                 # 0 for silence, 1 for voice
     bin_weight        = (1 - per_bin_ratio) * (RING_WEIGHT - 1) * ring_weight_scale + 1
