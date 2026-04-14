@@ -55,7 +55,7 @@ def generate_test_clip(ring_freq_hz=800.0, gain=0.95, duration=10.0, seed=42):
     ir_t   = np.arange(ir_len) / SR
     Q      = 50.0
     decay  = np.pi * ring_freq_hz / Q
-    h      = np.exp(-decay * ir_t) * np.sin(2 * np.pi * ring_freq_hz * ir_t)
+    h      = np.exp(-decay * ir_t) * np.cos(2 * np.pi * ring_freq_hz * ir_t)
     peak   = np.abs(np.fft.rfft(h, n=max(len(h) * 4, 4096))).max()
     h      = h / (peak + 1e-8) * gain   # spectral peak = gain
 

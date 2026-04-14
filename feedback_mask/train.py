@@ -168,7 +168,7 @@ def _add_resonators(h, sr, ir_path=None, n=None):
         Q         = random.uniform(15, 80)
         gain      = random.uniform(0.05, 0.3)
         decay     = np.pi * freq / Q
-        resonance = gain * np.exp(-decay * t) * np.sin(2 * np.pi * freq * t)
+        resonance = gain * np.exp(-decay * t) * np.cos(2 * np.pi * freq * t)
         h = h + resonance.astype(h.dtype)
     return h
 
