@@ -19,7 +19,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
-from scipy.signal import lfilter, butter, sosfilt
+from scipy.signal import lfilter, butter, sosfilt, resample_poly
+from math import gcd
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / 'feedback_mask'))
@@ -31,24 +32,41 @@ def _make_hpf(cutoff_hz=90):
     return butter(2, cutoff_hz / (SR / 2), btype='high', output='sos')
 
 
-def generate_test_clip(ring_freq_hz=800.0, gain=0.95, duration=10.0, seed=42):
+def generate_test_clip(ring_freq_hz=800.0, gain=0.95, duration=10.0, seed=42,
+                       vocal_file=None):
     """
-    Synthetic clip: bandpass noise (approximate speech) run through an IIR
-    feedback loop with a narrow resonator at ring_freq_hz.
+    Clip with a known ring at ring_freq_hz run through an IIR feedback loop.
+
+    vocal_file : path to a real speech file (wav/flac).  If None, falls back
+                 to synthetic bandpass noise (useless for voice-preservation tests).
 
     Returns
     -------
     mic_np   : (N,) float32  — RMS-normalised mic signal (as in training)
     ring_bin : int           — STFT bin closest to ring_freq_hz
     """
-    rng = np.random.default_rng(seed)
     n = int(duration * SR)
 
-    # Bandpass noise ≈ speech (100–3000 Hz)
-    vocal = rng.standard_normal(n).astype(np.float64)
-    sos = butter(4, [100 / (SR / 2), 3000 / (SR / 2)], btype='bandpass', output='sos')
-    vocal = sosfilt(sos, vocal)
-    vocal = vocal / (np.abs(vocal).max() + 1e-8) * 0.3
+    if vocal_file is not None:
+        audio, file_sr = sf.read(str(vocal_file), always_2d=False)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)          # stereo → mono
+        if file_sr != SR:
+            g = gcd(file_sr, SR)
+            audio = resample_poly(audio, SR // g, file_sr // g).astype(np.float64)
+        # Loop or truncate to exactly n samples
+        if len(audio) < n:
+            reps = int(np.ceil(n / len(audio)))
+            audio = np.tile(audio, reps)
+        vocal = audio[:n].astype(np.float64)
+        vocal = vocal / (np.abs(vocal).max() + 1e-8) * 0.3
+    else:
+        rng = np.random.default_rng(seed)
+        # Bandpass noise ≈ speech (100–3000 Hz) — no real voice, only for ring detection test
+        vocal = rng.standard_normal(n).astype(np.float64)
+        sos = butter(4, [100 / (SR / 2), 3000 / (SR / 2)], btype='bandpass', output='sos')
+        vocal = sosfilt(sos, vocal)
+        vocal = vocal / (np.abs(vocal).max() + 1e-8) * 0.3
 
     # Narrow resonator IR at ring_freq_hz (Q=50 → ~16 Hz bandwidth at 800 Hz)
     ir_len = int(0.05 * SR)
@@ -74,7 +92,7 @@ def generate_test_clip(ring_freq_hz=800.0, gain=0.95, duration=10.0, seed=42):
     return mic_np, ring_bin
 
 
-def run_eval(ring_freq_hz=800.0, gain=0.95, ckpt_path=None):
+def run_eval(ring_freq_hz=800.0, gain=0.95, ckpt_path=None, vocal_file=None):
     ckpt_path = ckpt_path or str(
         PROJECT_ROOT / 'checkpoints' / 'gtcrn_feedback' / 'best.pt')
 
@@ -89,7 +107,7 @@ def run_eval(ring_freq_hz=800.0, gain=0.95, ckpt_path=None):
     print(f'Checkpoint: epoch {state.get("epoch","?")}, '
           f'best_loss={state.get("best_loss", float("nan")):.4f}')
 
-    mic_np, ring_bin = generate_test_clip(ring_freq_hz, gain)
+    mic_np, ring_bin = generate_test_clip(ring_freq_hz, gain, vocal_file=vocal_file)
     print(f'Ring: {ring_freq_hz:.0f} Hz → bin {ring_bin} '
           f'({ring_bin * SR / N_FFT:.1f} Hz), gain={gain}')
 
@@ -183,5 +201,8 @@ if __name__ == '__main__':
     ap.add_argument('--ring-freq',   type=float, default=800.0)
     ap.add_argument('--gain',        type=float, default=0.95)
     ap.add_argument('--checkpoint',  type=str,   default=None)
+    ap.add_argument('--vocal-file',  type=str,   default=None,
+                    help='Real speech file to use instead of synthetic noise. '
+                         'Pass any wav/flac from your training data.')
     args = ap.parse_args()
-    run_eval(args.ring_freq, args.gain, args.checkpoint)
+    run_eval(args.ring_freq, args.gain, args.checkpoint, args.vocal_file)
