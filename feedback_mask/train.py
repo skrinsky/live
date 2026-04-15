@@ -317,33 +317,41 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     tgt_mag = tgt_stft.abs()                                           # (1, N_FREQ, T)
     mic_mag = mic_stft.abs()                                           # (1, N_FREQ, T)
 
-    # Model forward — uses enhanced output, not just mask
-    enh_spec, _, _ = model(mic_spec)
-    enh_mag = (enh_spec[..., 0].pow(2) + enh_spec[..., 1].pow(2) + 1e-12).sqrt()
+    # Model forward — get mask for BCE loss
+    _, pred_mask, _ = model(mic_spec)   # pred_mask: (1, N_FREQ, T)  in (0,1)
 
-    # Weighted L1: ring bins (tgt_mag << mic_mag) get RING_WEIGHT× weight vs non-ring.
-    # Gradient balance analysis (at ring elevation ~3×, per_bin_ratio≈0.31):
-    #   ring gradient   = bin_weight_ring × mic_mag_ring × 1 bin
-    #                   = (0.69×RING_WEIGHT) × 15.9 × 1
-    #   non-ring total  = 1 × 4.9 × 480 bins = 2333
-    #   Break-even: RING_WEIGHT ≈ 213.
+    # BCE on mask with ratio oracle — same approach as FeedbackDetector.
     #
-    # RING_WEIGHT=300 caused ring to win 1.4:1 → shared weights biased toward
-    # global suppression → background mask stuck at 0.55 (should be ~0.9).
-    # RING_WEIGHT=150: non-ring wins 1.4:1, background masks climb toward 1.0.
-    # Ring stays suppressed (at mask=0.25 < per_bin_ratio=0.31, ring gradient
-    # still pushes toward 0.31, not toward 1.0 — ring does not un-learn).
+    # Weighted L1 failed: the .mean() over 481 bins meant RING_WEIGHT had to
+    # exceed ~213 for ring bins to suppress, but at RING_WEIGHT>213 the shared
+    # FC bias was pushed DOWN globally → all masks suppressed → muted audio.
     #
-    # Critical: scale the ring weighting by max(per_bin_ratio). For silence/noise-only
-    # clips (target=zeros), per_bin_ratio=0 everywhere → max=0 → ring_weight_scale=0
-    # → bin_weight=1 uniformly. Without this, silence clips get weight=80 everywhere
-    # and overwhelm the voice passthrough gradient by 8.9:1, causing oscillation.
-    # For voice clips, non-ring bins have per_bin_ratio≈1 → max≈1 → scale=1 (unchanged).
-    RING_WEIGHT = 150.0
-    per_bin_ratio     = (tgt_mag / (mic_mag + 1e-8)).clamp(0, 1)       # ≈0 at ring, ≈1 at non-ring
+    # BCE fixes this: ring gradient = RING_WEIGHT × mask_ring (self-limiting as
+    # mask→0). Non-ring gradient = (1-mask_nonring) (large when stuck below 1).
+    # At current state (ring=0.086, bg=0.294): non-ring wins 50:1 on shared bias
+    # → background climbs toward 1.0. Ring stays down via per-bin GRU (per-bin
+    # gradient still 80× stronger for ring features than non-ring).
+    #
+    # Labels: same DETECT_THRESH=1.5 as FeedbackDetector.
+    #   ring_label=1  where mic_mag > 1.5×tgt_mag (Larsen bin right now)
+    #   mask_target=0 at ring bins (suppress), 1 at non-ring (pass through)
+    #
+    # Silence clips (target≈0): per_bin_ratio→0 everywhere → ring_weight_scale=0
+    # → all bins get weight=1, mask_target=0 → suppress silence output. ✓
+    RING_WEIGHT    = 80.0
+    DETECT_THRESH  = 1.5
+
+    ring_label        = (mic_mag / (tgt_mag + 1e-8) > DETECT_THRESH).float()
+    mask_target       = 1.0 - ring_label                                # 1=pass, 0=suppress
+
+    per_bin_ratio     = (tgt_mag / (mic_mag + 1e-8)).clamp(0, 1)
     ring_weight_scale = per_bin_ratio.max().clamp(0, 1)                 # 0 for silence, 1 for voice
-    bin_weight        = (1 - per_bin_ratio) * (RING_WEIGHT - 1) * ring_weight_scale + 1
-    return (bin_weight * F.l1_loss(enh_mag, tgt_mag, reduction='none')).mean()
+    sample_weight     = (ring_label * (RING_WEIGHT - 1) + 1) * ring_weight_scale \
+                        + (1 - ring_weight_scale)
+
+    mask_logit = torch.logit(pred_mask.clamp(1e-6, 1 - 1e-6))
+    return (sample_weight * F.binary_cross_entropy_with_logits(
+        mask_logit, mask_target, reduction='none')).mean()
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
