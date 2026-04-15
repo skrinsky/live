@@ -360,6 +360,8 @@ def train():
     ap = argparse.ArgumentParser()
     ap.add_argument('--resume', type=str, default=None,
                     help='Path to checkpoint to warm-start from.')
+    ap.add_argument('--reset-best', action='store_true',
+                    help='Reset best_loss to inf on resume (use when switching loss functions).')
     ap.add_argument('--lr', type=float, default=None)
     args, _ = ap.parse_known_args()
 
@@ -408,7 +410,7 @@ def train():
         ckpt = torch.load(args.resume, map_location=device)
         state = ckpt if isinstance(ckpt, dict) and 'model' in ckpt else {'model': ckpt}
         model.load_state_dict(state['model'])
-        best_loss   = state.get('best_loss', float('inf'))
+        best_loss   = float('inf') if args.reset_best else state.get('best_loss', float('inf'))
         start_epoch = state.get('epoch', 0) + 1
         print(f'Resumed from {args.resume} (epoch {start_epoch}, best_loss={best_loss:.4f})')
 
