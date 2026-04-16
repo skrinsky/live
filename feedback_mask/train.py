@@ -154,23 +154,27 @@ def _add_resonators(h, sr, ir_path=None, n=None):
     If ir_path is from a known room (room_dimensions.json), resonators are
     placed at the actual axial modal frequencies of that room.
     Otherwise, frequencies are random in the 100–4000 Hz feedback range.
+
+    Returns (h_modified, ring_freqs) so callers can build ground-truth ring labels.
     """
     n = n if n is not None else random.randint(0, 3)
     if n == 0:
-        return h
+        return h, []
     modal_freqs = _modal_freqs_for_ir(ir_path) if ir_path else None
     t = np.arange(len(h)) / sr
+    ring_freqs = []
     for _ in range(n):
         if modal_freqs:
             freq = random.choice(modal_freqs)
         else:
             freq = random.uniform(100, 4000)
+        ring_freqs.append(freq)
         Q         = random.uniform(15, 80)
         gain      = random.uniform(0.05, 0.3)
         decay     = np.pi * freq / Q
         resonance = gain * np.exp(-decay * t) * np.cos(2 * np.pi * freq * t)
         h = h + resonance.astype(h.dtype)
-    return h
+    return h, ring_freqs
 
 
 def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
@@ -245,10 +249,13 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
         gain_hi  = random.uniform(0.85, 0.99)  # never exceeds stability threshold
         split    = random.randint(int(0.2 * SEQ_LEN), int(0.5 * SEQ_LEN))
         # _stability_check: resonators can push spectral peak above gain level → overflow fix
-        h_lo = _stability_check(_add_resonators(mains_norm * gain_lo + mon_norm * gain_lo,
-                                                SR, ir_path=room_ir_path))
-        h_hi = _stability_check(_add_resonators(mains_norm * gain_hi + mon_norm * gain_hi,
-                                                SR, ir_path=room_ir_path))
+        h_lo_raw, ring_freqs_lo = _add_resonators(mains_norm * gain_lo + mon_norm * gain_lo,
+                                                  SR, ir_path=room_ir_path)
+        h_hi_raw, ring_freqs_hi = _add_resonators(mains_norm * gain_hi + mon_norm * gain_hi,
+                                                  SR, ir_path=room_ir_path)
+        h_lo = _stability_check(h_lo_raw)
+        h_hi = _stability_check(h_hi_raw)
+        ring_freqs = ring_freqs_lo + ring_freqs_hi
         a_lo = np.concatenate([[1.0], -h_lo.astype(np.float64)])
         a_hi = np.concatenate([[1.0], -h_hi.astype(np.float64)])
         zi   = np.zeros(len(a_lo) - 1)
@@ -258,9 +265,10 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
         h_combined = None  # not used in ramp case
     else:
         mains_gain, monitor_gain = sample_gain(epoch)
-        h_combined = _stability_check(_add_resonators(
+        h_combined_raw, ring_freqs = _add_resonators(
             mains_norm * mains_gain + mon_norm * monitor_gain,
-            SR, ir_path=room_ir_path))
+            SR, ir_path=room_ir_path)
+        h_combined = _stability_check(h_combined_raw)
         h_lo = h_hi = None  # not used in constant case
         split = 0
         if h_combined.max() == 0:
@@ -320,34 +328,30 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     # Model forward — get mask for BCE loss
     _, pred_mask, _ = model(mic_spec)   # pred_mask: (1, N_FREQ, T)  in (0,1)
 
-    # BCE on mask with ratio oracle — same approach as FeedbackDetector.
+    # Ground-truth ring bin labels — we know exactly which STFT bins have resonators
+    # because we placed them during the feedback simulation. ring_freqs is collected
+    # from _add_resonators calls above.
     #
-    # Weighted L1 failed: the .mean() over 481 bins meant RING_WEIGHT had to
-    # exceed ~213 for ring bins to suppress, but at RING_WEIGHT>213 the shared
-    # FC bias was pushed DOWN globally → all masks suppressed → muted audio.
+    # Why NOT the ratio oracle (mic_mag/tgt_mag > 1.5):
+    #   The feedback IR is a broadband room IR. At gain=0.95, ALL frequencies get
+    #   amplified: bins with |H(ω)|≈0.3 get 1/(1-0.285)≈1.4× amplified. With
+    #   independent normalization, ~100 non-ring bins exceed the 1.5 threshold.
+    #   Those bins get ring_label=1, weight=80. Equilibrium mask =
+    #   480/(100×80) ≈ 0.06 → global suppression. That's the bug.
     #
-    # BCE fixes this: ring gradient = RING_WEIGHT × mask_ring (self-limiting as
-    # mask→0). Non-ring gradient = (1-mask_nonring) (large when stuck below 1).
-    # At current state (ring=0.086, bg=0.294): non-ring wins 50:1 on shared bias
-    # → background climbs toward 1.0. Ring stays down via per-bin GRU (per-bin
-    # gradient still 80× stronger for ring features than non-ring).
-    #
-    # Labels: same DETECT_THRESH=1.5 as FeedbackDetector.
-    #   ring_label=1  where mic_mag > 1.5×tgt_mag (Larsen bin right now)
-    #   mask_target=0 at ring bins (suppress), 1 at non-ring (pass through)
-    #
-    # Silence clips (target≈0): per_bin_ratio→0 everywhere → ring_weight_scale=0
-    # → all bins get weight=1, mask_target=0 → suppress silence output. ✓
-    RING_WEIGHT    = 80.0
-    DETECT_THRESH  = 1.5
+    #   Ground-truth: exactly 1-3 ring bins per clip. Equilibrium:
+    #   480/(3×80+480) = 480/720 ≈ 0.67, but non-ring wins the bias battle
+    #   (480×1 upward vs 3×80×mask downward at mask≈0.5 → net strongly upward).
+    #   Background climbs toward 1.0. Ring bins suppressed per-bin by 80× gradient.
+    RING_WEIGHT = 80.0
 
-    ring_label        = (mic_mag / (tgt_mag + 1e-8) > DETECT_THRESH).float()
-    mask_target       = 1.0 - ring_label                                # 1=pass, 0=suppress
+    ring_label = torch.zeros_like(mic_mag)          # (1, N_FREQ, T)
+    for freq in ring_freqs:
+        rb = max(0, min(N_FREQ - 1, int(round(freq * N_FFT / SR))))
+        ring_label[:, rb, :] = 1.0
 
-    per_bin_ratio     = (tgt_mag / (mic_mag + 1e-8)).clamp(0, 1)
-    ring_weight_scale = per_bin_ratio.max().clamp(0, 1)                 # 0 for silence, 1 for voice
-    sample_weight     = (ring_label * (RING_WEIGHT - 1) + 1) * ring_weight_scale \
-                        + (1 - ring_weight_scale)
+    mask_target   = 1.0 - ring_label                # 1=pass, 0=suppress
+    sample_weight = ring_label * (RING_WEIGHT - 1) + 1  # 80 at ring bins, 1 elsewhere
 
     mask_logit = torch.logit(pred_mask.clamp(1e-6, 1 - 1e-6))
     return (sample_weight * F.binary_cross_entropy_with_logits(
