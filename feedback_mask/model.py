@@ -34,16 +34,21 @@ N_FREQ = N_FFT // 2 + 1   # 481 bins, 50 Hz resolution
 
 FREQ_CH    = 16
 GRU_HIDDEN = 32
-N_DELTA    = 4   # log_mag, Δ1, Δ4, Δ10
+N_DELTA    = 6   # log_mag, Δ1, Δ4, Δ10, Δ50, Δ200
 
 
 def _prepare_features(spec):
     """
     spec: (B, F, T, 2) complex STFT → (B, N_DELTA, F, T) feature tensor.
 
-    Features: [log_mag, Δ1 (~10ms), Δ4 (~40ms), Δ10 (~100ms)]
-    Same representation as FeedbackDetector.prepare_features().
-    Uses causal torch.roll (correct for T > 10; streaming uses external buffer).
+    Features: [log_mag, Δ1 (~10ms), Δ4 (~40ms), Δ10 (~100ms), Δ50 (~500ms), Δ200 (~2s)]
+
+    Why Δ50 and Δ200:
+      Ring builds up over seconds; speech formants are transient (50-500ms).
+      At steady-state ring, Δ10 diff (ring vs bg) ≈ 0.011 — barely usable.
+      Δ200 diff ≈ 0.134 during buildup — 12× more discriminative.
+      Without long deltas the GRU uses only log_mag magnitude as a suppression
+      proxy, which partially suppresses high-energy speech formants too.
     """
     mag = (spec[..., 0] ** 2 + spec[..., 1] ** 2 + 1e-12).sqrt()  # (B, F, T)
     lm  = torch.log(mag)
@@ -56,7 +61,9 @@ def _prepare_features(spec):
     return torch.stack([lm,
                         causal_delta(1),
                         causal_delta(4),
-                        causal_delta(10)], dim=1)   # (B, N_DELTA, F, T)
+                        causal_delta(10),
+                        causal_delta(50),
+                        causal_delta(200)], dim=1)   # (B, N_DELTA, F, T)
 
 
 class FeedbackMaskNet(nn.Module):
