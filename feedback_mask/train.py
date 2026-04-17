@@ -82,12 +82,12 @@ def sample_gain(epoch):
         t = random.random()
         if epoch < 30:
             if t < 0.10:   return 0.0                         # path off (10%)
-            elif t < 0.30: return random.uniform(0.2, 0.6)    # clearly sub-threshold (20%)
+            elif t < 0.30: return random.uniform(0.5, 0.6)    # clearly sub-threshold (20%)
             elif t < 0.70: return random.uniform(0.6, 0.85)   # moderate ring (40%)
             else:          return random.uniform(0.85, 0.99)  # near-threshold (30%)
         else:
             if t < 0.10:   return 0.0                         # path off (10%)
-            elif t < 0.20: return random.uniform(0.2, 0.6)    # clearly sub-threshold (10%)
+            elif t < 0.20: return random.uniform(0.5, 0.6)    # clearly sub-threshold (10%)
             elif t < 0.50: return random.uniform(0.6, 0.85)   # moderate ring (30%)
             else:          return random.uniform(0.85, 0.99)  # near-threshold (50%)
     return _one(), _one()
@@ -343,7 +343,7 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     #   480/(3×80+480) = 480/720 ≈ 0.67, but non-ring wins the bias battle
     #   (480×1 upward vs 3×80×mask downward at mask≈0.5 → net strongly upward).
     #   Background climbs toward 1.0. Ring bins suppressed per-bin by 80× gradient.
-    RING_WEIGHT = 80.0
+    RING_WEIGHT = 27.0   # ±1 bin labeling → up to 9 ring bins; 9×27≈243 ≈ old 3×80=240
 
     # Time-varying ring labels for ramp clips: ring_lo bins active only in the
     # first half, ring_hi bins active only in the second half.
@@ -356,14 +356,17 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
         split_frame = min(int(split / HOP), T_frames)
         for freq in ring_freqs_lo:
             rb = max(0, min(N_FREQ - 1, int(round(freq * N_FFT / SR))))
-            ring_label[:, rb, :split_frame] = 1.0
+            for rbo in [-1, 0, 1]:
+                ring_label[:, max(0, min(N_FREQ - 1, rb + rbo)), :split_frame] = 1.0
         for freq in ring_freqs_hi:
             rb = max(0, min(N_FREQ - 1, int(round(freq * N_FFT / SR))))
-            ring_label[:, rb, split_frame:] = 1.0
+            for rbo in [-1, 0, 1]:
+                ring_label[:, max(0, min(N_FREQ - 1, rb + rbo)), split_frame:] = 1.0
     else:
         for freq in ring_freqs:
             rb = max(0, min(N_FREQ - 1, int(round(freq * N_FFT / SR))))
-            ring_label[:, rb, :] = 1.0
+            for rbo in [-1, 0, 1]:
+                ring_label[:, max(0, min(N_FREQ - 1, rb + rbo)), :] = 1.0
 
     mask_target   = 1.0 - ring_label                # 1=pass, 0=suppress
     sample_weight = ring_label * (RING_WEIGHT - 1) + 1  # 80 at ring bins, 1 elsewhere
