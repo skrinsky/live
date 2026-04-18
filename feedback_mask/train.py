@@ -325,21 +325,34 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     tgt_mag = tgt_stft.abs()                                           # (1, N_FREQ, T)
     mic_mag = mic_stft.abs()                                           # (1, N_FREQ, T)
 
-    # Log-magnitude L1: drives mask toward ideal ratio mask (tgt_mag / mic_mag).
-    #
-    # Why log and not linear:
-    #   Linear L1 — non-ring gradient wins aggregate 23:1 → model learns
-    #   "pass everything", ring barely suppressed (stuck at mask=0.918).
-    #
-    #   Log L1 — at ring bin: |log(mask×mic_ring) - log(tgt_ring)| = |log(mask) + log(20)|
-    #   At convergence, ring bin loss = 0 when mask = tgt_ring/mic_ring = 1/20 = 0.05.
-    #   Gradient balance ~2.5:1 non-ring wins (healthy), vs 23:1 for linear.
-    #   This is the Wiener filter optimality criterion — model learns the exact
-    #   ratio mask without labels or RING_WEIGHT.
-    eps = 1e-8
-    enh_spec, _, _ = model(mic_spec)
-    enhanced_mag = (enh_spec[..., 0] ** 2 + enh_spec[..., 1] ** 2 + eps).sqrt()
-    return F.l1_loss(torch.log(enhanced_mag), torch.log(tgt_mag + eps))
+    # BCE with ground-truth ring bin labels.
+    # Only the exact resonator STFT bins are labeled ring=1 (mask target=0).
+    # All other bins are labeled non-ring (mask target=1).
+    # RING_WEIGHT=80 amplifies ring gradient to overcome 480:1 class imbalance.
+    _, pred_mask, _ = model(mic_spec)
+
+    RING_WEIGHT = 80.0
+    T_frames    = mic_mag.shape[2]
+    ring_label  = torch.zeros_like(mic_mag)
+    if is_ramp:
+        split_frame = min(int(split / HOP), T_frames)
+        for freq in ring_freqs_lo:
+            rb = max(0, min(N_FREQ - 1, int(round(freq * N_FFT / SR))))
+            ring_label[:, rb, :split_frame] = 1.0
+        for freq in ring_freqs_hi:
+            rb = max(0, min(N_FREQ - 1, int(round(freq * N_FFT / SR))))
+            ring_label[:, rb, split_frame:] = 1.0
+    else:
+        for freq in ring_freqs:
+            rb = max(0, min(N_FREQ - 1, int(round(freq * N_FFT / SR))))
+            ring_label[:, rb, :] = 1.0
+
+    mask_target   = 1.0 - ring_label
+    sample_weight = ring_label * (RING_WEIGHT - 1) + 1
+
+    mask_logit = torch.logit(pred_mask.clamp(1e-6, 1 - 1e-6))
+    return (sample_weight * F.binary_cross_entropy_with_logits(
+        mask_logit, mask_target, reduction='none')).mean()
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
