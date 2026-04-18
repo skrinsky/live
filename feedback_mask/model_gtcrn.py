@@ -263,14 +263,14 @@ class DPGRNN(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self):
+    def __init__(self, C=32):
         super().__init__()
         self.en_convs = nn.ModuleList([
-            ConvBlock(3*3, 16, (1,5), stride=(1,2), padding=(0,2)),
-            ConvBlock(16,  16, (1,5), stride=(1,2), padding=(0,2), groups=2),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1)),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1)),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1)),
+            ConvBlock(3*3, C, (1,5), stride=(1,2), padding=(0,2)),
+            ConvBlock(C,   C, (1,5), stride=(1,2), padding=(0,2), groups=2),
+            GTConvBlock(C, C, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1)),
+            GTConvBlock(C, C, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1)),
+            GTConvBlock(C, C, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1)),
         ])
 
     def forward(self, x):
@@ -282,14 +282,14 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self):
+    def __init__(self, C=32):
         super().__init__()
         self.de_convs = nn.ModuleList([
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*5,1), dilation=(5,1), use_deconv=True),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*1,1), dilation=(1,1), use_deconv=True),
-            ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True),
-            ConvBlock(16,  2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True),
+            GTConvBlock(C, C, (3,3), stride=(1,1), padding=(2*5,1), dilation=(5,1), use_deconv=True),
+            GTConvBlock(C, C, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
+            GTConvBlock(C, C, (3,3), stride=(1,1), padding=(2*1,1), dilation=(1,1), use_deconv=True),
+            ConvBlock(C, C, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True),
+            ConvBlock(C,  2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True),
         ])
 
     def forward(self, x, en_outs):
@@ -319,19 +319,18 @@ class GTCRN48k(nn.Module):
     Input:  mic STFT  (B, N_FREQ, T, 2)   — real/imag stacked on last dim
     Output: enhanced STFT (B, N_FREQ, T, 2)
 
-    ERB bank maps 481 bins → 129 (same width as original GTCRN at 16 kHz / 257 bins),
-    so the encoder/DPGRNN/decoder are byte-for-byte identical to the original.
+    C=32 (default): ~90K params — 4× the original 24K, enough capacity for
+    feedback + noise separation on simulated data.
+    C=16: original 24K param version (too small for source separation).
     """
-    def __init__(self):
+    def __init__(self, C=32):
         super().__init__()
-        # 48 kHz ERB: linear 0–3250 Hz, ERB-compress 3250–16000 Hz into 64 bins.
-        # Total width = 65+64 = 129 — identical to the original GTCRN.
         self.erb     = ERB(_ERB_LIN, _ERB_COMP, nfft=N_FFT, high_lim=_ERB_HIGH, fs=SR)
         self.sfe     = SFE(3, 1)
-        self.encoder = Encoder()
-        self.dpgrnn1 = DPGRNN(16, 33, 16)
-        self.dpgrnn2 = DPGRNN(16, 33, 16)
-        self.decoder = Decoder()
+        self.encoder = Encoder(C)
+        self.dpgrnn1 = DPGRNN(C, 33, C)
+        self.dpgrnn2 = DPGRNN(C, 33, C)
+        self.decoder = Decoder(C)
         self.crm     = CRM()
 
     def forward(self, spec):

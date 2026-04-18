@@ -139,28 +139,26 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     Loss: SI-SDR (scale-invariant signal-to-distortion ratio), time domain.
 
     Why SI-SDR instead of HybridLoss (MSE + SI-SNR):
-      HybridLoss MSE terms are NOT scale-invariant. Since dry vocal target is
-      always quieter than reverberant+feedback mic, the MSE shortcut is to
-      suppress everything → output approaches target amplitude → loss decreases
-      without learning any actual separation. This produced SI-SNR degradation
-      of -20 dB at epoch 25 (making things worse than passthrough).
+      HybridLoss MSE terms are NOT scale-invariant — they rewarded global
+      suppression (SI-SNR degraded -20 dB at epoch 25). SI-SDR is fully
+      scale-invariant: the only way to improve it is to preserve vocal structure.
 
-      SI-SDR is fully scale-invariant: "output near silence" scores the same as
-      "output at wrong amplitude" — both score -∞. The ONLY way to improve
-      SI-SDR is to preserve the structural content of the clean vocal.
-      This is how De-Feedback-style source separation should be trained.
+    Why reverberant vocal target (not dry vocal):
+      Dry vocal requires simultaneous dereverberation + denoising + defeedback.
+      That's too hard for ~90K params on simulated data — stalled at loss ~39 dB.
+      Reverberant vocal (vocal + room, no feedback, no noise) cuts to two tasks:
+      remove feedback + remove noise. Room reverb stays in the output.
+      This still achieves the product goal and matches the tractable task size.
     """
     TARGET_RMS = 0.1
 
-    # ── Target: dry vocal (before room/feedback/noise) ─────────────────────
-    target_np = vocal_np[:SEQ_LEN].copy()
-    hpf_tgt   = make_hpf(np.random.uniform(70, 120))
-    target_np = sosfilt(hpf_tgt, target_np).astype(np.float32)
-
-    # ── Mic: vocal → room → +noise → feedback IIR ──────────────────────────
+    # ── Mic path: vocal → room reverb ────────────────────────────────────────
     reverb_np = fftconvolve(vocal_np, room_ir_np)[:SEQ_LEN].astype(np.float32)
     hpf_rev   = make_hpf(np.random.uniform(70, 120))
     reverb_np = sosfilt(hpf_rev, reverb_np).astype(np.float32)
+
+    # ── Target: reverberant vocal (room kept, feedback + noise removed) ──────
+    target_np = reverb_np.copy()
 
     noise_np = noise_np[:SEQ_LEN]
     if random.random() < 0.5:
