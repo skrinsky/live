@@ -31,7 +31,7 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / 'feedback_mask'))
 
-from model_gtcrn import GTCRN48k, HybridLoss48k, SR, N_FFT, HOP, N_FREQ
+from model_gtcrn import GTCRN48k, SR, N_FFT, HOP, N_FREQ
 from mic_profiles import apply_random_mic_response, MIC_NAMES
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
@@ -130,24 +130,25 @@ def _add_resonators(h, sr, ir_path=None, n=None):
     return h, ring_freqs
 
 
-def train_one_step(model, loss_fn, vocal_np, mains_ir_np, monitor_ir_np,
+def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
                    room_ir_np, noise_np, device, window, room_ir_path=None, epoch=1):
     """
-    Source-separation training step.
+    Source-separation training step with pure SI-SDR loss.
 
     Target: dry vocal (no room, no feedback, no noise).
-    The model must learn to recover clean voice from the degraded mic signal.
+    Loss: SI-SDR (scale-invariant signal-to-distortion ratio), time domain.
 
-    This mirrors De-Feedback's approach: classify each spectral component as
-    "voice" vs "not-voice" (via Complex Ratio Mask) and pass only voice through.
+    Why SI-SDR instead of HybridLoss (MSE + SI-SNR):
+      HybridLoss MSE terms are NOT scale-invariant. Since dry vocal target is
+      always quieter than reverberant+feedback mic, the MSE shortcut is to
+      suppress everything → output approaches target amplitude → loss decreases
+      without learning any actual separation. This produced SI-SNR degradation
+      of -20 dB at epoch 25 (making things worse than passthrough).
 
-    Why dry vocal as target (not vocal+room or vocal+noise):
-      - Forces the model to learn what a clean voice sounds like, not just
-        "voice-plus-everything-else-except-feedback"
-      - Feedback, room reverb, and noise are all "not-voice" — the model removes
-        them all in one pass, matching De-Feedback's reported behaviour
-      - HybridLoss is scale-invariant (SI-SNR component) so the amplitude
-        difference between reverberant mic and dry target is handled automatically
+      SI-SDR is fully scale-invariant: "output near silence" scores the same as
+      "output at wrong amplitude" — both score -∞. The ONLY way to improve
+      SI-SDR is to preserve the structural content of the clean vocal.
+      This is how De-Feedback-style source separation should be trained.
     """
     TARGET_RMS = 0.1
 
@@ -237,12 +238,27 @@ def train_one_step(model, loss_fn, vocal_np, mains_ir_np, monitor_ir_np,
     mic_t    = torch.from_numpy(mic_np).unsqueeze(0).to(device)
     tgt_t    = torch.from_numpy(target_np).unsqueeze(0).to(device)
     mic_stft = torch.stft(mic_t, N_FFT, HOP, N_FFT, window, return_complex=True)
-    tgt_stft = torch.stft(tgt_t, N_FFT, HOP, N_FFT, window, return_complex=True)
     mic_spec = torch.stack([mic_stft.real, mic_stft.imag], dim=-1)   # (1, F, T, 2)
-    tgt_spec = torch.stack([tgt_stft.real, tgt_stft.imag], dim=-1)   # (1, F, T, 2)
 
-    enh_spec = model(mic_spec)   # (1, F, T, 2)
-    return loss_fn(enh_spec, tgt_spec)
+    enh_spec  = model(mic_spec)   # (1, F, T, 2)
+
+    # ISTFT → time domain for SI-SDR
+    enh_cplx  = torch.complex(enh_spec[0, :, :, 0], enh_spec[0, :, :, 1])
+    enh_audio = torch.istft(enh_cplx, N_FFT, HOP, N_FFT, window)  # (samples,)
+
+    tgt_audio = tgt_t.squeeze(0)
+    min_len   = min(enh_audio.shape[-1], tgt_audio.shape[-1])
+    enh_audio = enh_audio[:min_len]
+    tgt_audio = tgt_audio[:min_len]
+
+    # SI-SDR (scale-invariant SDR) — fully scale-invariant, no amplitude shortcut
+    tgt_z = tgt_audio - tgt_audio.mean()
+    enh_z = enh_audio - enh_audio.mean()
+    dot       = (tgt_z * enh_z).sum()
+    s_target  = dot / (tgt_z.pow(2).sum() + 1e-8) * tgt_z
+    e_noise   = enh_z - s_target
+    si_sdr    = 10 * torch.log10(s_target.pow(2).sum() / (e_noise.pow(2).sum() + 1e-8) + 1e-8)
+    return -si_sdr   # minimise negative SI-SDR
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
@@ -258,7 +274,6 @@ def train():
     # GTCRN expects sqrt-Hann window (same as original gtcrn.py)
     window    = torch.hann_window(N_FFT).sqrt().to(device)
     model     = GTCRN48k().to(device)
-    loss_fn   = HybridLoss48k().to(device)
     optimizer = Adam(model.parameters(), lr=args.lr or LR)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     ckpt_dir  = PROJECT_ROOT / 'checkpoints' / 'gtcrn_sep'
@@ -340,7 +355,7 @@ def train():
             noise_np = noise_np[n0:n0 + SEQ_LEN]
 
             loss = train_one_step(
-                model, loss_fn, vocal_np,
+                model, vocal_np,
                 mains_ir_np, monitor_ir_np, room_ir_np, noise_np,
                 device, window, room_ir_path=room_ir_path, epoch=epoch)
 
