@@ -5,10 +5,12 @@ Architecture: GTCRN (ShuffleNetV2 + SFE + TRA + 2 DPGRNN), adapted from gtcrn/gt
 ~24 K parameters.
 
 Changes from the original GTCRN (16 kHz / N_FFT=512):
-  1. 48 kHz / N_FFT=960 / HOP=480
-  2. ERB bank re-parameterised for 48 kHz:
-       erb_subband_1=65  (linear bins 0-64, covering 0–3250 Hz)
-       erb_subband_2=64  (ERB-compress bins 65-480 → 3250–16000 Hz into 64 bins)
+  1. 48 kHz / N_FFT=512 / HOP=256 → 5.33 ms latency (De-Feedback claims 4.9 ms)
+     N_FFT=512 at 48 kHz → same 257 bins as original GTCRN at 16 kHz, so the
+     entire downstream architecture is byte-for-byte identical.
+  2. ERB bank re-parameterised for 48 kHz / N_FFT=512:
+       erb_subband_1=65  (linear bins 0-64, covering 0–6094 Hz)
+       erb_subband_2=64  (ERB-compress bins 65-256 → 6094–16000 Hz into 64 bins)
        total width = 65+64 = 129  ← identical to original
      The downstream encoder/DPGRNN/decoder is completely unchanged because the
      ERB output width is the same.
@@ -39,15 +41,19 @@ import torch.nn as nn
 from einops import rearrange
 
 SR     = 48000
-N_FFT  = 960
-HOP    = 480
-N_FREQ = N_FFT // 2 + 1   # 481 bins
+N_FFT  = 512
+HOP    = 256
+N_FREQ = N_FFT // 2 + 1   # 257 bins — same as original GTCRN at 16 kHz/512FFT
+
+# HOP=256 → 256/48000 = 5.33 ms latency (De-Feedback claims 4.9 ms).
+# N_FFT=512 at 48 kHz → 93.75 Hz/bin (coarser than N_FFT=960/50 Hz, but fine
+# for source separation — the ERB bank handles cross-bin context anyway).
 
 # ERB compression parameters.  Chosen so ERB output width = 129 = original GTCRN,
 # keeping the entire encoder/DPGRNN/decoder architecture unchanged.
-_ERB_LIN   = 65       # linear bins (covers 0–3250 Hz at 48kHz/960FFT)
-_ERB_COMP  = 64       # ERB bins for 3250–16000 Hz
-_ERB_HIGH  = 16000    # Hz ceiling for ERB bank
+_ERB_LIN   = 65       # linear bins (covers 0–6094 Hz at 48kHz/512FFT)
+_ERB_COMP  = 64       # ERB bins for 6094–16000 Hz
+_ERB_HIGH  = 16000    # Hz ceiling for ERB bank (16–24 kHz not needed for voice/feedback)
 
 
 # ── Unchanged from gtcrn/gtcrn.py ─────────────────────────────────────────────
@@ -308,7 +314,7 @@ class CRM(nn.Module):
 
 class GTCRN48k(nn.Module):
     """
-    GTCRN adapted for 48 kHz / N_FFT=960.
+    GTCRN adapted for 48 kHz / N_FFT=512 / HOP=256 (5.33 ms latency).
 
     Input:  mic STFT  (B, N_FREQ, T, 2)   — real/imag stacked on last dim
     Output: enhanced STFT (B, N_FREQ, T, 2)
