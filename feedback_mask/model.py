@@ -34,21 +34,24 @@ N_FREQ = N_FFT // 2 + 1   # 481 bins, 50 Hz resolution
 
 FREQ_CH    = 32   # 16→32: more capacity to distinguish narrow ring spike from broad speech formant
 GRU_HIDDEN = 32
-N_DELTA    = 6   # log_mag, Δ1, Δ4, Δ10, Δ50, Δ200
+N_DELTA    = 7   # log_mag, Δ1, Δ4, Δ10, Δ50, Δ200, Δ500
 
 
 def _prepare_features(spec):
     """
     spec: (B, F, T, 2) complex STFT → (B, N_DELTA, F, T) feature tensor.
 
-    Features: [log_mag, Δ1 (~10ms), Δ4 (~40ms), Δ10 (~100ms), Δ50 (~500ms), Δ200 (~2s)]
+    Features: [log_mag, Δ1 (~10ms), Δ4 (~40ms), Δ10 (~100ms), Δ50 (~500ms), Δ200 (~2s), Δ500 (~5s)]
 
-    Why Δ50 and Δ200:
+    Why Δ50, Δ200, Δ500:
       Ring builds up over seconds; speech formants are transient (50-500ms).
       At steady-state ring, Δ10 diff (ring vs bg) ≈ 0.011 — barely usable.
       Δ200 diff ≈ 0.134 during buildup — 12× more discriminative.
-      Without long deltas the GRU uses only log_mag magnitude as a suppression
-      proxy, which partially suppresses high-energy speech formants too.
+      Δ500: ring at steady state (gain=0.85) is elevated for the ENTIRE 10s clip,
+      so Δ500 stays strongly positive at ring bins throughout. A sustained vowel
+      lasts 200-500ms — by the time 5s has elapsed, Δ500 at formant bins is
+      near zero or negative. This is the clearest temporal discriminator between
+      sustained ring and sustained speech.
     """
     mag = (spec[..., 0] ** 2 + spec[..., 1] ** 2 + 1e-12).sqrt()  # (B, F, T)
     lm  = torch.log(mag)
@@ -63,7 +66,8 @@ def _prepare_features(spec):
                         causal_delta(4),
                         causal_delta(10),
                         causal_delta(50),
-                        causal_delta(200)], dim=1)   # (B, N_DELTA, F, T)
+                        causal_delta(200),
+                        causal_delta(500)], dim=1)   # (B, N_DELTA, F, T)
 
 
 class FeedbackMaskNet(nn.Module):
