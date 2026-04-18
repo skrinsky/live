@@ -325,19 +325,21 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     tgt_mag = tgt_stft.abs()                                           # (1, N_FREQ, T)
     mic_mag = mic_stft.abs()                                           # (1, N_FREQ, T)
 
-    # Source separation L1: no ring labels needed.
-    # Ring bins are 20-100× elevated after the feedback loop + resonators, so they
-    # naturally dominate the L1 loss without any weighting:
-    #   ring bin:    L1 = |mask×mic_mag - tgt_mag| → large (mic_mag >> tgt_mag)
-    #                gradient pushes mask → 0 (suppress)
-    #   non-ring:    L1 = |mask×mic_mag - tgt_mag| → small (mic_mag ≈ tgt_mag)
-    #                gradient pushes mask → 1 (pass)
-    # This is the approach De-Feedback uses. Previously tried before sin→cos fix
-    # (commit f84ff1d) when ring elevation was only 1.11× — too small to dominate.
-    # Now with cos-based IR + resonators, elevation is 20-100×, so L1 works.
+    # Log-magnitude L1: drives mask toward ideal ratio mask (tgt_mag / mic_mag).
+    #
+    # Why log and not linear:
+    #   Linear L1 — non-ring gradient wins aggregate 23:1 → model learns
+    #   "pass everything", ring barely suppressed (stuck at mask=0.918).
+    #
+    #   Log L1 — at ring bin: |log(mask×mic_ring) - log(tgt_ring)| = |log(mask) + log(20)|
+    #   At convergence, ring bin loss = 0 when mask = tgt_ring/mic_ring = 1/20 = 0.05.
+    #   Gradient balance ~2.5:1 non-ring wins (healthy), vs 23:1 for linear.
+    #   This is the Wiener filter optimality criterion — model learns the exact
+    #   ratio mask without labels or RING_WEIGHT.
+    eps = 1e-8
     enh_spec, _, _ = model(mic_spec)
-    enhanced_mag = (enh_spec[..., 0] ** 2 + enh_spec[..., 1] ** 2 + 1e-12).sqrt()
-    return F.l1_loss(enhanced_mag, tgt_mag)
+    enhanced_mag = (enh_spec[..., 0] ** 2 + enh_spec[..., 1] ** 2 + eps).sqrt()
+    return F.l1_loss(torch.log(enhanced_mag), torch.log(tgt_mag + eps))
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
