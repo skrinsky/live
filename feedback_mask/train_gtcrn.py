@@ -43,7 +43,7 @@ LR          = 1e-4
 GRAD_CLIP   = 1.0
 MAX_IR_LEN  = int(1.5 * SR)
 FEEDBACK_TRUNC = int(0.05 * SR)
-N_STEPS     = 200         # 200 steps × 4 batch = 50 optimizer steps/epoch
+N_STEPS     = 800         # 800 steps × 4 batch = 200 optimizer steps/epoch
 
 
 def make_hpf(cutoff_hz=90):
