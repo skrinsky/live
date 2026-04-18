@@ -33,7 +33,7 @@ HOP    = 480
 N_FREQ = N_FFT // 2 + 1   # 481 bins, 50 Hz resolution
 
 FREQ_CH    = 16
-GRU_HIDDEN = 64
+GRU_HIDDEN = 32
 N_DELTA    = 6   # log_mag, Δ1, Δ4, Δ10, Δ50, Δ200
 
 

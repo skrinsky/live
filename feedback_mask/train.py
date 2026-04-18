@@ -325,55 +325,19 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     tgt_mag = tgt_stft.abs()                                           # (1, N_FREQ, T)
     mic_mag = mic_stft.abs()                                           # (1, N_FREQ, T)
 
-    # Model forward — get mask for BCE loss
-    _, pred_mask, _ = model(mic_spec)   # pred_mask: (1, N_FREQ, T)  in (0,1)
-
-    # Ground-truth ring bin labels — we know exactly which STFT bins have resonators
-    # because we placed them during the feedback simulation. ring_freqs is collected
-    # from _add_resonators calls above.
-    #
-    # Why NOT the ratio oracle (mic_mag/tgt_mag > 1.5):
-    #   The feedback IR is a broadband room IR. At gain=0.95, ALL frequencies get
-    #   amplified: bins with |H(ω)|≈0.3 get 1/(1-0.285)≈1.4× amplified. With
-    #   independent normalization, ~100 non-ring bins exceed the 1.5 threshold.
-    #   Those bins get ring_label=1, weight=80. Equilibrium mask =
-    #   480/(100×80) ≈ 0.06 → global suppression. That's the bug.
-    #
-    #   Ground-truth: exactly 1-3 ring bins per clip. Equilibrium:
-    #   480/(3×80+480) = 480/720 ≈ 0.67, but non-ring wins the bias battle
-    #   (480×1 upward vs 3×80×mask downward at mask≈0.5 → net strongly upward).
-    #   Background climbs toward 1.0. Ring bins suppressed per-bin by 80× gradient.
-    RING_WEIGHT = 27.0   # ±1 bin labeling → up to 9 ring bins; 9×27≈243 ≈ old 3×80=240
-
-    # Time-varying ring labels for ramp clips: ring_lo bins active only in the
-    # first half, ring_hi bins active only in the second half.
-    # Previous bug: both sets were labeled for the ENTIRE clip. In the first half,
-    # ring_hi bins look identical to non-ring bins (h_hi not yet active) but were
-    # labeled as ring=1 → supervision noise that confused the GRU.
-    T_frames   = mic_mag.shape[2]
-    ring_label = torch.zeros_like(mic_mag)           # (1, N_FREQ, T)
-    if is_ramp:
-        split_frame = min(int(split / HOP), T_frames)
-        for freq in ring_freqs_lo:
-            rb = max(0, min(N_FREQ - 1, int(round(freq * N_FFT / SR))))
-            for rbo in [-1, 0, 1]:
-                ring_label[:, max(0, min(N_FREQ - 1, rb + rbo)), :split_frame] = 1.0
-        for freq in ring_freqs_hi:
-            rb = max(0, min(N_FREQ - 1, int(round(freq * N_FFT / SR))))
-            for rbo in [-1, 0, 1]:
-                ring_label[:, max(0, min(N_FREQ - 1, rb + rbo)), split_frame:] = 1.0
-    else:
-        for freq in ring_freqs:
-            rb = max(0, min(N_FREQ - 1, int(round(freq * N_FFT / SR))))
-            for rbo in [-1, 0, 1]:
-                ring_label[:, max(0, min(N_FREQ - 1, rb + rbo)), :] = 1.0
-
-    mask_target   = 1.0 - ring_label                # 1=pass, 0=suppress
-    sample_weight = ring_label * (RING_WEIGHT - 1) + 1  # 80 at ring bins, 1 elsewhere
-
-    mask_logit = torch.logit(pred_mask.clamp(1e-6, 1 - 1e-6))
-    return (sample_weight * F.binary_cross_entropy_with_logits(
-        mask_logit, mask_target, reduction='none')).mean()
+    # Source separation L1: no ring labels needed.
+    # Ring bins are 20-100× elevated after the feedback loop + resonators, so they
+    # naturally dominate the L1 loss without any weighting:
+    #   ring bin:    L1 = |mask×mic_mag - tgt_mag| → large (mic_mag >> tgt_mag)
+    #                gradient pushes mask → 0 (suppress)
+    #   non-ring:    L1 = |mask×mic_mag - tgt_mag| → small (mic_mag ≈ tgt_mag)
+    #                gradient pushes mask → 1 (pass)
+    # This is the approach De-Feedback uses. Previously tried before sin→cos fix
+    # (commit f84ff1d) when ring elevation was only 1.11× — too small to dominate.
+    # Now with cos-based IR + resonators, elevation is 20-100×, so L1 works.
+    enh_spec, _, _ = model(mic_spec)
+    enhanced_mag = (enh_spec[..., 0] ** 2 + enh_spec[..., 1] ** 2 + 1e-12).sqrt()
+    return F.l1_loss(enhanced_mag, tgt_mag)
 
 
 # ── Main training loop ─────────────────────────────────────────────────────────
