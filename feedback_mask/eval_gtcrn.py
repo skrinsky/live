@@ -53,12 +53,12 @@ def si_snr(estimate, target, eps=1e-8):
 def generate_test_clip(ring_freq_hz=800.0, gain=0.95, duration=10.0, seed=42,
                        vocal_file=None):
     """
-    Generates (clean_np, mic_np, ring_bin):
-      clean_np : dry vocal, no room, no feedback — the ideal model output
-      mic_np   : clean vocal → room reverb → +noise → IIR feedback loop
-      ring_bin : STFT bin index for ring_freq_hz
-
-    Having clean_np lets us measure SI-SNR improvement, not just mask delta.
+    Generates (clean_np, reverb_clean_np, mic_np, ring_bin):
+      clean_np       : dry vocal — no room, no feedback, no noise
+      reverb_clean_np: reverberant vocal — room reverb kept, no feedback, no noise
+                       This is what GTCRN48k is trained to output.
+      mic_np         : clean vocal → room reverb → +noise → IIR feedback loop
+      ring_bin       : STFT bin index for ring_freq_hz
     """
     rng = np.random.default_rng(seed)
     n   = int(duration * SR)
@@ -98,6 +98,11 @@ def generate_test_clip(ring_freq_hz=800.0, gain=0.95, duration=10.0, seed=42,
     reverb   = fftconvolve(vocal, room_ir)[:n].astype(np.float64)
     reverb   = sosfilt(_make_hpf(90), reverb).astype(np.float64)
 
+    # ── Reverberant clean reference (what GTCRN48k is trained to output) ─────
+    reverb_clean_np  = reverb.astype(np.float32)
+    reverb_clean_rms = float(np.sqrt(np.mean(reverb_clean_np**2))) + 1e-8
+    reverb_clean_np  = np.clip(reverb_clean_np * (0.1 / reverb_clean_rms), -1.0, 1.0)
+
     # ── Background noise (SNR ~20 dB) ────────────────────────────────────────
     noise      = rng.standard_normal(n).astype(np.float64)
     vocal_rms  = float(np.sqrt(np.mean(reverb**2))) + 1e-8
@@ -126,7 +131,7 @@ def generate_test_clip(ring_freq_hz=800.0, gain=0.95, duration=10.0, seed=42,
     mic_np  = np.clip(mic_np * (0.1 / mic_rms), -1.0, 1.0).astype(np.float32)
 
     ring_bin = int(round(ring_freq_hz * N_FFT / SR))
-    return clean_np, mic_np, ring_bin
+    return clean_np, reverb_clean_np, mic_np, ring_bin
 
 
 def run_eval(ring_freq_hz=800.0, gain=0.95, ckpt_path=None, vocal_file=None):
@@ -146,7 +151,7 @@ def run_eval(ring_freq_hz=800.0, gain=0.95, ckpt_path=None, vocal_file=None):
     print(f'Ring: {ring_freq_hz:.0f} Hz → bin {int(round(ring_freq_hz * N_FFT / SR))} '
           f'({int(round(ring_freq_hz * N_FFT / SR)) * SR / N_FFT:.1f} Hz), gain={gain}')
 
-    clean_np, mic_np, ring_bin = generate_test_clip(
+    clean_np, reverb_clean_np, mic_np, ring_bin = generate_test_clip(
         ring_freq_hz, gain, vocal_file=vocal_file)
 
     # ── STFT → model → ISTFT ─────────────────────────────────────────────────
@@ -166,19 +171,32 @@ def run_eval(ring_freq_hz=800.0, gain=0.95, ckpt_path=None, vocal_file=None):
     mic_trim  = mic_np[:n]
 
     # ── SI-SNR metrics ────────────────────────────────────────────────────────
+    # Primary: vs reverberant clean (what the model is trained to output)
+    reverb_trim = reverb_clean_np[:n]
+    sisnr_mic_rev = si_snr(mic_trim.astype(np.float64),  reverb_trim.astype(np.float64))
+    sisnr_enh_rev = si_snr(enh_audio.astype(np.float64), reverb_trim.astype(np.float64))
+    improvement_rev = sisnr_enh_rev - sisnr_mic_rev
+
+    # Secondary: vs dry clean (shows residual reverb)
     sisnr_mic = si_snr(mic_trim.astype(np.float64),   clean_np.astype(np.float64))
     sisnr_enh = si_snr(enh_audio.astype(np.float64),  clean_np.astype(np.float64))
     improvement = sisnr_enh - sisnr_mic
 
-    print(f'\nSI-SNR (mic vs clean):      {sisnr_mic:+.2f} dB')
-    print(f'SI-SNR (enhanced vs clean): {sisnr_enh:+.2f} dB')
-    print(f'SI-SNR improvement:         {improvement:+.2f} dB', end='  ')
-    if improvement > 3.0:
+    print(f'\n── vs reverberant clean (primary — model target) ──')
+    print(f'SI-SNR (mic vs reverb clean):      {sisnr_mic_rev:+.2f} dB')
+    print(f'SI-SNR (enhanced vs reverb clean): {sisnr_enh_rev:+.2f} dB')
+    print(f'SI-SNR improvement:                {improvement_rev:+.2f} dB', end='  ')
+    if improvement_rev > 3.0:
         print('✓ Good suppression')
-    elif improvement > 0.5:
+    elif improvement_rev > 0.5:
         print('~ Marginal improvement')
     else:
         print('✗ No improvement (model not learning separation yet)')
+
+    print(f'\n── vs dry clean (secondary — shows residual reverb) ──')
+    print(f'SI-SNR (mic vs dry clean):      {sisnr_mic:+.2f} dB')
+    print(f'SI-SNR (enhanced vs dry clean): {sisnr_enh:+.2f} dB')
+    print(f'SI-SNR improvement:             {improvement:+.2f} dB')
 
     # ── Spectral check at ring bin ────────────────────────────────────────────
     enh_mag = np.abs(np.fft.rfft(enh_audio)) / len(enh_audio)
@@ -191,10 +209,11 @@ def run_eval(ring_freq_hz=800.0, gain=0.95, ckpt_path=None, vocal_file=None):
     # ── Save audio ────────────────────────────────────────────────────────────
     out_dir = PROJECT_ROOT / 'checkpoints' / 'gtcrn_sep'
     out_dir.mkdir(parents=True, exist_ok=True)
-    sf.write(str(out_dir / 'eval_mic.wav'),      mic_trim,  SR)
-    sf.write(str(out_dir / 'eval_enhanced.wav'), enh_audio, SR)
-    sf.write(str(out_dir / 'eval_clean.wav'),    clean_np,  SR)
-    print(f'\nAudio → {out_dir}/eval_mic.wav  eval_enhanced.wav  eval_clean.wav')
+    sf.write(str(out_dir / 'eval_mic.wav'),          mic_trim,  SR)
+    sf.write(str(out_dir / 'eval_enhanced.wav'),     enh_audio, SR)
+    sf.write(str(out_dir / 'eval_reverb_clean.wav'), reverb_trim, SR)
+    sf.write(str(out_dir / 'eval_clean.wav'),        clean_np,  SR)
+    print(f'\nAudio → {out_dir}/eval_mic.wav  eval_enhanced.wav  eval_reverb_clean.wav  eval_clean.wav')
 
     # ── Plot ──────────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(3, 1, figsize=(14, 10))
@@ -227,7 +246,7 @@ def run_eval(ring_freq_hz=800.0, gain=0.95, ckpt_path=None, vocal_file=None):
     axes[1].imshow(spec_enh, aspect='auto', origin='lower', extent=extent,
                    vmin=vmin, vmax=vmax, cmap='inferno')
     axes[1].axhline(ring_freq_hz, color='cyan', lw=1.5, linestyle='--', label='ring freq')
-    axes[1].set_title(f'Enhanced  (SI-SNR {improvement:+.2f} dB improvement, '
+    axes[1].set_title(f'Enhanced  (SI-SNR vs reverb_clean {improvement_rev:+.2f} dB, '
                       f'ring suppression {ring_suppression:+.1f} dB)')
     axes[1].set_ylabel('Freq (Hz)')
     axes[1].legend(loc='upper right', fontsize=8)
@@ -244,7 +263,7 @@ def run_eval(ring_freq_hz=800.0, gain=0.95, ckpt_path=None, vocal_file=None):
     axes[2].legend(loc='upper right', fontsize=8)
 
     plt.suptitle(f'GTCRN48k eval — ring={ring_freq_hz:.0f} Hz, gain={gain}, '
-                 f'SI-SNR improvement={improvement:+.2f} dB',
+                 f'SI-SNR vs reverb_clean={improvement_rev:+.2f} dB',
                  fontsize=11, y=1.01)
     plt.tight_layout()
     plot_path = str(out_dir / 'eval_spectrogram.png')
