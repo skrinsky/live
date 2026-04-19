@@ -184,15 +184,17 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
         mains_norm = mains_norm / (_peak + 1e-8)
         mon_norm   = mon_norm   / (_peak + 1e-8)
 
+    ring_freqs = []
     is_ramp = random.random() < 0.50
     if is_ramp:
         gain_lo = random.uniform(0.2, 0.7)
         gain_hi = random.uniform(0.85, 0.99)
         split   = random.randint(int(0.2 * SEQ_LEN), int(0.5 * SEQ_LEN))
-        h_lo_raw, _ = _add_resonators(mains_norm * gain_lo + mon_norm * gain_lo,
-                                      SR, ir_path=room_ir_path)
-        h_hi_raw, _ = _add_resonators(mains_norm * gain_hi + mon_norm * gain_hi,
-                                      SR, ir_path=room_ir_path)
+        h_lo_raw, ring_freqs_lo = _add_resonators(mains_norm * gain_lo + mon_norm * gain_lo,
+                                                   SR, ir_path=room_ir_path)
+        h_hi_raw, ring_freqs_hi = _add_resonators(mains_norm * gain_hi + mon_norm * gain_hi,
+                                                   SR, ir_path=room_ir_path)
+        ring_freqs = list(set(ring_freqs_lo + ring_freqs_hi))
         h_lo = _stability_check(h_lo_raw)
         h_hi = _stability_check(h_hi_raw)
         a_lo = np.concatenate([[1.0], -h_lo.astype(np.float64)])
@@ -203,7 +205,7 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
         mic_np = np.concatenate([y1, y2])
     else:
         mains_gain, monitor_gain = sample_gain(epoch)
-        h_raw, _ = _add_resonators(
+        h_raw, ring_freqs = _add_resonators(
             mains_norm * mains_gain + mon_norm * monitor_gain,
             SR, ir_path=room_ir_path)
         h = _stability_check(h_raw)
@@ -256,6 +258,25 @@ def train_one_step(model, vocal_np, mains_ir_np, monitor_ir_np,
     s_target  = dot / (tgt_z.pow(2).sum() + 1e-8) * tgt_z
     e_noise   = enh_z - s_target
     si_sdr    = 10 * torch.log10(s_target.pow(2).sum() / (e_noise.pow(2).sum() + 1e-8) + 1e-8)
+
+    # Spectral penalty: directly penalise residual energy at resonator ring bins.
+    # SI-SDR spreads its gradient over all 257 bins — ring bins contribute little.
+    # This penalty gives the ring bins a direct suppression incentive without
+    # breaking scale invariance (it operates in the STFT domain on the raw FFT bins,
+    # before ERB compression, so it targets the exact narrow spike).
+    # Weight 0.1 keeps it smaller than SI-SDR (~2-3 dB range) so it steers
+    # rather than dominates.
+    SPECTRAL_WEIGHT = 0.1
+    if ring_freqs:
+        ring_bins = list(set(
+            min(int(round(f * N_FFT / SR)), N_FREQ - 1) for f in ring_freqs
+        ))
+        bins_t     = torch.tensor(ring_bins, device=device)
+        ring_power = (enh_spec[0, bins_t, :, 0].pow(2) +
+                      enh_spec[0, bins_t, :, 1].pow(2)).mean()
+        spectral_penalty = SPECTRAL_WEIGHT * torch.log10(ring_power + 1e-8)
+        return -si_sdr + spectral_penalty
+
     return -si_sdr   # minimise negative SI-SDR
 
 
